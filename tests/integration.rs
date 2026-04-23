@@ -5,6 +5,7 @@ use std::process::Command;
 /// Cleaned up on drop.
 struct TestRepo {
     dir: PathBuf,
+    config_path: PathBuf,
 }
 
 impl TestRepo {
@@ -31,7 +32,19 @@ impl TestRepo {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        Self { dir }
+        // Write a jj config file for merge-tool setup.
+        // This is passed via JJ_CONFIG to all jj invocations (including
+        // those spawned by jj-hunk internally).
+        let config_path = dir.join("_jj_config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[merge-tools.jj-hunk]\nprogram = {:?}\nedit-args = [\"select\", \"$left\", \"$right\"]\n",
+                jj_hunk_bin(),
+            ),
+        ).unwrap();
+
+        Self { dir, config_path }
     }
 
     fn path(&self) -> &Path {
@@ -52,7 +65,8 @@ impl TestRepo {
             .current_dir(&self.dir)
             .env("JJ_USER", "Test User")
             .env("JJ_EMAIL", "test@example.com")
-            .env_remove("JJ_CONFIG")
+            .env("JJ_CONFIG", &self.config_path)
+            .env("PATH", path_with_jj_hunk())
             .output()
             .expect("failed to run jj")
     }
@@ -75,7 +89,8 @@ impl TestRepo {
             .current_dir(&self.dir)
             .env("JJ_USER", "Test User")
             .env("JJ_EMAIL", "test@example.com")
-            .env_remove("JJ_CONFIG")
+            .env("JJ_CONFIG", &self.config_path)
+            .env("PATH", path_with_jj_hunk())
             .output()
             .expect("failed to run jj-hunk")
     }
@@ -159,6 +174,14 @@ impl Drop for TestRepo {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Build a PATH that includes the directory containing the jj-hunk binary,
+/// so that `jj --tool=jj-hunk` can find it.
+fn path_with_jj_hunk() -> String {
+    let bin_dir = jj_hunk_bin().parent().unwrap().to_path_buf();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{}", bin_dir.display(), current_path)
 }
 
 fn jj_hunk_bin() -> PathBuf {
