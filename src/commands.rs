@@ -373,7 +373,7 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 
 fn resolve_revisions(revset: Option<&str>) -> (Option<String>, Option<String>) {
     if let Some(rev) = revset {
-        (Some(format!("({})^", rev)), Some(rev.to_string()))
+        (Some(format!("({})-", rev)), Some(rev.to_string()))
     } else {
         (Some("@-".to_string()), None)
     }
