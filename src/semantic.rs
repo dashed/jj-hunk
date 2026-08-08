@@ -17,6 +17,13 @@ pub struct SemanticContext {
     pub is_toplevel: bool,
     /// Nesting depth of enclosing scopes (0 = top level).
     pub nesting_depth: usize,
+    /// Whether a parser actually ran for this file.
+    ///
+    /// Without this, an unsupported file type is indistinguishable from a
+    /// genuinely top-level line: `SemanticContext::default()` is depth 0 but
+    /// `is_toplevel` false, so `depth(0)` matched it while `toplevel()` did
+    /// not. Predicates consult this so both fail the same way.
+    pub is_analyzed: bool,
 }
 
 /// Language configuration: which node kinds represent functions and scopes.
@@ -99,7 +106,12 @@ fn get_lang_config(extension: &str) -> Option<LangConfig> {
         "py" => Some(LangConfig {
             language: tree_sitter_python::LANGUAGE.into(),
             function_kinds: &["function_definition"],
-            scope_kinds: &["class_definition", "module"],
+            // NOTE: do not add "module" here. In tree-sitter-python `module`
+            // is the ROOT node, so listing it as a scope makes every line in
+            // the file non-top-level and depth >= 1. Ruby's "module" below is
+            // a real language construct (its root is `program`), so that one
+            // is correct.
+            scope_kinds: &["class_definition"],
             function_name_extractor: NameExtractor::NameField,
             scope_name_extractor: NameExtractor::NameField,
             annotation_kinds: &["decorator"],
@@ -422,6 +434,7 @@ impl ParsedFile {
                 let line_0 = line - 1;
                 let mut ctx = SemanticContext::default();
                 ctx.is_toplevel = true;
+                ctx.is_analyzed = true;
                 self.find_enclosing(root, line_0, &mut ctx, 0);
                 ctx
             })
@@ -1249,5 +1262,103 @@ end
         let ctx = parsed.context_at_line(7);
         assert!(!ctx.is_import);
         assert_eq!(ctx.enclosing_function.as_deref(), Some("bar"));
+    }
+}
+
+#[cfg(test)]
+mod toplevel_consistency_tests {
+    use super::*;
+
+    // `toplevel()` and `depth(0)` must agree, and must agree across languages.
+    // Two ways they used to disagree:
+    //   - Python listed "module" (the tree-sitter ROOT node) as a scope, so no
+    //     Python line was ever top level and every line had depth >= 1.
+    //   - A file with no language config fell back to SemanticContext::default(),
+    //     which is depth 0 but is_toplevel false -- so it matched depth(0) but
+    //     not toplevel().
+
+    #[test]
+    fn python_top_level_import_is_top_level() {
+        let src = "import os\nimport sys\n\ndef load():\n    pass\n";
+        let ctx = &contexts_for_lines("py", src, &[2])[0];
+        assert!(ctx.is_import, "should be recognised as an import");
+        assert!(
+            ctx.is_toplevel,
+            "a module-level import is top level; got is_toplevel=false"
+        );
+        assert_eq!(ctx.nesting_depth, 0, "module-level code is depth 0");
+        assert!(ctx.enclosing_scope.is_none(), "the file itself is not a scope");
+    }
+
+    #[test]
+    fn python_matches_rust_for_the_same_shape() {
+        let py = &contexts_for_lines("py", "import os\nimport sys\n", &[2])[0];
+        let rs = &contexts_for_lines("rs", "use std::fs;\nuse std::io;\n", &[2])[0];
+        assert_eq!(
+            (py.is_toplevel, py.nesting_depth),
+            (rs.is_toplevel, rs.nesting_depth),
+            "python and rust disagree on an equivalent top-level import"
+        );
+    }
+
+    #[test]
+    fn python_class_body_is_still_scoped() {
+        let src = "class Store:\n    def get(self):\n        return 1\n";
+        let ctx = &contexts_for_lines("py", src, &[3])[0];
+        assert_eq!(ctx.enclosing_scope.as_deref(), Some("Store"));
+        assert_eq!(ctx.enclosing_function.as_deref(), Some("get"));
+        assert!(!ctx.is_toplevel, "code inside a class is not top level");
+        assert!(ctx.nesting_depth >= 2, "class > method should nest");
+    }
+
+    #[test]
+    fn python_function_body_is_not_top_level() {
+        let src = "def load():\n    x = 1\n";
+        let ctx = &contexts_for_lines("py", src, &[2])[0];
+        assert!(!ctx.is_toplevel);
+        assert_eq!(ctx.enclosing_function.as_deref(), Some("load"));
+    }
+
+    #[test]
+    fn analyzed_flag_is_set_for_supported_languages() {
+        for (ext, src) in [("rs", "fn a() {}\n"), ("py", "x = 1\n"), ("go", "package m\n")] {
+            let ctx = &contexts_for_lines(ext, src, &[1])[0];
+            assert!(ctx.is_analyzed, "{ext} should be analyzed");
+        }
+    }
+
+    #[test]
+    fn analyzed_flag_is_clear_for_unsupported_languages() {
+        let ctx = &contexts_for_lines("txt", "hello\nworld\n", &[1])[0];
+        assert!(
+            !ctx.is_analyzed,
+            "a plain text file has no parser; predicates must be able to tell"
+        );
+        // and it must not masquerade as top-level-at-depth-0
+        assert!(!ctx.is_toplevel);
+    }
+
+    #[test]
+    fn no_language_config_lists_its_own_root_node_as_a_scope() {
+        // A root node contains every line, so listing it as a scope makes the
+        // whole file non-top-level. Guard every language against the mistake
+        // Python had.
+        for (ext, src) in [
+            ("rs", "use std::fs;\n"),
+            ("py", "import os\n"),
+            ("js", "import x from 'y';\n"),
+            ("go", "package m\n"),
+            ("rb", "require 'x'\n"),
+            ("lua", "local x = 1\n"),
+            ("c", "#include <s.h>\n"),
+        ] {
+            let ctx = &contexts_for_lines(ext, src, &[1])[0];
+            assert!(
+                ctx.is_toplevel,
+                "{ext}: a lone top-level statement is not top level -- \
+                 does its scope_kinds include the root node?"
+            );
+            assert_eq!(ctx.nesting_depth, 0, "{ext}: should be depth 0");
+        }
     }
 }
