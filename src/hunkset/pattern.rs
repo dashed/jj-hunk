@@ -38,6 +38,11 @@ impl CompiledPattern {
         }
     }
 
+    /// True when the user explicitly asked for exact matching.
+    pub(super) fn kind_is_exact(&self) -> bool {
+        self.kind == PatternKind::Exact
+    }
+
     pub(super) fn value(&self) -> &str {
         &self.value
     }

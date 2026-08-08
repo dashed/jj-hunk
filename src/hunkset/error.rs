@@ -15,6 +15,12 @@ pub enum HunksetError {
         pattern: String,
         source: regex::Error,
     },
+    #[error("hunk id '{prefix}' is ambiguous -- it matches {count} hunks: {candidates}. Use more characters, or exact:\"<full-id>\".")]
+    AmbiguousId {
+        prefix: String,
+        count: usize,
+        candidates: String,
+    },
     #[error("{func}() does not accept '{value}' -- valid values are: {valid}")]
     InvalidArgument {
         func: String,

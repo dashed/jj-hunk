@@ -119,7 +119,100 @@ fn warn_if_nothing_analyzed(func: &str, result: &HashSet<usize>, hunks: &[Enrich
     );
 }
 
+/// What shape of arguments a predicate accepts.
+#[derive(PartialEq)]
+enum ArgShape {
+    /// At least one string/pattern argument, no ranges.
+    Patterns,
+    /// At least one number or range. `lines(2)` is accepted as `2..2`.
+    Numeric,
+    /// No arguments at all.
+    None,
+    /// Zero or more patterns (zero has its own meaning).
+    OptionalPatterns,
+}
+
+fn arg_shape(name: &str) -> ArgShape {
+    match name {
+        "file" | "glob" | "extension" | "status" | "type" | "content" | "added" | "removed"
+        | "id" | "function" | "scope" => ArgShape::Patterns,
+        "lines" | "before_line" | "after_line" | "depth" => ArgShape::Numeric,
+        "doc" | "import" | "toplevel" => ArgShape::None,
+        _ => ArgShape::OptionalPatterns, // annotation/decorator: zero args = "has any"
+    }
+}
+
+/// Reject argument lists that would otherwise degenerate into a silent
+/// `none()` -- and, under `~`, into a silent `all()`.
+///
+/// `patterns.iter().any(..)` over an empty vec is `false`, so a forgotten
+/// argument used to mean "match nothing", which negation turned into "match
+/// the entire diff". Wrong-typed arguments were dropped just as quietly by
+/// extract_patterns/extract_ranges.
+fn validate_args(name: &str, args: &[Arg]) -> Result<(), HunksetError> {
+    let shape = arg_shape(name);
+    let invalid = |value: String, valid: &str| HunksetError::InvalidArgument {
+        func: name.to_string(),
+        value,
+        valid: valid.to_string(),
+    };
+
+    match shape {
+        ArgShape::None => {
+            if !args.is_empty() {
+                return Err(invalid(
+                    "an argument".to_string(),
+                    "no arguments -- this predicate takes none",
+                ));
+            }
+        }
+        ArgShape::Patterns => {
+            if args.is_empty() {
+                return Err(invalid(
+                    "no argument".to_string(),
+                    "at least one string, e.g. file(\"src/a.rs\")",
+                ));
+            }
+            if let Some((i, _)) = args.iter().enumerate().find(|(_, a)| matches!(a, Arg::Range(..))) {
+                return Err(invalid(
+                    format!("a range (argument {})", i + 1),
+                    "strings, not ranges",
+                ));
+            }
+        }
+        ArgShape::Numeric => {
+            if args.is_empty() {
+                return Err(invalid(
+                    "no argument".to_string(),
+                    "a number or range, e.g. lines(10) or lines(10..20)",
+                ));
+            }
+            for a in args {
+                if let Arg::Pattern(p) = a {
+                    if p.value.parse::<usize>().is_err() {
+                        return Err(invalid(
+                            p.value.clone(),
+                            "a number or range, e.g. lines(10) or lines(10..20)",
+                        ));
+                    }
+                }
+                if let Arg::Range(lo, hi) = a {
+                    if lo > hi {
+                        return Err(invalid(
+                            format!("{lo}..{hi}"),
+                            "a range whose start is not greater than its end",
+                        ));
+                    }
+                }
+            }
+        }
+        ArgShape::OptionalPatterns => {}
+    }
+    Ok(())
+}
+
 fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
+    validate_args(name, args)?;
     // Pre-compile patterns (validates regex upfront)
     let compiled = compile_patterns(extract_patterns(args))?;
 
@@ -143,16 +236,21 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "content" => Ok(eval_content(&compiled, hunks, ContentMode::Either)),
         "added" => Ok(eval_content(&compiled, hunks, ContentMode::Added)),
         "removed" => Ok(eval_content(&compiled, hunks, ContentMode::Removed)),
-        "id" => Ok(eval_id(&compiled, hunks)),
+        "id" => eval_id(&compiled, hunks),
         "function" => {
             require_semantic(name)?;
-            let r = eval_semantic(&compiled, hunks, SemanticField::Function);
+            // Identifiers match exactly unless a prefix says otherwise --
+            // substring matching here silently pulled in CacheManager for
+            // scope("Cache"), contradicting the README.
+            let exact = compile_exact(args)?;
+            let r = eval_semantic(&exact, hunks, SemanticField::Function);
             warn_if_nothing_analyzed(name, &r, hunks);
             Ok(r)
         }
         "scope" => {
             require_semantic(name)?;
-            let r = eval_semantic(&compiled, hunks, SemanticField::Scope);
+            let exact = compile_exact(args)?;
+            let r = eval_semantic(&exact, hunks, SemanticField::Scope);
             warn_if_nothing_analyzed(name, &r, hunks);
             Ok(r)
         }
@@ -181,27 +279,7 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
             Ok(r)
         }
         "depth" => {
-            // Validate the argument shape before the feature gate: a malformed
-            // query is malformed whether or not tree-sitter is compiled in.
-            // `depth(0)` arrives as a Pattern holding "0"; `depth(0..2)` as a
-            // Range. Anything else would be dropped and silently match nothing.
-            let bad = extract_patterns(args)
-                .into_iter()
-                .find(|p| p.value.parse::<usize>().is_err());
-            if let Some(p) = bad {
-                return Err(HunksetError::InvalidArgument {
-                    func: "depth".to_string(),
-                    value: p.value,
-                    valid: "a number or range, e.g. depth(0) or depth(0..2)".to_string(),
-                });
-            }
-            if args.is_empty() {
-                return Err(HunksetError::InvalidArgument {
-                    func: "depth".to_string(),
-                    value: "no argument".to_string(),
-                    valid: "a number or range, e.g. depth(0) or depth(0..2)".to_string(),
-                });
-            }
+            // Argument shape is validated up front by validate_args.
             require_semantic(name)?;
             let r = eval_depth(args, hunks);
             warn_if_nothing_analyzed("depth", &r, hunks);
@@ -242,7 +320,10 @@ fn extract_ranges(args: &[Arg]) -> Vec<(usize, usize)> {
     args.iter()
         .filter_map(|a| match a {
             Arg::Range(start, end) => Some((*start, *end)),
-            _ => None,
+            // `lines(2)` reads naturally as "hunks touching line 2"; treat a
+            // bare number as the single-line range 2..2 rather than dropping
+            // it. validate_args has already rejected non-numeric patterns.
+            Arg::Pattern(p) => p.value.parse::<usize>().ok().map(|n| (n, n)),
         })
         .collect()
 }
@@ -362,25 +443,58 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
 
 /// Match by hunk ID, supporting prefix matching for abbreviated IDs
 /// (e.g., `id("hunk-162b7798da21...")` matches the full ID).
-fn eval_id(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let ids: Vec<String> = patterns
-        .iter()
-        .filter_map(|p| crate::diff::normalize_hunk_id(p.value()))
-        .collect();
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| {
-            ids.iter().any(|id| {
-                if id.len() < h.hunk.id.len() {
+/// Select by stable hunk id, with jj-style abbreviation.
+///
+/// An abbreviated id that matches more than one hunk is an error, not a
+/// multi-select: `id()` is the identity predicate, the one destructive commands
+/// act on, and silently selecting two hunks because a 3-character prefix
+/// collided is the worst possible reading of the user's intent. jj errors on
+/// ambiguous change-id prefixes for the same reason.
+///
+/// `exact:"..."` disables abbreviation, so it is also the escape hatch when a
+/// full id happens to prefix another.
+fn eval_id(
+    patterns: &[CompiledPattern],
+    hunks: &[EnrichedHunk],
+) -> Result<HashSet<usize>, HunksetError> {
+    let mut selected = HashSet::new();
+    for p in patterns {
+        let Some(id) = crate::diff::normalize_hunk_id(p.value()) else {
+            return Err(HunksetError::InvalidArgument {
+                func: "id".to_string(),
+                value: p.value().to_string(),
+                valid: "a hunk id such as hunk-4c1b1b3... (or an unambiguous prefix)".to_string(),
+            });
+        };
+        let exact_only = p.kind_is_exact();
+        let matched: Vec<usize> = hunks
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                if !exact_only && id.len() < h.hunk.id.len() {
                     h.hunk.id.starts_with(id.as_str())
                 } else {
                     h.hunk.id == *id
                 }
             })
-        })
-        .map(|(i, _)| i)
-        .collect()
+            .map(|(i, _)| i)
+            .collect();
+
+        if matched.len() > 1 {
+            let mut which: Vec<String> = matched
+                .iter()
+                .map(|&i| format!("{} ({})", &hunks[i].hunk.id[..17.min(hunks[i].hunk.id.len())], hunks[i].file_path))
+                .collect();
+            which.sort();
+            return Err(HunksetError::AmbiguousId {
+                prefix: p.value().to_string(),
+                count: matched.len(),
+                candidates: which.join(", "),
+            });
+        }
+        selected.extend(matched);
+    }
+    Ok(selected)
 }
 
 // --- semantic ---
@@ -534,7 +648,9 @@ mod tests {
                 length: if added.is_empty() { 0 } else { added.lines().count() },
             },
             context: None,
-            semantic: crate::diff::SemanticInfo::default(),
+            // These fixtures model hunks in a .rs file, i.e. ones a parser did
+            // run on. Tests for the unanalyzed case set this back to false.
+            semantic: crate::diff::SemanticInfo { is_analyzed: true, ..Default::default() },
         }
     }
 
@@ -708,6 +824,26 @@ mod tests {
         assert_eq!(evaluate(&parse("doc()").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("import()").unwrap(), &enriched).unwrap(), HashSet::from([1]));
         assert_eq!(evaluate(&parse("toplevel()").unwrap(), &enriched).unwrap(), HashSet::from([2]));
+    }
+
+    #[test]
+    #[cfg(feature = "semantic")]
+    fn unanalyzed_hunks_match_neither_toplevel_nor_depth_zero() {
+        // A file no parser supports defaults to depth 0 / is_toplevel false.
+        // Both predicates must exclude it, rather than depth(0) matching it
+        // while toplevel() does not.
+        let mut h = make_hunk(0, "insert", "", "hello\n");
+        h.semantic.is_analyzed = false;
+        let enriched = vec![EnrichedHunk { file_path: "notes.txt", file_status: "modified", hunk: &h }];
+
+        assert!(
+            evaluate(&parse("toplevel()").unwrap(), &enriched).unwrap().is_empty(),
+            "unanalyzed hunk leaked into toplevel()"
+        );
+        assert!(
+            evaluate(&parse("depth(0)").unwrap(), &enriched).unwrap().is_empty(),
+            "unanalyzed hunk leaked into depth(0)"
+        );
     }
 
     #[test]

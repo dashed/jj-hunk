@@ -1170,7 +1170,11 @@ fn list_files(dir: &Path) -> HashSet<String> {
     }
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
+        // Symlinks must be included. WalkDir does not follow them, so their
+        // file_type is `symlink`, not `file` -- filtering on is_file() alone
+        // left every symlink out of the union, so no spec could ever select or
+        // reset one and its change silently rode along in every commit.
+        if entry.file_type().is_file() || entry.file_type().is_symlink() {
             if let Ok(rel) = entry.path().strip_prefix(dir) {
                 let name = rel.to_string_lossy().to_string();
                 if name != "JJ-INSTRUCTIONS" {
@@ -1186,15 +1190,46 @@ fn reset_file(left: &Path, right: &Path, filepath: &str) -> Result<()> {
     let left_file = left.join(filepath);
     let right_file = right.join(filepath);
 
-    if left_file.exists() {
-        if let Some(parent) = right_file.parent() {
-            fs::create_dir_all(parent)?;
+    // `symlink_metadata` deliberately does NOT traverse the link. `exists()`
+    // does, so a dangling symlink in `left` (jj materialises only the changed
+    // files, so a link's target is usually absent) reported "not there" and we
+    // deleted a file that was never selected. `fs::copy` traverses too, and
+    // wrote the *target's* bytes into the link's path.
+    let left_meta = fs::symlink_metadata(&left_file).ok();
+    let right_exists = fs::symlink_metadata(&right_file).is_ok();
+
+    match left_meta {
+        Some(meta) => {
+            if let Some(parent) = right_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if right_exists {
+                fs::remove_file(&right_file)?;
+            }
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(&left_file)?;
+                symlink_file(&target, &right_file)?;
+            } else {
+                fs::copy(&left_file, &right_file)?;
+            }
         }
-        fs::copy(&left_file, &right_file)?;
-    } else if right_file.exists() {
-        fs::remove_file(&right_file)?;
+        None => {
+            if right_exists {
+                fs::remove_file(&right_file)?;
+            }
+        }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 fn apply_hunk_selection(

@@ -1033,3 +1033,190 @@ fn no_warning_when_files_are_analyzable() {
         "should not warn for a supported language: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Symlinks. WalkDir does not follow them, so filtering on is_file() left them
+// out of the file union entirely: no spec could select or reset one, and the
+// change rode along in every commit. `exists()` and `fs::copy` both traverse
+// links, so a dangling link in `left` deleted an unselected file and a live one
+// wrote the target's bytes into the link's path.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn symlink_change_does_not_leak_into_a_selective_split() {
+    let repo = TestRepo::new("symlink-leak");
+    repo.write_file("a.txt", "AAA-line1\n");
+    repo.write_file("f.txt", "FFF-secret\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "AAA-line1\nAAA-line2\n");
+    std::fs::remove_file(repo.path().join("f.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("f.txt")).unwrap();
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    // The selected change must land intact -- not the symlink target's bytes.
+    let committed = repo.jj_ok(&["file", "show", "-r", "@-", "a.txt"]);
+    assert_eq!(
+        committed, "AAA-line1\nAAA-line2\n",
+        "a.txt in the split commit was corrupted"
+    );
+    // And the unselected symlink change must not ride along.
+    let summary = repo.changed_files("@-");
+    assert!(
+        !summary.iter().any(|l| l.contains("f.txt")),
+        "unselected symlink change leaked into the commit: {summary:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_does_not_delete_an_unselected_file() {
+    let repo = TestRepo::new("symlink-dangling");
+    repo.write_file("a.txt", "one\n");
+    // `s` points at a path that will not be materialised alongside it.
+    std::os::unix::fs::symlink("absent-target.txt", repo.path().join("s")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "one\ntwo\n");
+    std::fs::remove_file(repo.path().join("s")).unwrap();
+    repo.write_file("s", "now a regular file\n");
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    let summary = repo.changed_files("@-");
+    assert!(
+        !summary.iter().any(|l| l.contains(" s") || l.ends_with('s')),
+        "unselected symlink->file change leaked into the commit: {summary:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_is_restored_as_a_link_not_as_its_target_content() {
+    let repo = TestRepo::new("symlink-restore");
+    repo.write_file("target.txt", "TARGET\n");
+    std::os::unix::fs::symlink("target.txt", repo.path().join("link")).unwrap();
+    repo.write_file("a.txt", "one\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    // retarget the link, and change a.txt
+    repo.write_file("a.txt", "one\ntwo\n");
+    std::fs::remove_file(repo.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("link")).unwrap();
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    // After reset, the working copy's link must still be a symlink.
+    let meta = std::fs::symlink_metadata(repo.path().join("link")).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "reset replaced the symlink with a regular file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation. A missing or wrong-typed argument used to degenerate
+// into `none()` -- which negation turned into `all()`, so a forgotten filename
+// committed the entire diff.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zero_argument_predicates_are_an_error_not_an_empty_set() {
+    let repo = strict_repo("args-zero");
+    for spec in ["file()", "type()", "content()", "glob()", "id()", "lines()"] {
+        let err = repo.hunk_fail(&["list", "--spec", spec]);
+        assert!(!err.is_empty(), "{spec} should error");
+    }
+}
+
+#[test]
+fn negated_zero_argument_predicate_does_not_select_everything() {
+    let repo = strict_repo("args-zero-neg");
+    // The dangerous shape: user means "everything except <file>", forgets the
+    // name, and would otherwise commit the whole diff.
+    let err = repo.hunk_fail(&["list", "--spec", "~file()"]);
+    assert!(err.contains("file()"), "got: {err}");
+    // And it must not be reachable through a mutating command either.
+    let err = repo.hunk_fail(&["split", "~file()", "oops"]);
+    assert!(!err.is_empty());
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("oops")),
+        "a commit was created from a bogus selector"
+    );
+}
+
+#[test]
+fn wrong_typed_arguments_are_rejected() {
+    let repo = strict_repo("args-type");
+    for spec in [r#"lines("abc")"#, "type(1..3)", "file(1..3)", r#"depth("x")"#] {
+        let err = repo.hunk_fail(&["list", "--spec", spec]);
+        assert!(!err.is_empty(), "{spec} should error");
+    }
+}
+
+#[test]
+fn reversed_line_range_is_rejected() {
+    let repo = strict_repo("args-reversed");
+    let err = repo.hunk_fail(&["list", "--spec", "lines(100..1)"]);
+    assert!(err.contains("100..1"), "got: {err}");
+}
+
+#[test]
+fn bare_number_is_accepted_as_a_single_line_range() {
+    let repo = strict_repo("args-bare-num");
+    // `lines(2)` reads as "hunks touching line 2" and must behave as 2..2
+    // rather than silently matching nothing.
+    let one = repo.hunk_ok(&["list", "--spec", "lines(2)", "--format", "text"]);
+    let rng = repo.hunk_ok(&["list", "--spec", "lines(2..2)", "--format", "text"]);
+    assert_eq!(one, rng, "lines(2) should equal lines(2..2)");
+}
+
+#[test]
+fn valid_argument_forms_still_work() {
+    let repo = strict_repo("args-regression");
+    for spec in [
+        "all()",
+        r#"file("a.py")"#,
+        "type(insert)",
+        "lines(1..3)",
+        r#"~file("a.py")"#,
+        r#"content("import")"#,
+    ] {
+        let out = repo.hunk_ok(&["list", "--spec", spec, "--format", "text"]);
+        assert!(!out.contains("error"), "{spec} regressed: {out}");
+    }
+}
+
+#[test]
+fn ambiguous_or_malformed_hunk_id_is_rejected() {
+    let repo = strict_repo("id-ambiguous");
+    for spec in [r#"id("hunk-")"#, r#"id("not-hex")"#, r#"id("")"#] {
+        let err = repo.hunk_fail(&["list", "--spec", spec]);
+        assert!(!err.is_empty(), "{spec} should error");
+    }
+}
+
+#[test]
+fn a_full_hunk_id_still_selects_exactly_one() {
+    let repo = strict_repo("id-full");
+    let json = repo.hunk_ok(&["list", "--format", "json"]);
+    let id = json
+        .split(r#""id": ""#)
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("no id in output")
+        .to_string();
+    let out = repo.hunk_ok(&["list", "--spec", &format!(r#"id("{id}")"#), "--format", "text"]);
+    assert_eq!(out.matches("  hunk ").count(), 1, "expected exactly one: {out}");
+}
