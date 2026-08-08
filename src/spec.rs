@@ -1,9 +1,9 @@
 use crate::diff::{normalize_hunk_id, HunkSelection};
 use serde::de::{self, Deserializer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Spec {
     #[serde(default)]
     pub files: HashMap<String, FileSpec>,
@@ -11,14 +11,14 @@ pub struct Spec {
     pub default: DefaultAction,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum FileSpec {
     Selection(HunkSpec),
     Action { action: Action },
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HunkSpec {
     #[serde(default, deserialize_with = "deserialize_hunk_selectors")]
@@ -47,7 +47,8 @@ impl HunkSpec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
 pub enum HunkSelector {
     Index(usize),
     Id(String),
@@ -108,14 +109,14 @@ where
     Ok(parsed)
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     Keep,
     Reset,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAction {
     Keep,

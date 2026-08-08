@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 mod diff;
+mod glob;
+mod hunkset;
 mod spec;
 mod commands;
 
@@ -30,7 +32,7 @@ enum Commands {
 
     /// Split changes with hunk selection
     Split {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
@@ -44,7 +46,7 @@ enum Commands {
 
     /// Commit selected hunks
     Commit {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
@@ -55,7 +57,7 @@ enum Commands {
 
     /// Squash selected hunks into parent
     Squash {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
@@ -86,13 +88,7 @@ struct ListArgs {
     /// Binary handling
     #[arg(long, value_enum, default_value_t = BinaryMode::Mark)]
     binary: BinaryMode,
-    /// Truncate file contents to N bytes before diffing
-    #[arg(long)]
-    max_bytes: Option<usize>,
-    /// Truncate file contents to N lines before diffing
-    #[arg(long)]
-    max_lines: Option<usize>,
-    /// Optional JSON/YAML spec to preview (inline or '-')
+    /// Filter output with a hunkset expression or JSON/YAML spec
     #[arg(long)]
     spec: Option<String>,
     /// Read spec from a file (JSON or YAML)
@@ -129,8 +125,6 @@ fn main() -> Result<()> {
                 spec: args.spec,
                 spec_file: args.spec_file,
                 binary: args.binary,
-                max_bytes: args.max_bytes,
-                max_lines: args.max_lines,
             };
 
             commands::list(options)

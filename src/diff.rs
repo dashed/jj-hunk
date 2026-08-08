@@ -5,6 +5,10 @@ use std::collections::HashSet;
 use std::fmt::Write;
 
 pub const HUNK_ID_PREFIX: &str = "hunk-";
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
 const CONTEXT_LINES: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +26,25 @@ pub struct HunkContext {
     pub after: String,
 }
 
+/// Semantic metadata extracted via tree-sitter (when the `semantic` feature is enabled).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SemanticInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_scope: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_doc_comment: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_import: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_toplevel: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub nesting_depth: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hunk {
     pub index: usize,
@@ -36,6 +59,8 @@ pub struct Hunk {
     pub after_range: LineRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<HunkContext>,
+    #[serde(flatten)]
+    pub semantic: SemanticInfo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,6 +192,7 @@ fn finalize_hunk(
         before_range,
         after_range,
         context,
+        semantic: SemanticInfo::default(),
     });
 }
 
@@ -301,8 +327,12 @@ fn compute_hunk_id(hunk_type: &str, removed: &str, added: &str, context: Option<
     format!("{HUNK_ID_PREFIX}{}", hex_encode(&digest))
 }
 
+/// Normalize a hunk ID string. Accepts various prefixes (`hunk-`, `id:`,
+/// `sha:`, `sha256:`) and trailing `...` (for abbreviated IDs from diff output).
+/// Returns the normalized form `hunk-<hex>` which may be shorter than 64 chars
+/// for abbreviated IDs.
 pub fn normalize_hunk_id(value: &str) -> Option<String> {
-    let trimmed = value.trim();
+    let trimmed = value.trim().trim_end_matches("...");
     if trimmed.is_empty() {
         return None;
     }
