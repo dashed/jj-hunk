@@ -15,7 +15,33 @@ pub struct Spec {
 #[serde(untagged)]
 pub enum FileSpec {
     Selection(HunkSpec),
-    Action { action: Action },
+    Action {
+        action: Action,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
+}
+
+impl FileSpec {
+    /// The path this file had on the left side of the diff, when that differs
+    /// from the key it is filed under (renames and copies).
+    ///
+    /// `select` is handed two directories and a spec; without this it can only
+    /// join the key onto both, so for a rename it looks for `left/<new name>`,
+    /// finds nothing, and treats the whole file as newly inserted.
+    pub fn source_path(&self) -> Option<&str> {
+        match self {
+            FileSpec::Selection(selection) => selection.from.as_deref(),
+            FileSpec::Action { from, .. } => from.as_deref(),
+        }
+    }
+
+    pub fn set_source_path(&mut self, source: String) {
+        match self {
+            FileSpec::Selection(selection) => selection.from = Some(source),
+            FileSpec::Action { from, .. } => *from = Some(source),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -25,6 +51,11 @@ pub struct HunkSpec {
     pub hunks: Vec<HunkSelector>,
     #[serde(default, deserialize_with = "deserialize_hunk_ids")]
     pub ids: Vec<String>,
+    /// Path this file had on the left side of the diff. Optional, and absent
+    /// for everything but renames and copies, so specs written before it
+    /// existed keep working unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 impl HunkSpec {
@@ -135,7 +166,7 @@ impl Spec {
             return false; // unlisted files are kept
         }
         self.files.values().all(|f| match f {
-            FileSpec::Action { action } => *action != Action::Keep,
+            FileSpec::Action { action, .. } => *action != Action::Keep,
             FileSpec::Selection(sel) => sel.hunks.is_empty() && sel.ids.is_empty(),
         })
     }
@@ -177,6 +208,25 @@ mod tests {
         assert!(selection.indices.contains(&0));
         assert!(selection.ids.contains(&id_inline));
         assert!(selection.ids.contains(&id_from_ids));
+    }
+
+    #[test]
+    fn rename_source_is_parsed_and_is_optional() {
+        let json = r#"{"files": {"dst.txt": {"ids": [], "from": "src.txt"},
+                                 "plain.txt": {"hunks": [0]},
+                                 "bin.dat": {"action": "keep", "from": "old.dat"}}}"#;
+        let spec = Spec::from_str(json).expect("spec should parse");
+
+        assert_eq!(
+            spec.files.get("dst.txt").unwrap().source_path(),
+            Some("src.txt")
+        );
+        // Specs written before `from` existed must keep working unchanged.
+        assert_eq!(spec.files.get("plain.txt").unwrap().source_path(), None);
+        assert_eq!(
+            spec.files.get("bin.dat").unwrap().source_path(),
+            Some("old.dat")
+        );
     }
 
     #[test]

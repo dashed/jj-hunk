@@ -598,7 +598,16 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
 
 /// Convert a set of matched enriched hunks into a Spec suitable for
 /// split/commit/squash operations.
-pub fn to_spec(selected: &HashSet<usize>, hunks: &[EnrichedHunk]) -> Spec {
+///
+/// `rename_sources` maps a file's current path to the path it had on the left
+/// side of the diff. Hunk ids for a renamed file are computed by diffing the
+/// old path against the new one, so the spec has to carry the old path or
+/// `select` cannot reproduce them.
+pub fn to_spec(
+    selected: &HashSet<usize>,
+    hunks: &[EnrichedHunk],
+    rename_sources: &HashMap<&str, &str>,
+) -> Spec {
     let mut files: HashMap<String, Vec<String>> = HashMap::new();
 
     for &idx in selected {
@@ -615,6 +624,9 @@ pub fn to_spec(selected: &HashSet<usize>, hunks: &[EnrichedHunk]) -> Spec {
             let hunk_spec = HunkSpec {
                 hunks: Vec::new(),
                 ids,
+                from: rename_sources
+                    .get(path.as_str())
+                    .map(|source| source.to_string()),
             };
             (path, FileSpec::Selection(hunk_spec))
         })
@@ -743,10 +755,24 @@ mod tests {
             EnrichedHunk { file_path: "src/b.rs", file_status: "modified", hunk: &h2 },
         ];
         let selected = HashSet::from([0]);
-        let spec = to_spec(&selected, &enriched);
+        let spec = to_spec(&selected, &enriched, &HashMap::new());
         assert_eq!(spec.default, DefaultAction::Reset);
         assert!(spec.files.contains_key("src/a.rs"));
         assert!(!spec.files.contains_key("src/b.rs"));
+        assert_eq!(spec.files["src/a.rs"].source_path(), None);
+    }
+
+    #[test]
+    fn to_spec_carries_the_rename_source() {
+        let h = make_hunk(0, "replace", "old\n", "new\n");
+        let enriched = vec![EnrichedHunk {
+            file_path: "dst.rs",
+            file_status: "renamed",
+            hunk: &h,
+        }];
+        let renames = HashMap::from([("dst.rs", "src.rs")]);
+        let spec = to_spec(&HashSet::from([0]), &enriched, &renames);
+        assert_eq!(spec.files["dst.rs"].source_path(), Some("src.rs"));
     }
 
     #[test]
@@ -901,7 +927,7 @@ mod tests {
             EnrichedHunk { file_path: "src/b.rs", file_status: "modified", hunk: &h3 },
         ];
         let selected = HashSet::from([0, 2]);
-        let spec = to_spec(&selected, &enriched);
+        let spec = to_spec(&selected, &enriched, &HashMap::new());
         assert!(spec.files.contains_key("src/a.rs"));
         assert!(spec.files.contains_key("src/b.rs"));
         match spec.files.get("src/a.rs").unwrap() {

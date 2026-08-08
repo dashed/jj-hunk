@@ -3,7 +3,7 @@ use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
 #[cfg(feature = "semantic")]
 use crate::semantic;
-use crate::spec::{Action, DefaultAction, FileSpec, Spec};
+use crate::spec::{Action, DefaultAction, FileSpec, HunkSelector, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -179,8 +179,18 @@ struct SpecTemplateOutput {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum SpecTemplateEntry {
-    Ids { ids: Vec<String> },
-    Action { action: String },
+    Ids {
+        ids: Vec<String>,
+        /// Left-hand path of a rename or copy. `select` needs it to find the
+        /// "before" content the ids were computed against.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
+    Action {
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,7 +475,17 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
 
     let selected = hunkset::evaluate(&ast, &enriched)
         .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e.display_with_context()))?;
-    let spec = hunkset::to_spec(&selected, &enriched);
+
+    let rename_sources: HashMap<&str, &str> = file_hunks
+        .iter()
+        .filter_map(|fh| {
+            fh.rename
+                .as_ref()
+                .filter(|r| r.from != fh.path)
+                .map(|r| (fh.path.as_str(), r.from.as_str()))
+        })
+        .collect();
+    let spec = hunkset::to_spec(&selected, &enriched, &rename_sources);
 
     serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
 }
@@ -852,9 +872,11 @@ fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
         match file_spec {
             FileSpec::Action {
                 action: Action::Keep,
+                ..
             } => SpecDecision::KeepAll,
             FileSpec::Action {
                 action: Action::Reset,
+                ..
             } => SpecDecision::Skip,
             FileSpec::Selection(selection) => {
                 let selection = selection.to_selection();
@@ -972,16 +994,29 @@ fn group_summaries(files: Vec<FileSummary>, grouping: ListGrouping) -> Vec<ListS
     groups
 }
 
+/// The left-hand path of a rename or copy, when it differs from the current
+/// path. A spec entry needs it so `select` can find the "before" content the
+/// entry's hunk ids were computed against.
+fn rename_source(rename: &Option<RenameInfo>, path: &str) -> Option<String> {
+    rename
+        .as_ref()
+        .filter(|r| r.from != path)
+        .map(|r| r.from.clone())
+}
+
 fn build_spec_template(files: Vec<FileEntry>) -> SpecTemplateOutput {
     let mut output = HashMap::new();
 
     for file in files {
+        let from = rename_source(&file.rename, &file.path);
+
         if file.hunks.is_empty() {
             if file.binary == Some(true) {
                 output.insert(
                     file.path,
                     SpecTemplateEntry::Action {
                         action: "keep".to_string(),
+                        from,
                     },
                 );
             }
@@ -989,7 +1024,7 @@ fn build_spec_template(files: Vec<FileEntry>) -> SpecTemplateOutput {
         }
 
         let ids = file.hunks.into_iter().map(|hunk| hunk.id).collect();
-        output.insert(file.path, SpecTemplateEntry::Ids { ids });
+        output.insert(file.path, SpecTemplateEntry::Ids { ids, from });
     }
 
     SpecTemplateOutput {
@@ -1396,30 +1431,74 @@ pub fn select(left: &str, right: &str) -> Result<()> {
     let right_files = list_files(right_path);
     let all_files: HashSet<_> = left_files.union(&right_files).cloned().collect();
 
-    for filepath in all_files {
-        let file_spec = spec.files.get(&filepath);
+    // jj hands a rename to the tool as two unrelated paths: the old one in
+    // `left`, the new one in `right`. Only the new one is named in the spec,
+    // so the old one has to be resolved through the entry that claims it.
+    let mut rename_sources: HashMap<&str, &str> = HashMap::new();
+    for (path, file_spec) in &spec.files {
+        if let Some(from) = file_spec.source_path() {
+            if from != path {
+                rename_sources.insert(from, path.as_str());
+            }
+        }
+    }
 
-        match file_spec {
-            Some(FileSpec::Action {
+    // Whether each named file ended up keeping any of its change. A rename
+    // source can only be resolved once its target has been decided.
+    let mut kept: HashMap<&str, bool> = HashMap::new();
+
+    for filepath in &all_files {
+        let Some(file_spec) = spec.files.get(filepath) else {
+            continue;
+        };
+        let source = file_spec
+            .source_path()
+            .filter(|from| *from != filepath.as_str());
+
+        let keeps_change = match file_spec {
+            FileSpec::Action {
                 action: Action::Keep,
-            }) => {
-                // Keep as-is
-            }
-            Some(FileSpec::Action {
+                ..
+            } => true,
+            FileSpec::Action {
                 action: Action::Reset,
-            }) => {
-                reset_file(left_path, right_path, &filepath)?;
+                ..
+            } => {
+                reset_file(left_path, right_path, filepath)?;
+                false
             }
-            Some(FileSpec::Selection(selection)) => {
-                let selection = selection.to_selection();
-                apply_hunk_selection(left_path, right_path, &filepath, &selection)?;
-            }
-            None => {
-                // Use default
-                if spec.default == DefaultAction::Reset {
-                    reset_file(left_path, right_path, &filepath)?;
+            FileSpec::Selection(selection) => apply_hunk_selection(
+                left_path,
+                right_path,
+                source,
+                filepath,
+                &selection.to_selection(),
+            )?,
+        };
+        kept.insert(filepath.as_str(), keeps_change);
+    }
+
+    for filepath in &all_files {
+        if spec.files.contains_key(filepath) {
+            continue;
+        }
+
+        // A path that some entry claims as its rename source, and that is
+        // really gone from the right side, follows that entry: a kept rename
+        // leaves it deleted, a reset one puts it back. (A copy leaves the
+        // source in place on the right, so it takes the default action like
+        // any other file.)
+        if let Some(target) = rename_sources.get(filepath.as_str()) {
+            if !right_files.contains(filepath) {
+                if !kept.get(target).copied().unwrap_or(false) {
+                    reset_file(left_path, right_path, filepath)?;
                 }
+                continue;
             }
+        }
+
+        if spec.default == DefaultAction::Reset {
+            reset_file(left_path, right_path, filepath)?;
         }
     }
 
@@ -1495,36 +1574,77 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
 
+/// Apply a hunk selection to one file, reporting whether anything was kept.
+///
+/// `source` is the file's path on the left side when it differs from
+/// `filepath` (renames and copies). The spec's hunk ids were computed by
+/// diffing `left/<source>` against `right/<filepath>`; joining `filepath` onto
+/// both sides instead recomputes the change as one whole-file insertion under
+/// a different id, so nothing matches and the file is written out empty.
 fn apply_hunk_selection(
     left: &Path,
     right: &Path,
+    source: Option<&str>,
     filepath: &str,
     selection: &HunkSelection,
-) -> Result<()> {
-    let left_file = left.join(filepath);
+) -> Result<bool> {
+    // A `from` naming something that is not on the left is unusable. Fall back
+    // to the spec key rather than reading an empty "before" and concluding the
+    // file is new -- that path ends in deleting it.
+    let source = source.filter(|from| fs::symlink_metadata(left.join(from)).is_ok());
+
+    let left_file = left.join(source.unwrap_or(filepath));
     let right_file = right.join(filepath);
 
-    let before = if left_file.exists() {
-        fs::read_to_string(&left_file)?
-    } else {
-        String::new()
-    };
+    // Not `exists()`: that traverses symlinks, so a dangling link (jj
+    // materialises only the changed files, so a link's target is usually
+    // absent) reads as "not there".
+    let right_exists = fs::symlink_metadata(&right_file).is_ok();
 
-    let after = if right_file.exists() {
-        fs::read_to_string(&right_file)?
-    } else {
-        return Ok(());
-    };
+    // Deleted on the right: the whole file is a single delete hunk. Keep the
+    // deletion only if that hunk is selected -- otherwise the file is reset,
+    // which for a deletion means putting it back. Returning early here left
+    // every deletion in the commit no matter what the spec said.
+    if !right_exists {
+        // A deletion is always same-path, so read the left side at `filepath`
+        // rather than at a `source` a malformed spec might have supplied.
+        // Unreadable (a symlink, say) reads as empty, which yields no hunks
+        // and so restores the file -- the safe direction.
+        let before = fs::read_to_string(left.join(filepath)).unwrap_or_default();
+        let keeps_deletion = get_hunks(&before, "")
+            .iter()
+            .any(|hunk| selection.matches(hunk.index, &hunk.id));
+        if !keeps_deletion {
+            reset_file(left, right, filepath)?;
+        }
+        return Ok(keeps_deletion);
+    }
+
+    // A file that exists on the right but not at `filepath` on the left is
+    // either newly added or the target of a rename. Either way its "reset"
+    // state is: not present.
+    let existed_at_this_path = source.is_none() && fs::symlink_metadata(&left_file).is_ok();
+
+    let before = fs::read_to_string(&left_file).unwrap_or_default();
+    let after = fs::read_to_string(&right_file)?;
 
     let result = apply_selected_hunks(&before, &after, selection);
+    let keeps_change = result != before;
 
-    fs::write(&right_file, result)?;
+    if !existed_at_this_path && !keeps_change {
+        // Writing `result` here would leave a 0-byte file in the commit for an
+        // added file, or an unwanted copy of the old content for a rename.
+        fs::remove_file(&right_file)?;
+        return Ok(false);
+    }
+
+    fs::write(&right_file, &result)?;
     // `fs::write` keeps whatever mode the destination already had, so a
     // `chmod +x` in the working copy survived even when none of the file's
     // hunks were selected. A mode change is not a hunk and cannot be selected,
     // so it is restored from the left side exactly like unselected content.
     restore_exec_bit(&left_file, &right_file)?;
-    Ok(())
+    Ok(keeps_change)
 }
 
 /// Give `right` the executable bits `left` has.
@@ -1575,6 +1695,117 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
     Ok(spec.to_string())
 }
 
+/// Check that a spec actually resolves against the diff it will be applied to.
+///
+/// `Spec::selects_nothing` is structural: a non-empty id list satisfies it even
+/// when no such hunk exists. So a typo'd path or a stale id passed the guard,
+/// selected nothing, and produced an empty commit at exit 0 -- the exact
+/// failure that guard was added to prevent.
+///
+/// An entry that deliberately keeps nothing (`"ids": []`) is not an error:
+/// blanking out the ids you do not want is the documented workflow, and the
+/// structural check above already catches a spec where *every* entry is empty.
+fn validate_spec_resolves(spec: &Spec, file_hunks: &[FileHunks]) -> Result<()> {
+    let mut known: HashMap<&str, &FileHunks> = HashMap::new();
+    for fh in file_hunks {
+        for path in fh.all_paths() {
+            known.insert(path, fh);
+        }
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    for (path, file_spec) in &spec.files {
+        // An entry that keeps nothing by construction cannot produce the empty
+        // commit this guards against, so an unknown path there is harmless.
+        let intends_to_keep = match file_spec {
+            FileSpec::Action { action, .. } => *action == Action::Keep,
+            FileSpec::Selection(selection) => {
+                !selection.hunks.is_empty() || !selection.ids.is_empty()
+            }
+        };
+
+        let Some(fh) = known.get(path.as_str()) else {
+            if intends_to_keep {
+                problems.push(format!("{path}: no such path in the diff"));
+            }
+            continue;
+        };
+
+        let FileSpec::Selection(selection) = file_spec else {
+            continue;
+        };
+
+        let ids = selection.ids.iter().map(String::as_str).chain(
+            selection
+                .hunks
+                .iter()
+                .filter_map(|selector| match selector {
+                    HunkSelector::Id(id) => Some(id.as_str()),
+                    HunkSelector::Index(_) => None,
+                }),
+        );
+        for id in ids {
+            if !fh.hunks.iter().any(|hunk| hunk.id == id) {
+                problems.push(format!("{path}: no hunk with id {id}"));
+            }
+        }
+
+        for selector in &selection.hunks {
+            let HunkSelector::Index(index) = selector else {
+                continue;
+            };
+            if !fh.hunks.iter().any(|hunk| hunk.index == *index) {
+                problems.push(format!(
+                    "{path}: no hunk with index {index} (file has {})",
+                    fh.hunks.len()
+                ));
+            }
+        }
+    }
+
+    if !problems.is_empty() {
+        problems.sort();
+        anyhow::bail!(
+            "spec does not resolve against the diff:\n  {}\n\
+             Those entries would keep nothing. Check them against \
+             `jj-hunk list --spec-template`, or pass --allow-empty if that is \
+             intended.",
+            problems.join("\n  ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Attach the left-hand path of every rename the spec names but does not
+/// describe. Returns whether anything was filled in.
+///
+/// `select` is handed two directories and nothing else, so it cannot tell that
+/// `right/dst` used to be `left/src`. Without the source path it recomputes the
+/// change as one whole-file insertion, matches none of the spec's hunk ids, and
+/// writes an empty file. Filling this in here means a hand-written spec -- the
+/// usual "copy an id out of `list`" shape -- does not have to know about it.
+fn fill_rename_sources(spec: &mut Spec, file_hunks: &[FileHunks]) -> bool {
+    let mut filled = false;
+
+    for fh in file_hunks {
+        let Some(source) = rename_source(&fh.rename, &fh.path) else {
+            continue;
+        };
+        let Some(file_spec) = spec.files.get_mut(&fh.path) else {
+            continue;
+        };
+        if file_spec.source_path().is_some() {
+            continue; // already stated; do not second-guess it
+        }
+        file_spec.set_source_path(source);
+        filled = true;
+    }
+
+    filled
+}
+
 fn run_jj_with_selection(
     args: &[&str],
     spec: Option<&str>,
@@ -1583,28 +1814,44 @@ fn run_jj_with_selection(
     allow_empty: bool,
 ) -> Result<()> {
     let raw_spec = resolve_spec_input(spec, spec_file)?;
-    let spec_content = if hunkset::is_hunkset(&raw_spec) {
+    let is_hunkset = hunkset::is_hunkset(&raw_spec);
+    let mut spec_content = if is_hunkset {
         evaluate_hunkset(&raw_spec, rev)?
     } else {
         raw_spec.clone()
     };
 
-    // Refuse to mutate history with a selection that keeps nothing. jj would
-    // happily create an empty commit and exit 0, which hides a typo'd
-    // selector from any script driving this.
-    if !allow_empty {
-        if let Ok(parsed) = Spec::from_str(&spec_content) {
-            if parsed.selects_nothing() {
-                anyhow::bail!(
-                    "selection matched no hunks: {}\n\
-                     Nothing would be kept, so this would create an empty commit.\n\
-                     Check the selector with `jj-hunk list --spec ...`, or pass \
-                     --allow-empty if that is intended.",
-                    raw_spec.trim()
-                );
+    if let Ok(mut parsed) = Spec::from_str(&spec_content) {
+        // Refuse to mutate history with a selection that keeps nothing. jj
+        // would happily create an empty commit and exit 0, which hides a
+        // typo'd selector from any script driving this.
+        if !allow_empty && parsed.selects_nothing() {
+            anyhow::bail!(
+                "selection matched no hunks: {}\n\
+                 Nothing would be kept, so this would create an empty commit.\n\
+                 Check the selector with `jj-hunk list --spec ...`, or pass \
+                 --allow-empty if that is intended.",
+                raw_spec.trim()
+            );
+        }
+
+        // A hunkset spec is built from the diff it was evaluated against, so
+        // its paths and ids resolve by construction and it already carries
+        // every rename source. A hand-written one needs both passes.
+        if !is_hunkset {
+            // `Mark`, not `Skip`: a binary file has no hunks but is still a
+            // legitimate spec target via `{"action": "keep"}`.
+            let file_hunks = load_file_hunks(rev, BinaryMode::Mark)?;
+            if !allow_empty {
+                validate_spec_resolves(&parsed, &file_hunks)?;
+            }
+            if fill_rename_sources(&mut parsed, &file_hunks) {
+                spec_content = serde_json::to_string(&parsed)
+                    .context("failed to re-serialize spec with rename sources")?;
             }
         }
     }
+
     let temp_file = std::env::temp_dir().join(format!("jj-hunk-{}.spec", std::process::id()));
     fs::write(&temp_file, spec_content)?;
 

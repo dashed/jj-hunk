@@ -1674,6 +1674,367 @@ fn ambiguous_or_malformed_hunk_id_is_rejected() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Renames. `list` diffs `left/<source>` against `right/<target>`, so the hunk
+// id it reports is computed over the real edit. `select` only ever saw the
+// spec key, so it joined the target name onto both directories, found no
+// `left/<target>`, recomputed the hunk as "insert whole file" under a
+// different id, matched nothing, and wrote an empty file.
+// ---------------------------------------------------------------------------
+
+/// A repo whose working copy renames `src.txt` to `dst.txt` and edits one line.
+/// The lines are long enough for jj to report a rename rather than add+delete.
+fn rename_repo(name: &str) -> (TestRepo, &'static str) {
+    const BASE: &str = "aaaaaaaaaaaa\nbbbbbbbbbbbb\ncccccccccccc\ndddddddddddd\neeeeeeeeeeee\n";
+    const EDITED: &str = "aaaaaaaaaaaa\nbbbbbbbbbbbb\nCCC-CHANGED\ndddddddddddd\neeeeeeeeeeee\n";
+
+    let repo = TestRepo::new(name);
+    repo.write_file("src.txt", BASE);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("src.txt")).unwrap();
+    repo.write_file("dst.txt", EDITED);
+
+    // Guard against a vacuous test: if jj reports add+delete instead of a
+    // rename, none of the rename code paths are exercised at all.
+    let summary = repo.changed_files("@");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.contains("src.txt") && l.contains("dst.txt")),
+        "jj did not detect a rename, the test would be vacuous: {summary:?}"
+    );
+
+    (repo, EDITED)
+}
+
+#[test]
+fn renamed_file_selected_by_id_keeps_its_content() {
+    let (repo, edited) = rename_repo("rename-by-id");
+
+    // The documented workflow: take the spec template and feed it straight back.
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    repo.hunk_ok(&["split", &template, "keep the rename"]);
+
+    let got = repo.jj_ok(&["file", "show", "-r", "@-", "dst.txt"]);
+    assert_eq!(
+        got, edited,
+        "renamed file was committed with the wrong content (spec was:\n{template})"
+    );
+}
+
+#[test]
+fn renamed_file_selected_by_a_hand_written_id_spec_keeps_its_content() {
+    // The other half of the id path: an id copied out of `list` into a spec by
+    // hand carries no rename information, so the source has to be filled in
+    // from the diff before `select` is handed the spec.
+    let (repo, edited) = rename_repo("rename-handwritten-id");
+    let id = first_hunk_id(&repo, "dst.txt");
+    let spec = format!(r#"{{"files": {{"dst.txt": {{"ids": ["{id}"]}}}}, "default": "reset"}}"#);
+
+    repo.hunk_ok(&["split", &spec, "keep the rename by bare id"]);
+
+    let got = repo.jj_ok(&["file", "show", "-r", "@-", "dst.txt"]);
+    assert_eq!(got, edited, "spec was:\n{spec}");
+}
+
+#[test]
+fn renamed_file_selected_by_index_still_keeps_its_content() {
+    // Backward compatibility: a spec written before `from` existed carries no
+    // rename information, and index selection must keep working as it did.
+    let (repo, edited) = rename_repo("rename-by-index");
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"dst.txt": {"hunks": [0]}}, "default": "reset"}"#,
+        "keep the rename by index",
+    ]);
+
+    let got = repo.jj_ok(&["file", "show", "-r", "@-", "dst.txt"]);
+    assert_eq!(got, edited, "index selection regressed for a renamed file");
+}
+
+#[test]
+fn keeping_a_rename_does_not_resurrect_the_source_file() {
+    // jj hands `select` the rename as two entries: `left/src.txt` and
+    // `right/dst.txt`. Only the target is named in the spec, so the source
+    // fell through to `default: reset` and was copied back into `right`,
+    // turning the rename into a copy.
+    let (repo, _) = rename_repo("rename-source");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    repo.hunk_ok(&["split", &template, "keep the rename"]);
+
+    let tracked = repo.jj_ok(&["file", "list", "-r", "@-"]);
+    assert!(
+        !tracked.lines().any(|l| l.trim() == "src.txt"),
+        "the rename source was resurrected, making the commit a copy:\n{tracked}"
+    );
+    assert!(
+        tracked.lines().any(|l| l.trim() == "dst.txt"),
+        "the rename target is missing from the commit:\n{tracked}"
+    );
+}
+
+#[test]
+fn resetting_a_rename_restores_the_source_file() {
+    // The mirror case: nothing selected for the target, so the whole rename
+    // must be undone -- target gone, source back where it was.
+    let (repo, _) = rename_repo("rename-reset");
+
+    repo.write_file("other.txt", "other\n");
+    let other_id = first_hunk_id(&repo, "other.txt");
+    let spec = format!(
+        r#"{{"files": {{"other.txt": {{"ids": ["{other_id}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "only other.txt"]);
+
+    let files = repo.changed_files("@-");
+    assert!(
+        !files.iter().any(|f| f.contains("dst.txt")),
+        "an unselected rename leaked into the commit: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("src.txt")),
+        "an unselected rename deleted its source: {files:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A selection that keeps nothing must reset the file, not mutate it. Blanking
+// out the ids you do not want in a `--spec-template` is the natural workflow,
+// and it produced non-empty but wrong commits: deletions still applied, and
+// added files landed as 0-byte stubs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deleted_file_with_an_empty_selection_is_not_deleted() {
+    let repo = TestRepo::new("empty-sel-delete");
+    repo.write_file("gone.txt", "gone-line1\ngone-line2\n");
+    repo.write_file("keep.txt", "keep-line1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+    repo.write_file("keep.txt", "keep-line1\nkeep-line2\n");
+
+    let keep_id = first_hunk_id(&repo, "keep.txt");
+    let spec = format!(
+        r#"{{"files": {{"gone.txt": {{"ids": []}}, "keep.txt": {{"ids": ["{keep_id}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "only keep.txt"]);
+
+    let files = repo.changed_files("@-");
+    assert!(
+        !files.iter().any(|f| f.contains("gone.txt")),
+        "a file whose selection keeps nothing was deleted anyway: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.contains("keep.txt")),
+        "the selected change is missing: {files:?}"
+    );
+}
+
+#[test]
+fn added_file_with_an_empty_selection_is_left_out_entirely() {
+    let repo = TestRepo::new("empty-sel-add");
+    repo.write_file("keep.txt", "keep-line1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("new.txt", "brand new\ncontent\n");
+    repo.write_file("keep.txt", "keep-line1\nkeep-line2\n");
+
+    let keep_id = first_hunk_id(&repo, "keep.txt");
+    let spec = format!(
+        r#"{{"files": {{"new.txt": {{"ids": []}}, "keep.txt": {{"ids": ["{keep_id}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "only keep2"]);
+
+    let files = repo.changed_files("@-");
+    assert!(
+        !files.iter().any(|f| f.contains("new.txt")),
+        "an unselected added file landed in the commit (as a 0-byte stub): {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.contains("keep.txt")),
+        "the selected change is missing: {files:?}"
+    );
+}
+
+#[test]
+fn a_deletion_that_is_selected_still_deletes_the_file() {
+    // The mirror of the case above: restoring a file whose selection keeps
+    // nothing must not make deletions unselectable.
+    let repo = TestRepo::new("selected-delete");
+    repo.write_file("gone.txt", "gone-line1\ngone-line2\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("gone.txt")).unwrap();
+
+    let gone_id = first_hunk_id(&repo, "gone.txt");
+    let spec =
+        format!(r#"{{"files": {{"gone.txt": {{"ids": ["{gone_id}"]}}}}, "default": "reset"}}"#);
+    repo.hunk_ok(&["split", &spec, "drop gone.txt"]);
+
+    let files = repo.changed_files("@-");
+    assert!(
+        files.iter().any(|f| f.contains("gone.txt")),
+        "a selected deletion was undone: {files:?}"
+    );
+}
+
+#[test]
+fn an_added_file_that_is_selected_keeps_its_content() {
+    // The mirror of the 0-byte case: removing unselected additions must not
+    // drop selected ones.
+    let repo = TestRepo::new("selected-add");
+    repo.write_file("base.txt", "base\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("new.txt", "brand new\ncontent\n");
+
+    let new_id = first_hunk_id(&repo, "new.txt");
+    let spec = format!(r#"{{"files": {{"new.txt": {{"ids": ["{new_id}"]}}}}, "default": "reset"}}"#);
+    repo.hunk_ok(&["split", &spec, "add new.txt"]);
+
+    let got = repo.jj_ok(&["file", "show", "-r", "@-", "new.txt"]);
+    assert_eq!(got, "brand new\ncontent\n", "a selected addition was dropped");
+}
+
+#[test]
+fn hunkset_selection_of_a_renamed_file_keeps_its_content() {
+    // The hunkset path builds its own spec, so it has to carry the rename
+    // source too.
+    let (repo, edited) = rename_repo("rename-hunkset");
+    repo.hunk_ok(&["split", r#"file("dst.txt")"#, "hunkset rename"]);
+
+    let got = repo.jj_ok(&["file", "show", "-r", "@-", "dst.txt"]);
+    assert_eq!(got, edited, "hunkset selection lost the renamed content");
+}
+
+// ---------------------------------------------------------------------------
+// A JSON spec must be checked against the diff it will be applied to, not just
+// parsed. `selects_nothing` is structural: it sees a non-empty id list and is
+// satisfied, even when no such hunk exists, so a typo produced an empty commit
+// at exit 0 -- exactly what --allow-empty was introduced to prevent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn out_of_range_hunk_index_is_rejected() {
+    let repo = strict_repo("resolve-bad-index");
+    let err = repo.hunk_fail(&[
+        "split",
+        r#"{"files": {"a.py": {"hunks": [99]}}, "default": "reset"}"#,
+        "out of range",
+    ]);
+    assert!(err.contains("99"), "error should name the bad index: {err}");
+    assert!(
+        !repo
+            .log_descriptions()
+            .iter()
+            .any(|d| d.contains("out of range")),
+        "an empty commit was created from an out-of-range index"
+    );
+}
+
+#[test]
+fn spec_path_that_is_not_in_the_diff_is_rejected() {
+    let repo = strict_repo("resolve-bad-path");
+    let err = repo.hunk_fail(&[
+        "split",
+        r#"{"files": {"nope.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "bad path",
+    ]);
+    assert!(err.contains("nope.txt"), "error should name the path: {err}");
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("bad path")),
+        "an empty commit was created from an unknown path"
+    );
+}
+
+#[test]
+fn unknown_hunk_id_in_a_spec_is_rejected() {
+    let repo = strict_repo("resolve-bad-id");
+    let bogus = format!("hunk-{}", "a".repeat(64));
+    let spec = format!(
+        r#"{{"files": {{"a.py": {{"ids": ["{bogus}"]}}}}, "default": "reset"}}"#
+    );
+    let err = repo.hunk_fail(&["split", &spec, "bad id"]);
+    assert!(err.contains(&bogus), "error should name the bad id: {err}");
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("bad id")),
+        "an empty commit was created from an unknown hunk id"
+    );
+}
+
+#[test]
+fn allow_empty_still_bypasses_the_resolution_check() {
+    let repo = strict_repo("resolve-allow-empty");
+    repo.hunk_ok(&[
+        "split",
+        "--allow-empty",
+        r#"{"files": {"nope.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "intentionally empty",
+    ]);
+    assert!(
+        repo.log_descriptions()
+            .iter()
+            .any(|d| d.contains("intentionally empty")),
+        "--allow-empty must remain the escape hatch"
+    );
+}
+
+#[test]
+fn an_explicitly_empty_selection_is_not_a_resolution_error() {
+    // Blanking out the ids you do not want is the documented workflow; only
+    // ids and indices that cannot exist are errors.
+    let repo = strict_repo("resolve-empty-entry");
+    let py_id = first_hunk_id(&repo, "a.py");
+    let spec = format!(
+        r#"{{"files": {{"a.rs": {{"ids": []}}, "a.py": {{"ids": ["{py_id}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "python only"]);
+    assert!(
+        repo.log_descriptions()
+            .iter()
+            .any(|d| d.contains("python only")),
+        "a blanked-out entry must not be rejected"
+    );
+}
+
+#[test]
+fn an_entry_that_keeps_nothing_may_name_an_unknown_path() {
+    // A boilerplate "always reset these" list cannot cause an empty commit, so
+    // a stale path in one is not worth failing over.
+    let repo = strict_repo("resolve-harmless-path");
+    let py_id = first_hunk_id(&repo, "a.py");
+    let spec = format!(
+        r#"{{"files": {{"stale.txt": {{"action": "reset"}}, "vanished.txt": {{"ids": []}}, "a.py": {{"ids": ["{py_id}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "python only, stale entries"]);
+    assert!(
+        repo.log_descriptions()
+            .iter()
+            .any(|d| d.contains("python only, stale entries")),
+        "a harmless stale entry must not be rejected"
+    );
+}
+
+/// The first hunk id `list` reports for `path`, read from `--format text`.
+fn first_hunk_id(repo: &TestRepo, path: &str) -> String {
+    let out = repo.hunk_ok(&["list", "--format", "text"]);
+    let mut current = String::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("  hunk ") {
+            if current == path {
+                return rest
+                    .split_whitespace()
+                    .nth(2)
+                    .expect("hunk line has no id")
+                    .to_string();
+            }
+        } else if !line.starts_with(' ') {
+            // File header: "<status char> <path>[ (from -> to)]".
+            current = line.split_whitespace().nth(1).unwrap_or("").to_string();
+        }
+    }
+    panic!("no hunk found for {path} in:\n{out}");
+}
+
 #[test]
 fn a_full_hunk_id_still_selects_exactly_one() {
     let repo = strict_repo("id-full");
