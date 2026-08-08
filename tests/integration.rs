@@ -1198,6 +1198,473 @@ fn valid_argument_forms_still_work() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Paths are handed to `jj file show` as fileset expressions. Unquoted, any
+// path containing `( ) " ' ~ , [ ]` is parsed as fileset *syntax*, so the
+// read either fails or reads a different file -- and because the read never
+// checked its exit status, the failure became "empty file", the file yielded
+// zero hunks, and it was dropped from `list` entirely.
+// ---------------------------------------------------------------------------
+
+/// Path characters that are legal on every platform jj-hunk targets and that
+/// all mean something to the fileset parser.
+const METACHAR_NAMES: &[&str] = &[
+    "plain.txt",
+    "paren(1).txt",
+    "single'.txt",
+    "tilde~x.txt",
+    "has,comma.txt",
+];
+
+fn metachar_repo(name: &str, names: &[&str]) -> TestRepo {
+    let repo = TestRepo::new(name);
+    for f in names {
+        repo.write_file(f, "a\n");
+    }
+    repo.jj_ok(&["commit", "-m", "base"]);
+    for f in names {
+        repo.write_file(f, "a\nb\n");
+    }
+    repo
+}
+
+#[test]
+fn paths_with_fileset_metacharacters_are_not_silently_dropped() {
+    let repo = metachar_repo("fileset-metachars", METACHAR_NAMES);
+
+    // jj itself sees every file.
+    let summary = repo.changed_files("@");
+    assert_eq!(
+        summary.len(),
+        METACHAR_NAMES.len(),
+        "precondition: jj should report every file: {summary:?}"
+    );
+
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text"]);
+    for f in METACHAR_NAMES {
+        assert!(
+            out.contains(f),
+            "{f} vanished from `list` -- its path was parsed as fileset syntax:\n{out}"
+        );
+    }
+}
+
+/// `"` is legal in a POSIX filename and is the fileset string delimiter, so it
+/// is the one character that a naive `"{path}"` wrapper would still get wrong.
+#[cfg(unix)]
+#[test]
+fn a_double_quote_in_a_path_is_escaped_not_dropped() {
+    let repo = metachar_repo("fileset-quote", &["plain.txt", "quote\".txt"]);
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text"]);
+    assert!(
+        out.contains("quote\".txt"),
+        "a path containing a double quote vanished from `list`:\n{out}"
+    );
+}
+
+/// A bare path is parsed as a *glob* pattern, so `br[1].txt` matched `br1.txt`
+/// and `list` reported one file's hunks under the other file's name.
+#[test]
+fn glob_metacharacters_in_a_path_do_not_read_a_different_file() {
+    let repo = TestRepo::new("fileset-glob-metachars");
+    repo.write_file("br[1].txt", "same\n");
+    repo.write_file("br1.txt", "same\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    // Only the bracketed file changes. A glob read would find `br1.txt`,
+    // see no difference, and report zero hunks.
+    repo.write_file("br[1].txt", "same\nbracketed-change\n");
+
+    let out = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        out.contains("bracketed-change"),
+        "hunks for `br[1].txt` were computed against `br1.txt`:\n{out}"
+    );
+    assert!(
+        !out.contains("br1.txt (") && !out.contains("M br1.txt"),
+        "`br1.txt` is unchanged and must not appear:\n{out}"
+    );
+}
+
+/// The documented `--spec-template` -> `split` flow must move every file it
+/// listed, not commit a subset and leave the rest behind at exit 0.
+#[test]
+fn spec_template_split_does_not_leave_metachar_files_behind() {
+    let repo = metachar_repo("fileset-metachars-split", METACHAR_NAMES);
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    let spec_path = repo.path().join("_tmpl.json");
+    std::fs::write(&spec_path, &template).unwrap();
+
+    repo.hunk_ok(&["split", "-f", spec_path.to_str().unwrap(), "everything"]);
+
+    let committed = repo.changed_files("@-");
+    for f in METACHAR_NAMES {
+        assert!(
+            committed.iter().any(|l| l.contains(f)),
+            "{f} was silently left in the working copy instead of committed: {committed:?}"
+        );
+    }
+}
+
+/// A read that fails must surface an error, not degrade into an empty file.
+/// `tilde~x.txt` is the case that proves an exit-status check alone is not
+/// enough: unquoted, jj parses it as `tilde ~ x.txt`, warns on stderr, and
+/// exits **0** with empty stdout.
+#[test]
+fn a_tilde_in_a_path_is_not_parsed_as_a_difference_operator() {
+    let repo = metachar_repo("fileset-tilde", &["plain.txt", "tilde~x.txt"]);
+    let out = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        out.contains("tilde~x.txt"),
+        "`tilde~x.txt` was parsed as `tilde ~ x.txt` and dropped:\n{out}"
+    );
+}
+
+/// A leading `-` made jj's own argument parser read the path as flags, so the
+/// read failed and the file was dropped. Quoting it into a `file:` pattern
+/// fixes the argument parsing too.
+#[test]
+fn a_leading_dash_in_a_path_is_not_parsed_as_a_flag() {
+    let repo = metachar_repo("fileset-leading-dash", &["plain.txt", "-dash.txt"]);
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text"]);
+    assert!(
+        out.contains("-dash.txt"),
+        "`-dash.txt` was parsed as command-line flags and dropped:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Merge revisions. `@-` on a two-parent commit is ambiguous: `jj file show -r
+// @-` fails, the before-text came back empty, and every file looked like a
+// whole-file insertion. Both `--spec-template` (IDs that can never match, so
+// `split` makes an EMPTY commit) and index selection then acted on a diff that
+// was never real -- at exit 0.
+// ---------------------------------------------------------------------------
+
+/// A working copy whose parent is a merge of two bookmarks, with `f.txt`
+/// (present in both parents) modified on top.
+fn merge_working_copy_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("f.txt", "L1\nL2\nL3\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.jj_ok(&["bookmark", "create", "b0", "-r", "@-"]);
+
+    repo.write_file("a.txt", "A\n");
+    repo.jj_ok(&["commit", "-m", "side A"]);
+    repo.jj_ok(&["bookmark", "create", "ba", "-r", "@-"]);
+
+    repo.jj_ok(&["new", "b0"]);
+    repo.write_file("b.txt", "B\n");
+    repo.jj_ok(&["commit", "-m", "side B"]);
+    repo.jj_ok(&["bookmark", "create", "bb", "-r", "@-"]);
+
+    // Working copy is now a merge of the two sides.
+    repo.jj_ok(&["new", "ba", "bb"]);
+    repo.write_file("f.txt", "L1\nCHANGED\nL3\n");
+    repo
+}
+
+#[test]
+fn a_merge_working_copy_is_an_error_not_a_bogus_whole_file_insertion() {
+    let repo = merge_working_copy_repo("merge-list");
+
+    // Precondition: this really is a merge, and the change really is a
+    // one-line replacement.
+    let status = repo.jj_ok(&["status"]);
+    assert_eq!(
+        status.matches("Parent commit").count(),
+        2,
+        "precondition: working copy should have two parents:\n{status}"
+    );
+
+    let err = repo.hunk_fail(&["list", "--format", "text"]);
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("merge") || lower.contains("parent"),
+        "expected a clear merge-commit error, got: {err}"
+    );
+}
+
+#[test]
+fn a_merge_revision_does_not_produce_a_spec_template_that_matches_nothing() {
+    let repo = merge_working_copy_repo("merge-spec-template");
+    let err = repo.hunk_fail(&["list", "--spec-template"]);
+    assert!(!err.is_empty(), "--spec-template should fail on a merge");
+}
+
+#[test]
+fn a_merge_revision_never_yields_a_silent_empty_split() {
+    let repo = merge_working_copy_repo("merge-split");
+
+    // A hunkset selector goes through the same diff computation, so it must
+    // fail rather than produce IDs from a diff that was never real.
+    let err = repo.hunk_fail(&["split", "all()", "merge split"]);
+    assert!(!err.is_empty(), "split on a merge should fail loudly");
+
+    let descs = repo.log_descriptions();
+    assert!(
+        !descs.iter().any(|d| d.contains("merge split")),
+        "an empty commit was created from a merge revision: {descs:?}"
+    );
+}
+
+#[test]
+fn a_merge_revision_selected_with_dash_r_is_also_rejected() {
+    let repo = merge_working_copy_repo("merge-dash-r");
+    // Describe the merge so we can name it, then move off it.
+    repo.jj_ok(&["describe", "-m", "the merge"]);
+    repo.jj_ok(&["new"]);
+
+    let err = repo.hunk_fail(&["list", "-r", "@-", "--format", "text"]);
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("merge") || lower.contains("parent"),
+        "expected a merge error for `-r @-`, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-revision revsets. `jj diff -r 'all()' --summary` lists files, but
+// `jj-hunk list -r 'all()'` printed nothing at exit 0 -- the before/after
+// reads both failed and every file collapsed to zero hunks.
+// ---------------------------------------------------------------------------
+
+fn two_commit_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("x.txt", "1\n");
+    repo.jj_ok(&["commit", "-m", "c1"]);
+    repo.write_file("x.txt", "2\n");
+    repo.jj_ok(&["commit", "-m", "c2"]);
+    repo.write_file("x.txt", "3\n");
+    repo
+}
+
+#[test]
+fn a_multi_revision_revset_is_an_error_not_empty_output() {
+    let repo = two_commit_repo("multi-rev");
+    let err = repo.hunk_fail(&["list", "-r", "all()", "--format", "text"]);
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("revision") || lower.contains("revset"),
+        "expected a 'single revision required' error, got: {err}"
+    );
+}
+
+#[test]
+fn a_multi_revision_revset_cannot_drive_a_mutating_command() {
+    let repo = two_commit_repo("multi-rev-split");
+    let err = repo.hunk_fail(&["split", "-r", "all()", "all()", "multi rev split"]);
+    assert!(!err.is_empty(), "split -r 'all()' should fail");
+    let descs = repo.log_descriptions();
+    assert!(
+        !descs.iter().any(|d| d.contains("multi rev split")),
+        "a commit was created from a multi-revision revset: {descs:?}"
+    );
+}
+
+/// The single-revision forms must keep working exactly as before.
+#[test]
+fn single_revision_revsets_are_unaffected() {
+    let repo = two_commit_repo("single-rev-ok");
+
+    // Bare working copy.
+    let wc = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(wc.contains("x.txt"), "working copy list broke:\n{wc}");
+
+    // `-r @-`.
+    let prev = repo.hunk_ok(&["list", "-r", "@-", "--format", "text"]);
+    assert!(prev.contains("x.txt"), "-r @- broke:\n{prev}");
+
+    // A revset function that still resolves to exactly one revision.
+    let named = repo.hunk_ok(&[
+        "list",
+        "-r",
+        r#"description(substring:"c2")"#,
+        "--format",
+        "text",
+    ]);
+    assert!(named.contains("x.txt"), "single-rev revset broke:\n{named}");
+
+    // The root commit has no parent; it must not be mistaken for an error.
+    let root = repo.hunk(&["list", "-r", "root()", "--format", "text"]);
+    assert!(
+        root.status.success(),
+        "root() should not error: {}",
+        String::from_utf8_lossy(&root.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Executable bit. `apply_hunk_selection` rewrote the right-hand file with
+// `fs::write`, which preserves that file's mode, so an unselected `chmod +x`
+// rode along in the split commit.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn an_unselected_exec_bit_change_does_not_leak_into_a_split() {
+    let repo = TestRepo::new("exec-bit-leak");
+    repo.write_file("a.txt", "aaa\n");
+    repo.write_file("s.sh", "S1\nS2\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("a.txt", "aaa\nbbb\n");
+    repo.write_file("s.sh", "S1\nS2\nS3\n");
+    let path = repo.path().join("s.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    // Keep a.txt's hunk; explicitly keep nothing from s.sh.
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}, "s.sh": {"hunks": []}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        !committed.contains("new mode 100755"),
+        "an unselected chmod +x rode along in the split commit:\n{committed}"
+    );
+    assert!(
+        committed.contains("+bbb"),
+        "the selected change is missing:\n{committed}"
+    );
+}
+
+/// The same leak, but through the `default: reset` path rather than an
+/// explicit empty selection.
+#[cfg(unix)]
+#[test]
+fn an_exec_bit_change_on_a_partially_selected_file_is_reset() {
+    let repo = TestRepo::new("exec-bit-partial");
+    repo.write_file("s.sh", "S1\nS2\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("s.sh", "S1\nS2\nS3\n");
+    let path = repo.path().join("s.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    // Select the content hunk. The mode change is not a hunk, so it must not
+    // be carried along with it.
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"s.sh": {"hunks": [0]}}, "default": "reset"}"#,
+        "content only",
+    ]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("+S3"),
+        "the selected content hunk is missing:\n{committed}"
+    );
+    assert!(
+        !committed.contains("new mode 100755"),
+        "the mode change rode along with the selected hunk:\n{committed}"
+    );
+}
+
+/// A mode-only change produces zero hunks, so it was dropped from `list`
+/// entirely -- the user could not see that the file had changed at all.
+#[cfg(unix)]
+#[test]
+fn a_mode_only_change_is_visible_in_list() {
+    let repo = TestRepo::new("exec-bit-visible");
+    repo.write_file("only.sh", "x\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    let path = repo.path().join("only.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    // Precondition: jj sees the change.
+    let summary = repo.changed_files("@");
+    assert!(
+        summary.iter().any(|l| l.contains("only.sh")),
+        "precondition: jj should report the mode change: {summary:?}"
+    );
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("only.sh"),
+        "a mode-only change was invisible in `list`:\n{text}"
+    );
+    assert!(
+        text.contains("100755"),
+        "`list` should say what the mode changed to:\n{text}"
+    );
+
+    let json = repo.hunk_ok(&["list"]);
+    assert!(
+        json.contains("only.sh") && json.contains("100755"),
+        "a mode-only change was invisible in the JSON output:\n{json}"
+    );
+}
+
+/// A file with both a content change and a mode change must report both.
+#[cfg(unix)]
+#[test]
+fn a_mode_change_alongside_hunks_is_also_reported() {
+    let repo = TestRepo::new("exec-bit-visible-both");
+    repo.write_file("s.sh", "S1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("s.sh", "S1\nS2\n");
+    let path = repo.path().join("s.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(text.contains("+ S2"), "content hunk missing:\n{text}");
+    assert!(
+        text.contains("100755"),
+        "mode change not reported next to the hunks:\n{text}"
+    );
+}
+
+/// Adding a file with the executable bit set is an addition, not a mode
+/// *change*; it must not be annotated as one.
+#[cfg(unix)]
+#[test]
+fn a_newly_added_executable_is_not_reported_as_a_mode_change() {
+    let repo = TestRepo::new("exec-bit-added");
+    repo.write_file("keep.txt", "k\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("new.sh", "n\n");
+    let path = repo.path().join("new.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(text.contains("new.sh"), "added file missing:\n{text}");
+    assert!(
+        !text.contains("100644"),
+        "an added executable was described as a mode change:\n{text}"
+    );
+}
+
 #[test]
 fn ambiguous_or_malformed_hunk_id_is_rejected() {
     let repo = strict_repo("id-ambiguous");

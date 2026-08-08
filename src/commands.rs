@@ -133,6 +133,8 @@ struct FileEntry {
     hunks: Vec<Hunk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<ModeChange>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -164,6 +166,8 @@ struct FileSummary {
     hunk_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<ModeChange>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +191,46 @@ struct DiffSummaryEntry {
     source: String,
     #[serde(default)]
     target: String,
+    #[serde(default)]
+    source_executable: bool,
+    #[serde(default)]
+    target_executable: bool,
+}
+
+/// A change to a file's executable bit.
+///
+/// jj tracks exactly one mode bit, and it is not part of any hunk. A mode-only
+/// change therefore produced zero hunks and vanished from the listing, so the
+/// file looked unchanged. It is reported here so it is at least visible; it is
+/// never *selectable*, and `select` always restores it from the left side (see
+/// `restore_exec_bit`), which leaves it in the working copy.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+struct ModeChange {
+    from: &'static str,
+    to: &'static str,
+}
+
+fn git_mode(executable: bool) -> &'static str {
+    if executable {
+        "100755"
+    } else {
+        "100644"
+    }
+}
+
+fn mode_change_for_entry(entry: &DiffSummaryEntry) -> Option<ModeChange> {
+    // On an added or removed file the mode is part of the addition or the
+    // removal, not a change on top of it.
+    if matches!(entry.status.as_str(), "added" | "removed") {
+        return None;
+    }
+    if entry.source_executable == entry.target_executable {
+        return None;
+    }
+    Some(ModeChange {
+        from: git_mode(entry.source_executable),
+        to: git_mode(entry.target_executable),
+    })
 }
 
 /// List hunks in current working copy or a specific revision
@@ -232,7 +276,9 @@ where
             hunks = filter_hunks(hunks, selection);
         }
 
-        if hunks.is_empty() && !fh.is_binary {
+        // A file with no hunks is still a real change if it is binary or if
+        // only its mode moved; dropping those made them invisible.
+        if hunks.is_empty() && !fh.is_binary && fh.mode.is_none() {
             continue;
         }
 
@@ -242,6 +288,7 @@ where
             rename: fh.rename,
             hunks,
             binary: if fh.is_binary { Some(true) } else { None },
+            mode: fh.mode,
         });
     }
 
@@ -309,7 +356,7 @@ where
     Ok(())
 }
 
-const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ "}\n""#;
+const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_executable\":" ++ if(self.source().executable(), "true", "false") ++ ",\"target_executable\":" ++ if(self.target().executable(), "true", "false") ++ "}\n""#;
 
 struct FilePaths {
     before: Option<String>,
@@ -430,6 +477,7 @@ struct FileHunks {
     hunks: Vec<Hunk>,
     rename: Option<RenameInfo>,
     is_binary: bool,
+    mode: Option<ModeChange>,
 }
 
 impl FileHunks {
@@ -448,8 +496,10 @@ impl FileHunks {
 /// Load all file hunks for a revision, applying semantic enrichment.
 /// This is the shared core used by both `list` and `evaluate_hunkset`.
 fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunks>> {
+    // Validate the revision *before* doing any work: a merge or a
+    // multi-revision revset makes every hunk below meaningless.
+    let revisions = resolve_revisions(rev)?;
     let summary_entries = read_diff_summary(rev)?;
-    let (before_rev, after_rev) = resolve_revisions(rev);
     let mut result = Vec::new();
 
     for entry in &summary_entries {
@@ -459,16 +509,15 @@ fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunk
         }
 
         let file_paths = file_paths_for_entry(entry, &path);
-        let before_bytes = file_paths
-            .before
-            .as_deref()
-            .map(|p| read_jj_file(before_rev.as_deref(), p))
-            .unwrap_or_default();
-        let after_bytes = file_paths
-            .after
-            .as_deref()
-            .map(|p| read_jj_file(after_rev.as_deref(), p))
-            .unwrap_or_default();
+        let before_bytes = match (revisions.before.as_deref(), file_paths.before.as_deref()) {
+            (Some(rev), Some(p)) => read_jj_file(Some(rev), p)?,
+            // No parent revision, or this side of the diff has no file.
+            _ => Vec::new(),
+        };
+        let after_bytes = match file_paths.after.as_deref() {
+            Some(p) => read_jj_file(revisions.after.as_deref(), p)?,
+            None => Vec::new(),
+        };
 
         let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
         if is_binary && binary == BinaryMode::Skip {
@@ -499,18 +548,121 @@ fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunk
             hunks,
             rename: rename_info(entry),
             is_binary,
+            mode: mode_change_for_entry(entry),
         });
     }
 
     Ok(result)
 }
 
-fn resolve_revisions(revset: Option<&str>) -> (Option<String>, Option<String>) {
-    if let Some(rev) = revset {
-        (Some(format!("({})-", rev)), Some(rev.to_string()))
-    } else {
-        (Some("@-".to_string()), None)
+/// The two sides a diff is computed between.
+struct DiffRevisions {
+    /// Revision the "before" text is read from. `None` means the target has no
+    /// parent (the root commit), so the before side is empty.
+    before: Option<String>,
+    /// Revision the "after" text is read from. `None` means the working copy
+    /// on disk.
+    after: Option<String>,
+}
+
+/// One resolved revision and the ids of its parents.
+struct ResolvedRevision {
+    id: String,
+    parents: Vec<String>,
+}
+
+/// Emits `<commit id>\t<parent id> <parent id> ...` per revision, so one
+/// `jj log` answers both "how many revisions?" and "how many parents?".
+const REVISION_TEMPLATE: &str =
+    r#"commit_id.short() ++ "\t" ++ parents.map(|c| c.commit_id().short()).join(" ") ++ "\n""#;
+
+/// Revisions a revset resolves to, in `jj log` order.
+fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
+    let output = Command::new("jj")
+        .args(["log", "--no-graph", "-r", revset, "-T", REVISION_TEMPLATE])
+        .output()
+        .context("Failed to run jj log")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to resolve revset `{}`: {}", revset, stderr.trim());
     }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (id, parents) = line.split_once('\t').unwrap_or((line, ""));
+            ResolvedRevision {
+                id: id.trim().to_string(),
+                parents: parents.split_whitespace().map(str::to_string).collect(),
+            }
+        })
+        .collect())
+}
+
+fn preview_ids<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> String {
+    const MAX: usize = 5;
+    let total = ids.len();
+    let mut shown: Vec<String> = ids.take(MAX).map(str::to_string).collect();
+    if total > MAX {
+        shown.push(format!("... and {} more", total - MAX));
+    }
+    shown.join(", ")
+}
+
+/// Work out which revisions to read the before/after text from.
+///
+/// A hunk only means something between exactly one revision and exactly one
+/// parent. Both of the ways that can fail used to degrade into an empty
+/// before-text -- which is indistinguishable from "the whole file is new" --
+/// so the diff was wrong but the exit status was 0:
+///
+///   * a revset resolving to several revisions (`-r 'all()'`), and
+///   * a merge commit, where `@-` is ambiguous.
+///
+/// Both are now rejected outright.
+fn resolve_revisions(revset: Option<&str>) -> Result<DiffRevisions> {
+    let target = revset.unwrap_or("@");
+
+    let mut targets = resolve_revset(target)?;
+    match targets.len() {
+        0 => anyhow::bail!("revset `{}` did not resolve to any revision", target),
+        1 => {}
+        n => anyhow::bail!(
+            "revset `{}` resolved to {} revisions, but jj-hunk needs exactly one.\n\
+             Hunks are only defined between a single revision and its parent.\n\
+             Resolved to: {}",
+            target,
+            n,
+            preview_ids(targets.iter().map(|r| r.id.as_str()))
+        ),
+    }
+
+    let resolved = targets.remove(0);
+    if resolved.parents.len() > 1 {
+        anyhow::bail!(
+            "`{}` ({}) is a merge commit with {} parents, so it has no single \
+             \"before\" state to diff against.\n\
+             Reporting it anyway would describe every file as a whole-file insertion, \
+             and a selection built from that diff would commit something other than \
+             what was listed.\n\
+             Diff against one parent explicitly (`-r {}`), or choose a non-merge revision.\n\
+             Parents: {}",
+            target,
+            resolved.id,
+            resolved.parents.len(),
+            resolved.parents[0],
+            preview_ids(resolved.parents.iter().map(String::as_str))
+        );
+    }
+
+    Ok(DiffRevisions {
+        // Resolved ids rather than `({rev})-`: they cannot be re-resolved into
+        // something else between here and the reads below.
+        before: resolved.parents.into_iter().next(),
+        after: revset.map(|_| resolved.id),
+    })
 }
 
 fn read_diff_summary(revset: Option<&str>) -> Result<Vec<DiffSummaryEntry>> {
@@ -607,19 +759,80 @@ fn file_paths_for_entry(entry: &DiffSummaryEntry, path: &str) -> FilePaths {
     }
 }
 
-fn read_jj_file(rev: Option<&str>, path: &str) -> Vec<u8> {
+/// Quote `value` as a jj fileset string literal, including the delimiters.
+///
+/// From jj's own grammar (`lib/src/fileset.pest`):
+///
+/// ```text
+/// string_literal = "\"" ~ (string_content | string_escape)* ~ "\""
+/// string_escape  = "\\" ~ ("t"|"r"|"n"|"0"|"e"|("x" ~ HEX{2})|"\""|"\\")
+/// ```
+///
+/// Only `"` and `\` are excluded from `string_content`, so those are the two
+/// that strictly must be escaped; control characters are escaped as well so the
+/// argument stays a single readable token in any error message.
+fn fileset_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\0' => out.push_str("\\0"),
+            '\x1b' => out.push_str("\\e"),
+            // The remaining C0 controls have no named escape. `\xHH` is only
+            // used for these, so it never has to encode a multi-byte char.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A fileset expression matching exactly one path.
+///
+/// Passing a path to jj bare makes jj parse it as fileset *syntax*: `(`, `)`,
+/// `~`, `,` and `"` are operators, and the default pattern kind is a glob, so
+/// `br[1].txt` silently matches `br1.txt`. `file:` is the cwd-relative exact
+/// pattern, which is the frame `.display()` reports paths in (see
+/// `SUMMARY_TEMPLATE`).
+fn fileset_exact_path(path: &str) -> String {
+    format!("file:{}", fileset_string_literal(path))
+}
+
+fn read_jj_file(rev: Option<&str>, path: &str) -> Result<Vec<u8>> {
+    let pattern = fileset_exact_path(path);
     let mut args = vec!["file", "show"];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    args.push(path);
+    args.push(&pattern);
 
-    Command::new("jj")
+    let output = Command::new("jj")
         .args(&args)
         .output()
-        .map(|o| o.stdout)
-        .unwrap_or_default()
+        .with_context(|| format!("Failed to run jj file show for {}", path))?;
+
+    // A failed read used to become an empty file, which is indistinguishable
+    // from "this file is new" -- the file then produced no hunks and was
+    // dropped from the listing entirely.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "failed to read `{}`{}: {}",
+            path,
+            rev.map(|r| format!(" at revision {}", r))
+                .unwrap_or_default(),
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
 }
 
 fn is_binary_data(bytes: &[u8]) -> bool {
@@ -715,6 +928,7 @@ fn build_summary_output(files: Vec<FileEntry>, grouping: ListGrouping) -> ListSu
             rename: file.rename,
             hunk_count: file.hunks.len(),
             binary: file.binary,
+            mode: file.mode,
         })
         .collect();
 
@@ -1124,6 +1338,9 @@ fn format_summary_text(lines: &mut Vec<String>, files: &[FileSummary]) {
         if file.binary == Some(true) {
             line.push_str(" [binary]");
         }
+        if let Some(mode) = &file.mode {
+            line.push_str(&format_mode_change(mode));
+        }
         lines.push(line);
     }
 }
@@ -1136,7 +1353,15 @@ fn format_file_header(file: &FileEntry) -> String {
     if file.binary == Some(true) {
         header.push_str(" [binary]");
     }
+    if let Some(mode) = &file.mode {
+        header.push_str(&format_mode_change(mode));
+    }
     header
+}
+
+/// A mode change cannot be selected, so say so where it is reported.
+fn format_mode_change(mode: &ModeChange) -> String {
+    format!(" [mode {} -> {}, not selectable]", mode.from, mode.to)
 }
 
 fn status_char(status: &str) -> &'static str {
@@ -1294,6 +1519,35 @@ fn apply_hunk_selection(
     let result = apply_selected_hunks(&before, &after, selection);
 
     fs::write(&right_file, result)?;
+    // `fs::write` keeps whatever mode the destination already had, so a
+    // `chmod +x` in the working copy survived even when none of the file's
+    // hunks were selected. A mode change is not a hunk and cannot be selected,
+    // so it is restored from the left side exactly like unselected content.
+    restore_exec_bit(&left_file, &right_file)?;
+    Ok(())
+}
+
+/// Give `right` the executable bits `left` has.
+#[cfg(unix)]
+fn restore_exec_bit(left: &Path, right: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A file that is absent on the left is newly added; there is no earlier
+    // mode to restore, and its own mode is part of the addition.
+    let Ok(left_meta) = fs::metadata(left) else {
+        return Ok(());
+    };
+    let right_meta =
+        fs::metadata(right).with_context(|| format!("Failed to stat {}", right.display()))?;
+
+    let exec = left_meta.permissions().mode() & 0o111;
+    let mode = (right_meta.permissions().mode() & !0o111) | exec;
+    fs::set_permissions(right, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to restore mode on {}", right.display()))
+}
+
+#[cfg(not(unix))]
+fn restore_exec_bit(_left: &Path, _right: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1448,4 +1702,79 @@ pub fn squash(
         args.push(rev);
     }
     run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_paths_are_wrapped_in_quotes_unchanged() {
+        assert_eq!(fileset_string_literal("src/main.rs"), r#""src/main.rs""#);
+        assert_eq!(fileset_exact_path("src/main.rs"), r#"file:"src/main.rs""#);
+    }
+
+    /// `"` and `\` are the only two characters excluded from `string_content`,
+    /// so they are the two that must be escaped for the literal to parse.
+    #[test]
+    fn quotes_and_backslashes_are_escaped() {
+        assert_eq!(fileset_string_literal(r#"quote".txt"#), r#""quote\".txt""#);
+        assert_eq!(fileset_string_literal(r"back\slash"), r#""back\\slash""#);
+        // A trailing backslash must not escape the closing delimiter.
+        assert_eq!(fileset_string_literal(r"dir\"), r#""dir\\""#);
+    }
+
+    /// These are fileset *operators*; unquoted they made jj parse the path as
+    /// an expression, so the file silently disappeared from the listing.
+    #[test]
+    fn fileset_operators_are_neutralised_by_quoting() {
+        for path in [
+            "paren(1).txt",
+            "tilde~x.txt",
+            "has,comma.txt",
+            "single'.txt",
+            "a|b.txt",
+            "a&b.txt",
+            "-leading-dash.txt",
+        ] {
+            let quoted = fileset_exact_path(path);
+            assert!(quoted.starts_with(r#"file:""#), "{quoted}");
+            assert!(quoted.ends_with('"'), "{quoted}");
+            // The path survives verbatim: none of these need escaping.
+            assert!(quoted.contains(path), "{path} was mangled into {quoted}");
+        }
+    }
+
+    /// A bare path is parsed as a glob, so `br[1].txt` matched `br1.txt`.
+    /// `file:` is an exact pattern, so the glob characters are inert.
+    #[test]
+    fn glob_characters_are_kept_but_matched_exactly() {
+        assert_eq!(fileset_exact_path("br[1].txt"), r#"file:"br[1].txt""#);
+        assert_eq!(fileset_exact_path("star*.txt"), r#"file:"star*.txt""#);
+    }
+
+    #[test]
+    fn control_characters_use_the_escapes_the_grammar_defines() {
+        assert_eq!(fileset_string_literal("a\tb"), r#""a\tb""#);
+        assert_eq!(fileset_string_literal("a\nb"), r#""a\nb""#);
+        assert_eq!(fileset_string_literal("a\rb"), r#""a\rb""#);
+        assert_eq!(fileset_string_literal("a\x1bb"), r#""a\eb""#);
+        assert_eq!(fileset_string_literal("a\x01b"), r#""a\x01b""#);
+    }
+
+    /// Non-ASCII is ordinary `string_content`; escaping it as `\xHH` would
+    /// split a multi-byte character.
+    #[test]
+    fn non_ascii_paths_are_passed_through() {
+        assert_eq!(fileset_string_literal("café-☃.txt"), r#""café-☃.txt""#);
+    }
+
+    #[test]
+    fn revision_previews_are_truncated() {
+        let ids: Vec<String> = (0..8).map(|i| format!("id{i}")).collect();
+        let preview = preview_ids(ids.iter().map(String::as_str));
+        assert!(preview.contains("id0"));
+        assert!(preview.contains("... and 3 more"), "{preview}");
+        assert!(!preview.contains("id5"), "{preview}");
+    }
 }
