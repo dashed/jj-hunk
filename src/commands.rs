@@ -887,8 +887,46 @@ fn group_adjacent_hunks(hunks: &[Hunk]) -> Vec<(usize, usize)> {
 /// Context lines stored per hunk by `diff::build_context`.
 const DIFF_CONTEXT_LINES: usize = 3;
 
-fn context_lines(text: &str) -> Vec<&str> {
-    text.lines().collect()
+/// Split into lines WITHOUT discarding the line terminator information.
+///
+/// `str::lines()` strips both `\n` and a preceding `\r`, and loses whether the
+/// final line was newline-terminated at all. Re-emitting those lines with a
+/// bare `\n` silently converted CRLF files to LF and dropped the
+/// `\ No newline at end of file` marker, so `git apply` either rejected the
+/// patch or -- when the change was only the trailing newline -- applied a
+/// textually identical hunk and silently discarded the edit.
+///
+/// Returns (content_without_trailing_newline, was_newline_terminated). The
+/// content keeps any `\r`, which unified diff treats as part of the line.
+fn context_lines(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.find('\n') {
+            Some(i) => {
+                out.push((&rest[..i], true));
+                rest = &rest[i + 1..];
+            }
+            None => {
+                out.push((rest, false));
+                rest = "";
+            }
+        }
+    }
+    out
+}
+
+const NO_NEWLINE_MARKER: &str = "\\ No newline at end of file\n";
+
+/// Emit one diff line, appending the no-newline marker when the source line was
+/// not newline-terminated.
+fn push_diff_line(body: &mut String, prefix: char, line: &str, newline_terminated: bool) {
+    body.push(prefix);
+    body.push_str(line);
+    body.push('\n');
+    if !newline_terminated {
+        body.push_str(NO_NEWLINE_MARKER);
+    }
 }
 
 /// Reconstruct the `gap` source lines sitting between two hunks.
@@ -896,15 +934,15 @@ fn context_lines(text: &str) -> Vec<&str> {
 /// `prev.context.post` holds the first up-to-3 lines after `prev`, and
 /// `next.context.pre` holds the last up-to-3 lines before `next`. For a gap of
 /// at most `2 * DIFF_CONTEXT_LINES` the two together cover it exactly.
-fn gap_lines<'a>(prev: &'a Hunk, next: &'a Hunk, gap: usize) -> Vec<&'a str> {
-    let post: Vec<&str> = prev
+fn gap_lines<'a>(prev: &'a Hunk, next: &'a Hunk, gap: usize) -> Vec<(&'a str, bool)> {
+    let post: Vec<(&str, bool)> = prev
         .context
         .as_ref()
         .map(|c| context_lines(&c.after))
         .unwrap_or_default();
-    let mut out: Vec<&str> = post.into_iter().take(gap.min(DIFF_CONTEXT_LINES)).collect();
+    let mut out: Vec<(&str, bool)> = post.into_iter().take(gap.min(DIFF_CONTEXT_LINES)).collect();
     if out.len() < gap {
-        let pre: Vec<&str> = next
+        let pre: Vec<(&str, bool)> = next
             .context
             .as_ref()
             .map(|c| context_lines(&c.before))
@@ -925,12 +963,12 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
     };
     let last = &hunks[hunks.len() - 1];
 
-    let leading: Vec<&str> = first
+    let leading: Vec<(&str, bool)> = first
         .context
         .as_ref()
         .map(|c| context_lines(&c.before))
         .unwrap_or_default();
-    let trailing: Vec<&str> = last
+    let trailing: Vec<(&str, bool)> = last
         .context
         .as_ref()
         .map(|c| context_lines(&c.after))
@@ -941,8 +979,8 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
     let mut body = String::new();
     let mut old_len = leading.len();
     let mut new_len = leading.len();
-    for line in &leading {
-        body.push_str(&format!(" {}\n", line));
+    for (line, nl) in &leading {
+        push_diff_line(&mut body, ' ', line, *nl);
     }
 
     for (i, hunk) in hunks.iter().enumerate() {
@@ -950,24 +988,24 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
             let prev = &hunks[i - 1];
             let prev_end = prev.before_range.start + prev.before_range.length;
             let gap = hunk.before_range.start.saturating_sub(prev_end);
-            for line in gap_lines(prev, hunk, gap) {
-                body.push_str(&format!(" {}\n", line));
+            for (line, nl) in gap_lines(prev, hunk, gap) {
+                push_diff_line(&mut body, ' ', line, nl);
                 old_len += 1;
                 new_len += 1;
             }
         }
-        for line in hunk.removed.lines() {
-            body.push_str(&format!("-{}\n", line));
+        for (line, nl) in context_lines(&hunk.removed) {
+            push_diff_line(&mut body, '-', line, nl);
             old_len += 1;
         }
-        for line in hunk.added.lines() {
-            body.push_str(&format!("+{}\n", line));
+        for (line, nl) in context_lines(&hunk.added) {
+            push_diff_line(&mut body, '+', line, nl);
             new_len += 1;
         }
     }
 
-    for line in &trailing {
-        body.push_str(&format!(" {}\n", line));
+    for (line, nl) in &trailing {
+        push_diff_line(&mut body, ' ', line, *nl);
         old_len += 1;
         new_len += 1;
     }

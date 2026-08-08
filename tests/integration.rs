@@ -1220,3 +1220,59 @@ fn a_full_hunk_id_still_selects_exactly_one() {
     let out = repo.hunk_ok(&["list", "--spec", &format!(r#"id("{id}")"#), "--format", "text"]);
     assert_eq!(out.matches("  hunk ").count(), 1, "expected exactly one: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// Line-terminator fidelity in `--format diff`.
+//
+// str::lines() strips \r and loses whether the last line was newline
+// terminated. Re-emitting with a bare \n converted CRLF files to LF and
+// dropped the `\ No newline at end of file` marker -- and when the ONLY change
+// was the trailing newline, that produced a textually identical hunk that
+// git apply accepted while silently discarding the edit.
+// ---------------------------------------------------------------------------
+
+/// Write bytes, emit a patch, restore the base, apply, compare bytes.
+fn diff_roundtrip(name: &str, base: &[u8], modified: &[u8]) {
+    let repo = TestRepo::new(name);
+    std::fs::write(repo.path().join("f.txt"), base).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::write(repo.path().join("f.txt"), modified).unwrap();
+
+    let patch = repo.hunk_ok(&["list", "--format", "diff"]);
+    std::fs::write(repo.path().join("f.txt"), base).unwrap();
+
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "{name}: git apply rejected:\n{err}\npatch:\n{patch}");
+    let got = std::fs::read(repo.path().join("f.txt")).unwrap();
+    assert_eq!(
+        got, modified,
+        "{name}: bytes differ after round-trip\npatch:\n{patch}"
+    );
+}
+
+#[test]
+fn diff_format_preserves_missing_trailing_newline() {
+    diff_roundtrip("nl-none", b"a\nb\nc", b"a\nZ\nc");
+}
+
+#[test]
+fn diff_format_handles_dropping_the_trailing_newline() {
+    // The silent-corruption case: without the marker this emits `-c`/`+c`,
+    // which is textually identical, so git apply succeeds and loses the edit.
+    diff_roundtrip("nl-drop", b"a\nb\nc\n", b"a\nb\nc");
+}
+
+#[test]
+fn diff_format_handles_adding_a_trailing_newline() {
+    diff_roundtrip("nl-add", b"a\nb\nc", b"a\nb\nc\n");
+}
+
+#[test]
+fn diff_format_preserves_crlf() {
+    diff_roundtrip("crlf", b"a\r\nb\r\nc\r\n", b"a\r\nB\r\nc\r\n");
+}
+
+#[test]
+fn diff_format_preserves_crlf_without_final_newline() {
+    diff_roundtrip("crlf-nonl", b"a\r\nb\r\nc", b"a\r\nB\r\nc");
+}
