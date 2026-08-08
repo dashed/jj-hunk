@@ -42,6 +42,9 @@ enum Commands {
         /// Revision to split (default: @)
         #[arg(short, long)]
         rev: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
     },
 
     /// Commit selected hunks
@@ -53,6 +56,9 @@ enum Commands {
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
         spec_file: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
     },
 
     /// Squash selected hunks into parent
@@ -65,6 +71,9 @@ enum Commands {
         /// Revision to squash (default: @)
         #[arg(short, long)]
         rev: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
     },
 }
 
@@ -135,21 +144,23 @@ fn main() -> Result<()> {
             message,
             spec_file,
             rev,
+            allow_empty,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "split")?;
-            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref())
+            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref(), allow_empty)
         }
         Commands::Commit {
             spec,
             message,
             spec_file,
+            allow_empty,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "commit")?;
-            commands::commit(spec.as_deref(), spec_file.as_deref(), &message)
+            commands::commit(spec.as_deref(), spec_file.as_deref(), &message, allow_empty)
         }
-        Commands::Squash { spec, spec_file, rev } => {
+        Commands::Squash { spec, spec_file, rev, allow_empty } => {
             let spec = normalize_spec_only(spec, &spec_file, "squash")?;
-            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref())
+            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref(), allow_empty)
         }
     }
 }

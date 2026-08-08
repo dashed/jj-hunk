@@ -1252,13 +1252,31 @@ fn run_jj_with_selection(
     spec: Option<&str>,
     spec_file: Option<&str>,
     rev: Option<&str>,
+    allow_empty: bool,
 ) -> Result<()> {
-    let spec_content = resolve_spec_input(spec, spec_file)?;
-    let spec_content = if hunkset::is_hunkset(&spec_content) {
-        evaluate_hunkset(&spec_content, rev)?
+    let raw_spec = resolve_spec_input(spec, spec_file)?;
+    let spec_content = if hunkset::is_hunkset(&raw_spec) {
+        evaluate_hunkset(&raw_spec, rev)?
     } else {
-        spec_content
+        raw_spec.clone()
     };
+
+    // Refuse to mutate history with a selection that keeps nothing. jj would
+    // happily create an empty commit and exit 0, which hides a typo'd
+    // selector from any script driving this.
+    if !allow_empty {
+        if let Ok(parsed) = Spec::from_str(&spec_content) {
+            if parsed.selects_nothing() {
+                anyhow::bail!(
+                    "selection matched no hunks: {}\n\
+                     Nothing would be kept, so this would create an empty commit.\n\
+                     Check the selector with `jj-hunk list --spec ...`, or pass \
+                     --allow-empty if that is intended.",
+                    raw_spec.trim()
+                );
+            }
+        }
+    }
     let temp_file = std::env::temp_dir().join(format!("jj-hunk-{}.spec", std::process::id()));
     fs::write(&temp_file, spec_content)?;
 
@@ -1319,29 +1337,41 @@ pub fn split(
     spec_file: Option<&str>,
     message: &str,
     rev: Option<&str>,
+    allow_empty: bool,
 ) -> Result<()> {
     let mut args = vec!["split", JJ_HUNK_TOOL_ARG, "-m", message];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, rev)
+    run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
 }
 
-pub fn commit(spec: Option<&str>, spec_file: Option<&str>, message: &str) -> Result<()> {
+pub fn commit(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    message: &str,
+    allow_empty: bool,
+) -> Result<()> {
     run_jj_with_selection(
         &["commit", "-i", JJ_HUNK_TOOL_ARG, "-m", message],
         spec,
         spec_file,
         None, // commit always operates on @
+        allow_empty,
     )
 }
 
-pub fn squash(spec: Option<&str>, spec_file: Option<&str>, rev: Option<&str>) -> Result<()> {
+pub fn squash(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    rev: Option<&str>,
+    allow_empty: bool,
+) -> Result<()> {
     let mut args = vec!["squash", "-i", JJ_HUNK_TOOL_ARG];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, rev)
+    run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
 }

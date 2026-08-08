@@ -125,6 +125,21 @@ pub enum DefaultAction {
 }
 
 impl Spec {
+    /// True when applying this spec would keep no changes at all.
+    ///
+    /// Used to refuse mutating commands rather than let jj create an empty
+    /// commit: a selector that matches nothing is nearly always a mistake,
+    /// and exiting 0 makes it invisible to a script.
+    pub fn selects_nothing(&self) -> bool {
+        if self.default == DefaultAction::Keep {
+            return false; // unlisted files are kept
+        }
+        self.files.values().all(|f| match f {
+            FileSpec::Action { action } => *action != Action::Keep,
+            FileSpec::Selection(sel) => sel.hunks.is_empty() && sel.ids.is_empty(),
+        })
+    }
+
     pub fn from_str(input: &str) -> anyhow::Result<Self> {
         match serde_json::from_str(input) {
             Ok(spec) => Ok(spec),

@@ -61,14 +61,34 @@ fn compile_exact(args: &[Arg]) -> Result<Vec<CompiledPattern>, HunksetError> {
     let patterns: Vec<StringPattern> = extract_patterns(args)
         .into_iter()
         .map(|p| {
-            if p.kind == PatternKind::Substring {
-                StringPattern { kind: PatternKind::Exact, value: p.value }
+            // Only override the kind the parser *inferred*. An explicit
+            // `substring:"..."` means the user asked for substring matching.
+            if p.kind == PatternKind::Substring && !p.explicit {
+                StringPattern::inferred(PatternKind::Exact, p.value)
             } else {
                 p
             }
         })
         .collect();
     compile_patterns(patterns)
+}
+
+/// Values accepted by the enum-like predicates. A misspelling here would
+/// otherwise select nothing and exit 0.
+const VALID_TYPES: &[&str] = &["insert", "delete", "replace"];
+const VALID_STATUSES: &[&str] = &["modified", "added", "removed", "renamed", "copied"];
+
+fn validate_enum_args(func: &str, args: &[Arg], valid: &[&str]) -> Result<(), HunksetError> {
+    for p in extract_patterns(args) {
+        if !valid.contains(&p.value.as_str()) {
+            return Err(HunksetError::InvalidArgument {
+                func: func.to_string(),
+                value: p.value,
+                valid: valid.join(", "),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
@@ -79,8 +99,16 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "file" => Ok(eval_file(args, hunks)),
         "glob" => Ok(eval_glob(args, hunks)),
         "extension" => { let exact = compile_exact(args)?; Ok(eval_extension(&exact, hunks)) }
-        "status" => { let exact = compile_exact(args)?; Ok(eval_status(&exact, hunks)) }
-        "type" => { let exact = compile_exact(args)?; Ok(eval_type(&exact, hunks)) }
+        "status" => {
+            validate_enum_args("status", args, VALID_STATUSES)?;
+            let exact = compile_exact(args)?;
+            Ok(eval_status(&exact, hunks))
+        }
+        "type" => {
+            validate_enum_args("type", args, VALID_TYPES)?;
+            let exact = compile_exact(args)?;
+            Ok(eval_type(&exact, hunks))
+        }
         "lines" => Ok(eval_lines(args, hunks, LineRangeMode::Either)),
         "before_line" => Ok(eval_lines(args, hunks, LineRangeMode::Before)),
         "after_line" => Ok(eval_lines(args, hunks, LineRangeMode::After)),
@@ -94,7 +122,31 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "doc" => { require_semantic(name)?; Ok(eval_doc(hunks)) }
         "import" => { require_semantic(name)?; Ok(eval_import(hunks)) }
         "toplevel" => { require_semantic(name)?; Ok(eval_toplevel(hunks)) }
-        "depth" => { require_semantic(name)?; Ok(eval_depth(args, hunks)) }
+        "depth" => {
+            // Validate the argument shape before the feature gate: a malformed
+            // query is malformed whether or not tree-sitter is compiled in.
+            // `depth(0)` arrives as a Pattern holding "0"; `depth(0..2)` as a
+            // Range. Anything else would be dropped and silently match nothing.
+            let bad = extract_patterns(args)
+                .into_iter()
+                .find(|p| p.value.parse::<usize>().is_err());
+            if let Some(p) = bad {
+                return Err(HunksetError::InvalidArgument {
+                    func: "depth".to_string(),
+                    value: p.value,
+                    valid: "a number or range, e.g. depth(0) or depth(0..2)".to_string(),
+                });
+            }
+            if args.is_empty() {
+                return Err(HunksetError::InvalidArgument {
+                    func: "depth".to_string(),
+                    value: "no argument".to_string(),
+                    valid: "a number or range, e.g. depth(0) or depth(0..2)".to_string(),
+                });
+            }
+            require_semantic(name)?;
+            Ok(eval_depth(args, hunks))
+        }
         _ => Err(HunksetError::UnknownFunction { name: name.to_string() }),
     }
 }
@@ -153,7 +205,11 @@ fn eval_file(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
 fn eval_glob(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     let patterns: Vec<CompiledPattern> = extract_patterns(args)
         .into_iter()
-        .map(|p| CompiledPattern::compile(&StringPattern { kind: PatternKind::Glob, value: p.value }).unwrap())
+        // Default to glob matching, but honour an explicit prefix.
+        .map(|p| {
+            let pattern = if p.explicit { p } else { StringPattern::inferred(PatternKind::Glob, p.value) };
+            CompiledPattern::compile(&pattern).unwrap()
+        })
         .collect();
     hunks
         .iter()

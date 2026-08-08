@@ -746,3 +746,197 @@ fn diff_format_new_file_applies() {
     let got = std::fs::read_to_string(repo.path().join("new.txt")).unwrap();
     assert_eq!(got, "alpha\nbeta\n", "patch:\n{patch}");
 }
+
+// ---------------------------------------------------------------------------
+// Strict selectors.
+//
+// A hunkset expression that is malformed, misspelled, or misused must fail
+// loudly. Selecting nothing and exiting 0 is the worst outcome for this tool:
+// an agent driving `split` in a loop produces empty junk commits and believes
+// it succeeded.
+// ---------------------------------------------------------------------------
+
+/// A repo with two single-line insertions, one in a .py and one in a .rs file.
+fn strict_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("a.py", "import os\n");
+    repo.write_file("a.rs", "use std::fs;\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.py", "import os\nimport sys\n");
+    repo.write_file("a.rs", "use std::fs;\nuse std::io;\n");
+    repo
+}
+
+#[test]
+fn unknown_hunk_type_is_an_error_not_an_empty_selection() {
+    let repo = strict_repo("strict-type");
+    let err = repo.hunk_fail(&["list", "--spec", "type(insertt)"]);
+    assert!(
+        err.contains("insertt"),
+        "error should name the bad value, got: {err}"
+    );
+}
+
+#[test]
+fn unknown_status_value_is_an_error() {
+    let repo = strict_repo("strict-status");
+    let err = repo.hunk_fail(&["list", "--spec", "status(bogus)"]);
+    assert!(err.contains("bogus"), "got: {err}");
+}
+
+#[test]
+fn hunk_type_is_case_sensitive_and_reports_the_bad_value() {
+    let repo = strict_repo("strict-case");
+    let err = repo.hunk_fail(&["list", "--spec", "type(INSERT)"]);
+    assert!(err.contains("INSERT"), "got: {err}");
+}
+
+#[test]
+fn valid_enum_values_still_work() {
+    let repo = strict_repo("strict-valid-enum");
+    for spec in ["type(insert)", "type(delete)", "type(replace)", "status(modified)"] {
+        let out = repo.hunk_ok(&["list", "--spec", spec, "--format", "text"]);
+        // Must not error; may legitimately match nothing for delete/replace.
+        assert!(!out.contains("error"), "{spec} errored: {out}");
+    }
+}
+
+#[test]
+fn hunkset_syntax_error_is_reported_as_a_hunkset_error() {
+    let repo = strict_repo("strict-syntax");
+    let err = repo.hunk_fail(&["list", "--spec", "type(insert"]);
+    assert!(
+        !err.contains("Failed to parse spec as JSON"),
+        "syntax error leaked into the JSON parser: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("hunkset"),
+        "expected a hunkset error, got: {err}"
+    );
+}
+
+#[test]
+fn trailing_operator_is_a_hunkset_syntax_error() {
+    let repo = strict_repo("strict-trailing-op");
+    let err = repo.hunk_fail(&["list", "--spec", "type(insert) &"]);
+    assert!(
+        !err.contains("Failed to parse spec as JSON"),
+        "leaked into JSON parser: {err}"
+    );
+}
+
+#[test]
+fn json_specs_still_parse_and_report_json_errors() {
+    let repo = strict_repo("strict-json-untouched");
+    // Valid JSON spec keeps working.
+    let out = repo.hunk_ok(&[
+        "list",
+        "--spec",
+        r#"{"files": {"a.py": {"action": "keep"}}, "default": "reset"}"#,
+        "--format",
+        "text",
+    ]);
+    assert!(out.contains("a.py"), "valid JSON spec broke: {out}");
+    // Malformed JSON must still be reported as a spec error, not a hunkset one.
+    let err = repo.hunk_fail(&["list", "--spec", r#"{"files": {"#]);
+    assert!(err.to_lowercase().contains("json") || err.to_lowercase().contains("yaml"),
+        "expected a JSON/YAML error, got: {err}");
+}
+
+#[test]
+fn explicit_substring_prefix_is_honoured_not_downgraded_to_exact() {
+    let repo = strict_repo("strict-substring");
+    let out = repo.hunk_ok(&["list", "--spec", r#"file(substring:"a.p")"#, "--format", "text"]);
+    assert!(
+        out.contains("a.py"),
+        "explicit substring: was discarded, got: {out}"
+    );
+}
+
+#[test]
+fn explicit_regex_prefix_is_honoured_by_glob_predicate() {
+    let repo = strict_repo("strict-glob-regex");
+    let out = repo.hunk_ok(&["list", "--spec", r#"glob(regex:"a\\.py")"#, "--format", "text"]);
+    assert!(
+        out.contains("a.py"),
+        "explicit regex: was discarded by glob(), got: {out}"
+    );
+}
+
+#[test]
+fn default_exact_matching_for_file_is_preserved() {
+    let repo = strict_repo("strict-exact-default");
+    // A bare string on file() still means exact: a partial path must not match.
+    let out = repo.hunk_ok(&["list", "--spec", r#"file("a.p")"#, "--format", "text"]);
+    assert!(!out.contains("a.py"), "bare string should be exact, got: {out}");
+    let out = repo.hunk_ok(&["list", "--spec", r#"file("a.py")"#, "--format", "text"]);
+    assert!(out.contains("a.py"), "exact path should match, got: {out}");
+}
+
+#[test]
+fn pattern_prefix_inside_quotes_is_rejected_with_a_hint() {
+    let repo = strict_repo("strict-quoted-prefix");
+    let err = repo.hunk_fail(&["list", "--spec", r#"content("regex:import")"#]);
+    assert!(
+        err.contains("regex:"),
+        "error should quote the offending prefix, got: {err}"
+    );
+}
+
+#[test]
+fn mutating_command_refuses_an_empty_selection() {
+    let repo = strict_repo("strict-empty-split");
+    let err = repo.hunk_fail(&["split", "type(insertt)", "typo commit"]);
+    assert!(
+        !err.is_empty(),
+        "split with a bad selector should fail loudly"
+    );
+    // and must not have created a commit
+    let descs = repo.log_descriptions();
+    assert!(
+        !descs.iter().any(|d| d.contains("typo commit")),
+        "an empty junk commit was created anyway: {descs:?}"
+    );
+}
+
+#[test]
+fn mutating_command_refuses_a_valid_selector_that_matches_nothing() {
+    let repo = strict_repo("strict-empty-nomatch");
+    // Syntactically fine, semantically empty: no such file.
+    let err = repo.hunk_fail(&["split", r#"file("nope.txt")"#, "no match"]);
+    assert!(!err.is_empty(), "expected failure");
+    let descs = repo.log_descriptions();
+    assert!(
+        !descs.iter().any(|d| d.contains("no match")),
+        "created a commit from an empty selection: {descs:?}"
+    );
+}
+
+#[test]
+fn list_with_a_selector_matching_nothing_is_not_an_error() {
+    // `list` is read-only: an empty result is legitimate output, not a failure.
+    let repo = strict_repo("strict-empty-list");
+    let out = repo.hunk_ok(&["list", "--spec", r#"file("nope.txt")"#, "--format", "text"]);
+    assert!(!out.contains("a.py"), "unexpected match: {out}");
+}
+
+#[test]
+fn split_with_a_matching_selector_still_works() {
+    let repo = strict_repo("strict-happy-path");
+    repo.hunk_ok(&["split", r#"file("a.py")"#, "feat: python change"]);
+    let descs = repo.log_descriptions();
+    assert!(
+        descs.iter().any(|d| d.contains("feat: python change")),
+        "happy path broke: {descs:?}"
+    );
+}
+
+#[test]
+fn depth_rejects_a_non_numeric_argument() {
+    let repo = strict_repo("strict-depth");
+    let err = repo.hunk_fail(&["list", "--spec", "depth(abc)"]);
+    assert!(
+        err.contains("abc") || err.contains("number or range"),
+        "expected an argument error, got: {err}"
+    );
+}

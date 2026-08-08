@@ -326,10 +326,10 @@ impl Parser {
                         _ => Err(self.error_at(self.current_pos(), "expected number after '..'")),
                     }
                 } else {
-                    Ok(Arg::Pattern(StringPattern {
-                        kind: PatternKind::Exact,
-                        value: n.to_string(),
-                    }))
+                    Ok(Arg::Pattern(StringPattern::inferred(
+                        PatternKind::Exact,
+                        n.to_string(),
+                    )))
                 }
             }
             Some(TokenKind::Str(_)) => {
@@ -337,10 +337,24 @@ impl Parser {
                     Some(TokenKind::Str(s)) => s,
                     _ => unreachable!(),
                 };
-                Ok(Arg::Pattern(StringPattern {
-                    kind: PatternKind::Substring,
+                // A bare quoted string carries no explicit kind. Reject a
+                // prefix written *inside* the quotes: it would otherwise be
+                // matched as literal text and quietly find nothing.
+                if let Some((prefix, _)) = value.split_once(':') {
+                    if matches!(prefix, "exact" | "substring" | "glob" | "regex") {
+                        return Err(self.error_at(
+                            self.current_pos(),
+                            &format!(
+                                "pattern prefix '{prefix}:' must go outside the quotes \
+                                 -- write {prefix}:\"...\" instead of \"{prefix}:...\""
+                            ),
+                        ));
+                    }
+                }
+                Ok(Arg::Pattern(StringPattern::inferred(
+                    PatternKind::Substring,
                     value,
-                }))
+                )))
             }
             Some(TokenKind::Ident(_)) => {
                 let ident = match self.next_kind() {
@@ -363,12 +377,12 @@ impl Parser {
                             return Err(self.error_at(self.current_pos(), &format!("expected string after '{}:'", ident)))
                         }
                     };
-                    Ok(Arg::Pattern(StringPattern { kind, value }))
+                    Ok(Arg::Pattern(StringPattern { kind, value, explicit: true }))
                 } else {
-                    Ok(Arg::Pattern(StringPattern {
-                        kind: PatternKind::Exact,
-                        value: ident,
-                    }))
+                    Ok(Arg::Pattern(StringPattern::inferred(
+                        PatternKind::Exact,
+                        ident,
+                    )))
                 }
             }
             _ => Err(self.error_at(self.current_pos(), "expected argument")),
@@ -490,6 +504,7 @@ mod tests {
                 vec![Arg::Pattern(StringPattern {
                     kind: PatternKind::Exact,
                     value: "insert".into(),
+                    explicit: false, // bare ident: kind inferred
                 })]
             )
         );
@@ -561,6 +576,7 @@ mod tests {
                 vec![Arg::Pattern(StringPattern {
                     kind: PatternKind::Regex,
                     value: "TODO".into(),
+                    explicit: true, // written as regex:"..."
                 })]
             )
         );
