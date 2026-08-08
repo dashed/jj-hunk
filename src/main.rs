@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 mod diff;
+#[cfg(feature = "semantic")]
+mod semantic;
 mod spec;
 mod commands;
 
