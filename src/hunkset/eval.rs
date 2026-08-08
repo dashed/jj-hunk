@@ -91,6 +91,34 @@ fn validate_enum_args(func: &str, args: &[Arg], valid: &[&str]) -> Result<(), Hu
     Ok(())
 }
 
+/// Warn when a semantic predicate came back empty only because nothing could
+/// be parsed. Without this, "no language support for .txt" is indistinguishable
+/// from "no hunk matched your query".
+///
+/// Deliberately silent when *some* file was analyzed: an empty result is then a
+/// real answer about real metadata.
+fn warn_if_nothing_analyzed(func: &str, result: &HashSet<usize>, hunks: &[EnrichedHunk]) {
+    if !result.is_empty() || hunks.is_empty() {
+        return;
+    }
+    if hunks.iter().any(|h| h.hunk.semantic.is_analyzed) {
+        return;
+    }
+    let mut files: Vec<&str> = hunks.iter().map(|h| h.file_path).collect();
+    files.sort_unstable();
+    files.dedup();
+    let shown = files.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    let more = if files.len() > 3 {
+        format!(" (+{} more)", files.len() - 3)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "warning: {func}() found no semantic metadata -- no parser is available for: {shown}{more}. \
+         The empty result reflects missing language support, not an absence of matches."
+    );
+}
+
 fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
     // Pre-compile patterns (validates regex upfront)
     let compiled = compile_patterns(extract_patterns(args))?;
@@ -116,12 +144,42 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "added" => Ok(eval_content(&compiled, hunks, ContentMode::Added)),
         "removed" => Ok(eval_content(&compiled, hunks, ContentMode::Removed)),
         "id" => Ok(eval_id(&compiled, hunks)),
-        "function" => { require_semantic(name)?; Ok(eval_semantic(&compiled, hunks, SemanticField::Function)) }
-        "scope" => { require_semantic(name)?; Ok(eval_semantic(&compiled, hunks, SemanticField::Scope)) }
-        "annotation" | "decorator" => { require_semantic(name)?; Ok(eval_annotation(&compiled, hunks)) }
-        "doc" => { require_semantic(name)?; Ok(eval_doc(hunks)) }
-        "import" => { require_semantic(name)?; Ok(eval_import(hunks)) }
-        "toplevel" => { require_semantic(name)?; Ok(eval_toplevel(hunks)) }
+        "function" => {
+            require_semantic(name)?;
+            let r = eval_semantic(&compiled, hunks, SemanticField::Function);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
+        "scope" => {
+            require_semantic(name)?;
+            let r = eval_semantic(&compiled, hunks, SemanticField::Scope);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
+        "annotation" | "decorator" => {
+            require_semantic(name)?;
+            let r = eval_annotation(&compiled, hunks);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
+        "doc" => {
+            require_semantic(name)?;
+            let r = eval_doc(hunks);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
+        "import" => {
+            require_semantic(name)?;
+            let r = eval_import(hunks);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
+        "toplevel" => {
+            require_semantic(name)?;
+            let r = eval_toplevel(hunks);
+            warn_if_nothing_analyzed(name, &r, hunks);
+            Ok(r)
+        }
         "depth" => {
             // Validate the argument shape before the feature gate: a malformed
             // query is malformed whether or not tree-sitter is compiled in.
@@ -145,7 +203,9 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
                 });
             }
             require_semantic(name)?;
-            Ok(eval_depth(args, hunks))
+            let r = eval_depth(args, hunks);
+            warn_if_nothing_analyzed("depth", &r, hunks);
+            Ok(r)
         }
         _ => Err(HunksetError::UnknownFunction { name: name.to_string() }),
     }
@@ -382,7 +442,8 @@ fn eval_import(hunks: &[EnrichedHunk]) -> HashSet<usize> {
 }
 
 fn eval_toplevel(hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    filter_by_bool(hunks, |h| h.hunk.semantic.is_toplevel)
+    // A hunk no parser looked at is not "top level" -- it is unknown.
+    filter_by_bool(hunks, |h| h.hunk.semantic.is_analyzed && h.hunk.semantic.is_toplevel)
 }
 
 fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
@@ -404,6 +465,12 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
         .iter()
         .enumerate()
         .filter(|(_, h)| {
+            // Same reasoning as eval_toplevel: an unanalyzed hunk defaults to
+            // depth 0, which would otherwise make depth(0) match every file
+            // the parser could not read.
+            if !h.hunk.semantic.is_analyzed {
+                return false;
+            }
             let d = h.hunk.semantic.nesting_depth;
             exact.contains(&d) || ranges.iter().any(|&(lo, hi)| d >= lo && d <= hi)
         })

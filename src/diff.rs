@@ -43,6 +43,14 @@ pub struct SemanticInfo {
     pub is_toplevel: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub nesting_depth: usize,
+    /// Whether a parser actually ran for this hunk's file.
+    ///
+    /// Distinguishes "parsed, and top level" from "never parsed". Without it,
+    /// an unsupported file type looks identical to genuinely top-level code:
+    /// the default is depth 0 with is_toplevel false, so `depth(0)` matched it
+    /// while `toplevel()` did not.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_analyzed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

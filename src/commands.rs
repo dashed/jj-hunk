@@ -373,6 +373,7 @@ fn enrich_hunks_with_semantics(
                 is_doc_comment: ctx.is_doc_comment,
                 is_import: ctx.is_import,
                 is_toplevel: ctx.is_toplevel,
+                is_analyzed: ctx.is_analyzed,
                 nesting_depth: ctx.nesting_depth,
             };
         }

@@ -940,3 +940,96 @@ fn depth_rejects_a_non_numeric_argument() {
         "expected an argument error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// toplevel() and depth() must agree with each other, and must not quietly
+// include hunks from files no parser ever looked at.
+//
+// These need a real parser, so they are gated on the `semantic` feature.
+// They are inert on alberto/hunkset-lang (which declares `semantic = []`)
+// and run in the integration merge, where the grammars are present.
+// include hunks from files no parser ever looked at.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "semantic")]
+fn unparsed_files_are_excluded_from_both_toplevel_and_depth() {
+    let repo = TestRepo::new("sem-unparsed");
+    repo.write_file("a.rs", "use std::fs;\n");
+    repo.write_file("notes.txt", "hello\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.rs", "use std::fs;\nuse std::io;\n");
+    repo.write_file("notes.txt", "hello\nworld\n");
+
+    let toplevel = repo.hunk_ok(&["list", "--spec", "toplevel()", "--format", "text"]);
+    let depth0 = repo.hunk_ok(&["list", "--spec", "depth(0)", "--format", "text"]);
+
+    // Whatever the answer is, the two must agree about notes.txt.
+    assert_eq!(
+        toplevel.contains("notes.txt"),
+        depth0.contains("notes.txt"),
+        "toplevel() and depth(0) disagree about an unparsed file\n\
+         toplevel:\n{toplevel}\ndepth(0):\n{depth0}"
+    );
+    assert!(
+        !depth0.contains("notes.txt"),
+        "a file with no parser must not be reported as depth 0:\n{depth0}"
+    );
+}
+
+#[test]
+#[cfg(feature = "semantic")]
+fn toplevel_and_depth_agree_on_python_and_rust() {
+    let repo = TestRepo::new("sem-py-rs");
+    repo.write_file("a.py", "import os\n");
+    repo.write_file("a.rs", "use std::fs;\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.py", "import os\nimport sys\n");
+    repo.write_file("a.rs", "use std::fs;\nuse std::io;\n");
+
+    let toplevel = repo.hunk_ok(&["list", "--spec", "toplevel()", "--format", "text"]);
+    for f in ["a.py", "a.rs"] {
+        assert!(
+            toplevel.contains(f),
+            "{f} top-level import missing from toplevel():\n{toplevel}"
+        );
+    }
+    let depth0 = repo.hunk_ok(&["list", "--spec", "depth(0)", "--format", "text"]);
+    for f in ["a.py", "a.rs"] {
+        assert!(depth0.contains(f), "{f} missing from depth(0):\n{depth0}");
+    }
+}
+
+#[test]
+#[cfg(feature = "semantic")]
+fn semantic_predicates_warn_when_a_file_cannot_be_analyzed() {
+    let repo = TestRepo::new("sem-warn");
+    repo.write_file("notes.txt", "hello\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("notes.txt", "hello\nworld\n");
+
+    // Every hunk is unanalyzable, so a semantic query returning nothing is
+    // misleading without a diagnostic.
+    let out = repo.hunk(&["list", "--spec", r#"function("anything")"#, "--format", "text"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("warning"),
+        "expected a warning about unanalyzable files, got stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "semantic")]
+fn no_warning_when_files_are_analyzable() {
+    let repo = TestRepo::new("sem-nowarn");
+    repo.write_file("a.rs", "fn a() {}\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.rs", "fn a() {}\nfn b() {}\n");
+
+    let out = repo.hunk(&["list", "--spec", r#"function("b")"#, "--format", "text"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.to_lowercase().contains("warning"),
+        "should not warn for a supported language: {stderr}"
+    );
+}
