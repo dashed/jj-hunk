@@ -1,4 +1,11 @@
-# jj-hunk
+# jj-hunk (fork)
+
+> **This is a fork** of [laulauland/jj-hunk](https://github.com/laulauland/jj-hunk).
+> It adds the [hunkset query language](FORK_WORKFLOW.md#hunkset-quick-reference) and
+> tree-sitter semantic predicates, imported from [sigma/jj-hunk](https://github.com/sigma/jj-hunk)
+> and reorganized into independently-buildable feature branches.
+> See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for the branch structure, roadmap, and
+> upstream-tracking procedure.
 
 Programmatic hunk selection for [jj (Jujutsu)](https://github.com/martinvonz/jj).
 
