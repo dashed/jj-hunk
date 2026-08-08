@@ -848,43 +848,159 @@ fn render_diff_output(output: &ListOutput) -> String {
 
         result.push_str(&format!("--- {}\n+++ {}\n", a_path, b_path));
 
-        for hunk in &file.hunks {
-            // Build the hunk header: @@ -before +after @@ [scope::function]  [id]
-            let before = format!("-{},{}", hunk.before_range.start, hunk.before_range.length);
-            let after = format!("+{},{}", hunk.after_range.start, hunk.after_range.length);
-
-            let mut context = String::new();
-            if let Some(scope) = &hunk.semantic.enclosing_scope {
-                if let Some(func) = &hunk.semantic.enclosing_function {
-                    context = format!(" {}::{}", scope, func);
-                } else {
-                    context = format!(" {}", scope);
-                }
-            } else if let Some(func) = &hunk.semantic.enclosing_function {
-                context = format!(" {}", func);
-            }
-
-            // Truncate ID for readability (first 12 hex chars after "hunk-")
-            let short_id = if hunk.id.len() > 17 {
-                format!("{}...", &hunk.id[..17])
-            } else {
-                hunk.id.clone()
-            };
-
-            result.push_str(&format!(
-                "@@ {} {} @@{} [{}]\n",
-                before, after, context, short_id
-            ));
-
-            for line in hunk.removed.lines() {
-                result.push_str(&format!("-{}\n", line));
-            }
-            for line in hunk.added.lines() {
-                result.push_str(&format!("+{}\n", line));
-            }
+        // Hunks whose context windows touch or overlap must be emitted as a
+        // single @@ block, otherwise the ranges overlap and the patch is
+        // invalid. Anything further apart than two context windows is
+        // independent.
+        for block in group_adjacent_hunks(&file.hunks) {
+            result.push_str(&render_diff_block(&file.hunks[block.0..block.1]));
         }
     }
 
+    result
+}
+
+/// Split a file's hunks into runs that must share one `@@` block.
+/// Returns half-open index ranges into `hunks`.
+fn group_adjacent_hunks(hunks: &[Hunk]) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    for i in 1..hunks.len() {
+        let prev = &hunks[i - 1];
+        let prev_end = prev.before_range.start + prev.before_range.length;
+        let gap = hunks[i].before_range.start.saturating_sub(prev_end);
+        // Two windows of CONTEXT_LINES is the most we can reconstruct from the
+        // stored per-hunk context, and also the point past which git would
+        // split the hunks anyway.
+        if gap > 2 * DIFF_CONTEXT_LINES {
+            blocks.push((start, i));
+            start = i;
+        }
+    }
+    if !hunks.is_empty() {
+        blocks.push((start, hunks.len()));
+    }
+    blocks
+}
+
+/// Context lines stored per hunk by `diff::build_context`.
+const DIFF_CONTEXT_LINES: usize = 3;
+
+fn context_lines(text: &str) -> Vec<&str> {
+    text.lines().collect()
+}
+
+/// Reconstruct the `gap` source lines sitting between two hunks.
+///
+/// `prev.context.post` holds the first up-to-3 lines after `prev`, and
+/// `next.context.pre` holds the last up-to-3 lines before `next`. For a gap of
+/// at most `2 * DIFF_CONTEXT_LINES` the two together cover it exactly.
+fn gap_lines<'a>(prev: &'a Hunk, next: &'a Hunk, gap: usize) -> Vec<&'a str> {
+    let post: Vec<&str> = prev
+        .context
+        .as_ref()
+        .map(|c| context_lines(&c.after))
+        .unwrap_or_default();
+    let mut out: Vec<&str> = post.into_iter().take(gap.min(DIFF_CONTEXT_LINES)).collect();
+    if out.len() < gap {
+        let pre: Vec<&str> = next
+            .context
+            .as_ref()
+            .map(|c| context_lines(&c.before))
+            .unwrap_or_default();
+        // `pre` covers the last min(3, gap) lines of the gap; take the tail we
+        // are still missing.
+        let need = gap - out.len();
+        let skip = pre.len().saturating_sub(need);
+        out.extend(pre.into_iter().skip(skip));
+    }
+    out
+}
+
+fn render_diff_block(hunks: &[Hunk]) -> String {
+    let mut result = String::new();
+    let Some(first) = hunks.first() else {
+        return result;
+    };
+    let last = &hunks[hunks.len() - 1];
+
+    let leading: Vec<&str> = first
+        .context
+        .as_ref()
+        .map(|c| context_lines(&c.before))
+        .unwrap_or_default();
+    let trailing: Vec<&str> = last
+        .context
+        .as_ref()
+        .map(|c| context_lines(&c.after))
+        .unwrap_or_default();
+
+    // Body, and the change-line counts, are built together so the header can
+    // be computed from what was actually emitted.
+    let mut body = String::new();
+    let mut old_len = leading.len();
+    let mut new_len = leading.len();
+    for line in &leading {
+        body.push_str(&format!(" {}\n", line));
+    }
+
+    for (i, hunk) in hunks.iter().enumerate() {
+        if i > 0 {
+            let prev = &hunks[i - 1];
+            let prev_end = prev.before_range.start + prev.before_range.length;
+            let gap = hunk.before_range.start.saturating_sub(prev_end);
+            for line in gap_lines(prev, hunk, gap) {
+                body.push_str(&format!(" {}\n", line));
+                old_len += 1;
+                new_len += 1;
+            }
+        }
+        for line in hunk.removed.lines() {
+            body.push_str(&format!("-{}\n", line));
+            old_len += 1;
+        }
+        for line in hunk.added.lines() {
+            body.push_str(&format!("+{}\n", line));
+            new_len += 1;
+        }
+    }
+
+    for line in &trailing {
+        body.push_str(&format!(" {}\n", line));
+        old_len += 1;
+        new_len += 1;
+    }
+
+    let old_start = first.before_range.start.saturating_sub(leading.len());
+    let new_start = first.after_range.start.saturating_sub(leading.len());
+    // A zero-length side is written as `-0,0` / `+0,0`; otherwise the start is
+    // the first line the block covers.
+    let old_start = if old_len == 0 { 0 } else { old_start.max(1) };
+    let new_start = if new_len == 0 { 0 } else { new_start.max(1) };
+
+    let mut scope = String::new();
+    if let Some(s) = &first.semantic.enclosing_scope {
+        if let Some(func) = &first.semantic.enclosing_function {
+            scope = format!(" {}::{}", s, func);
+        } else {
+            scope = format!(" {}", s);
+        }
+    } else if let Some(func) = &first.semantic.enclosing_function {
+        scope = format!(" {}", func);
+    }
+
+    // Truncate ID for readability (first 12 hex chars after "hunk-")
+    let short_id = if first.id.len() > 17 {
+        format!("{}...", &first.id[..17])
+    } else {
+        first.id.clone()
+    };
+
+    result.push_str(&format!(
+        "@@ -{},{} +{},{} @@{} [{}]\n",
+        old_start, old_len, new_start, new_len, scope, short_id
+    ));
+    result.push_str(&body);
     result
 }
 
