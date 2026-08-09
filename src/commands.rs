@@ -1,4 +1,4 @@
-use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::diff::{self, apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
 #[cfg(feature = "semantic")]
@@ -317,7 +317,8 @@ where
         let mut hunks = fh.hunks;
 
         if let SpecDecision::KeepSelection(selection) = &decision {
-            hunks = filter_hunks(hunks, selection);
+            hunks = filter_hunks(hunks, selection)
+                .with_context(|| format!("cannot resolve the selection for {}", fh.path))?;
         }
 
         // A file with no hunks is still a real change if it is binary or if
@@ -606,7 +607,7 @@ fn load_file_hunks(
         };
 
         let mut hunks = if should_diff {
-            get_hunks(&before_text, &after_text)
+            get_hunks(&path, &before_text, &after_text)
         } else {
             Vec::new()
         };
@@ -623,6 +624,12 @@ fn load_file_hunks(
             truncated: before_cut || after_cut,
         });
     }
+
+    // Abbreviate against the whole diff, not per file. A short id has to name
+    // one hunk among everything the user is looking at, and it also has to
+    // mean the same thing whether or not they passed --include, so this
+    // happens before any filtering.
+    diff::assign_short_ids(result.iter_mut().flat_map(|file| file.hunks.iter_mut()));
 
     Ok(result)
 }
@@ -981,11 +988,12 @@ fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
     }
 }
 
-fn filter_hunks(hunks: Vec<Hunk>, selection: &HunkSelection) -> Vec<Hunk> {
-    hunks
+fn filter_hunks(hunks: Vec<Hunk>, selection: &HunkSelection) -> Result<Vec<Hunk>> {
+    let keep = selection.resolve(&hunks)?;
+    Ok(hunks
         .into_iter()
-        .filter(|hunk| selection.matches(hunk.index, &hunk.id))
-        .collect()
+        .filter(|hunk| keep.contains(&hunk.index))
+        .collect())
 }
 
 /// One flag occurrence is one pattern.
@@ -1143,7 +1151,13 @@ fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
             continue;
         }
 
-        let ids = file.hunks.into_iter().map(|hunk| hunk.id).collect();
+        // Abbreviated, because a template exists to be edited by hand: the
+        // documented workflow is to redirect it to a file and delete the ids
+        // you do not want, and 64-character lines make that miserable. Short
+        // ids are unambiguous over the diff this was built from, and
+        // `validate_spec_resolves` turns any that stop being so into an error
+        // rather than a silent mis-select.
+        let ids = file.hunks.into_iter().map(|hunk| hunk.short_id).collect();
         output.insert(file.path, SpecTemplateEntry::Ids { ids, from });
     }
 
@@ -1397,16 +1411,11 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
         scope = format!(" {}", func);
     }
 
-    // Truncate ID for readability (first 12 hex chars after "hunk-")
-    let short_id = if first.id.len() > 17 {
-        format!("{}...", &first.id[..17])
-    } else {
-        first.id.clone()
-    };
-
+    // The abbreviated id, with no ellipsis: it is unambiguous over this diff,
+    // so it can be copied straight out of the header into a selector.
     result.push_str(&format!(
         "@@ -{},{} +{},{} @@{} [{}]\n",
-        old_start, old_len, new_start, new_len, scope, short_id
+        old_start, old_len, new_start, new_len, scope, first.short_id
     ));
     result.push_str(&body);
     result
@@ -1449,7 +1458,7 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
                 "  hunk {} {} {} (before {}+{} after {}+{})",
                 hunk.index,
                 hunk.hunk_type,
-                hunk.id,
+                hunk.short_id,
                 hunk.before_range.start,
                 hunk.before_range.length,
                 hunk.after_range.start,
@@ -1737,9 +1746,8 @@ fn apply_hunk_selection(
         // Unreadable (a symlink, say) reads as empty, which yields no hunks
         // and so restores the file -- the safe direction.
         let before = fs::read_to_string(left.join(filepath)).unwrap_or_default();
-        let keeps_deletion = get_hunks(&before, "")
-            .iter()
-            .any(|hunk| selection.matches(hunk.index, &hunk.id));
+        let hunks = get_hunks(filepath, &before, "");
+        let keeps_deletion = !selection.resolve(&hunks)?.is_empty();
         if !keeps_deletion {
             reset_file(left, right, filepath)?;
         }
@@ -1766,7 +1774,7 @@ fn apply_hunk_selection(
         )
     })?;
 
-    let result = apply_selected_hunks(&before, &after, selection);
+    let result = apply_selected_hunks(filepath, &before, &after, selection)?;
     let keeps_change = result != before;
 
     if !existed_at_this_path && !keeps_change {
@@ -1884,8 +1892,16 @@ fn validate_spec_resolves(spec: &Spec, file_hunks: &[FileHunks]) -> Result<()> {
                 }),
         );
         for id in ids {
-            if !fh.hunks.iter().any(|hunk| hunk.id == id) {
-                problems.push(format!("{path}: no hunk with id {id}"));
+            // Prefix matching, so a spec may name hunks by the abbreviated ids
+            // `list` prints. Ambiguity is caught here rather than left to
+            // `select`, which sees one file at a time and would just keep both.
+            let matched = fh.hunks.iter().filter(|hunk| diff::id_matches(id, &hunk.id)).count();
+            match matched {
+                0 => problems.push(format!("{path}: no hunk with id {id}")),
+                1 => {}
+                n => problems.push(format!(
+                    "{path}: id {id} is ambiguous, it names {n} hunks -- use a longer prefix"
+                )),
             }
         }
 
@@ -1906,9 +1922,9 @@ fn validate_spec_resolves(spec: &Spec, file_hunks: &[FileHunks]) -> Result<()> {
         problems.sort();
         anyhow::bail!(
             "spec does not resolve against the diff:\n  {}\n\
-             Those entries would keep nothing. Check them against \
-             `jj-hunk list --spec-template`, or pass --allow-empty if that is \
-             intended.",
+             Those entries do not name exactly what they meant to. Check them \
+             against `jj-hunk list --spec-template`, or pass --allow-empty if \
+             that is intended.",
             problems.join("\n  ")
         );
     }

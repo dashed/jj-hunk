@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -2528,4 +2529,245 @@ fn a_spec_selecting_hunks_in_a_binary_file_names_the_file() {
         err.contains("bin.dat"),
         "error should name the offending file: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hunk ids: one hunk per id, and an abbreviation you can actually type.
+// ---------------------------------------------------------------------------
+
+/// Every `(path, hunk)` pair in `list --format json`, as (path, id, short_id).
+fn listed_ids(repo: &TestRepo, args: &[&str]) -> Vec<(String, String, String)> {
+    let mut argv = vec!["list", "--format", "json"];
+    argv.extend_from_slice(args);
+    let listing: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&argv)).unwrap();
+
+    let mut out = Vec::new();
+    for file in listing["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap().to_string();
+        for hunk in file["hunks"].as_array().unwrap() {
+            out.push((
+                path.clone(),
+                hunk["id"].as_str().unwrap().to_string(),
+                hunk["short_id"].as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// Two byte-identical blocks in one file, each wrapped in identical lines, so
+/// the hunks agree on everything the id is hashed from.
+fn duplicate_block_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file(
+        "dup.json",
+        "{\n  \"a\": {\n    \"x\": 1,\n    \"drop\": 0\n  },\n  \"z\": 9,\n  \"b\": {\n    \"x\": 1,\n    \"drop\": 0\n  }\n}\n",
+    );
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file(
+        "dup.json",
+        "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"z\": 9,\n  \"b\": {\n    \"x\": 1\n  }\n}\n",
+    );
+    repo
+}
+
+#[test]
+fn identical_hunks_in_one_file_do_not_share_an_id() {
+    let repo = duplicate_block_repo("dup-ids");
+    let listed = listed_ids(&repo, &[]);
+
+    assert_eq!(listed.len(), 2, "fixture should produce two hunks: {listed:?}");
+    assert_ne!(listed[0].1, listed[1].1, "full ids collided: {listed:?}");
+    assert_ne!(listed[1].2, listed[0].2, "short ids collided: {listed:?}");
+}
+
+#[test]
+fn an_id_selects_one_of_two_identical_hunks_through_split() {
+    let repo = duplicate_block_repo("dup-split");
+    let listed = listed_ids(&repo, &[]);
+    let second = &listed[1].2;
+
+    // Keep only the second of the two identical deletions.
+    let spec = format!(r#"{{"files": {{"dup.json": {{"ids": ["{second}"]}}}}}}"#);
+    repo.hunk_ok(&["split", &spec, "second only"]);
+
+    // The first block's `drop` is still in the working copy; the second's is
+    // gone. Sharing one id took both.
+    let remaining = repo.jj_ok(&["diff", "--git"]);
+    assert_eq!(
+        remaining.matches("-    \"drop\": 0").count(),
+        1,
+        "exactly one deletion should be left over:\n{remaining}"
+    );
+}
+
+#[test]
+fn a_line_range_selector_does_not_reach_an_identical_later_hunk() {
+    // `to_spec` turns matched hunks into ids, so a shared id let any selector
+    // that matched one hunk quietly take its twin as well.
+    let repo = duplicate_block_repo("dup-range");
+    let out = repo.hunk_ok(&["list", "--format", "text", "--spec", "before_line(1..5)"]);
+
+    assert_eq!(
+        out.matches("  hunk ").count(),
+        1,
+        "only the first block is in lines 1..5:\n{out}"
+    );
+}
+
+#[test]
+fn the_same_edit_in_two_files_does_not_share_an_id() {
+    let repo = TestRepo::new("cross-file-ids");
+    repo.write_file("one.txt", "alpha\nbravo\ncharlie\n");
+    repo.write_file("two.txt", "alpha\nbravo\ncharlie\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("one.txt", "alpha\nBRAVO\ncharlie\n");
+    repo.write_file("two.txt", "alpha\nBRAVO\ncharlie\n");
+
+    let listed = listed_ids(&repo, &[]);
+    assert_eq!(listed.len(), 2);
+    assert_ne!(
+        listed[0].1, listed[1].1,
+        "the same edit to two files must not be one id: {listed:?}"
+    );
+}
+
+#[test]
+fn json_keeps_the_full_id_and_adds_the_short_one() {
+    let repo = duplicate_block_repo("id-json-shape");
+
+    for (path, id, short_id) in listed_ids(&repo, &[]) {
+        let hex = id.strip_prefix("hunk-").expect("full id keeps the prefix");
+        assert_eq!(hex.len(), 64, "{path}: json `id` must stay the full digest");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let short_hex = short_id.strip_prefix("hunk-").unwrap();
+        assert!(short_hex.len() >= 8, "{path}: {short_id} is under the floor");
+        assert!(id.starts_with(&short_id), "{path}: {short_id} must prefix {id}");
+    }
+}
+
+#[test]
+fn text_and_diff_output_print_the_short_id() {
+    let repo = duplicate_block_repo("id-short-output");
+    let listed = listed_ids(&repo, &[]);
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    let diff = repo.hunk_ok(&["list", "--format", "diff"]);
+
+    for (_, id, short_id) in &listed {
+        assert!(text.contains(short_id.as_str()), "text should show {short_id}:\n{text}");
+        assert!(!text.contains(id.as_str()), "text should not show the full id:\n{text}");
+    }
+    // The diff header names the first hunk of each block, unellipsised.
+    assert!(
+        diff.contains(&format!("[{}]", listed[0].2)),
+        "diff header should carry the short id:\n{diff}"
+    );
+}
+
+#[test]
+fn a_short_id_from_list_works_in_a_hunkset_and_in_a_spec() {
+    let repo = duplicate_block_repo("id-short-input");
+    let listed = listed_ids(&repo, &[]);
+    let (_, full, short) = &listed[0];
+
+    let hunkset = repo.hunk_ok(&["list", "--format", "text", "--spec", &format!(r#"id("{short}")"#)]);
+    assert_eq!(hunkset.matches("  hunk ").count(), 1, "{hunkset}");
+
+    let by_full = repo.hunk_ok(&["list", "--format", "text", "--spec", &format!(r#"id("{full}")"#)]);
+    assert_eq!(by_full, hunkset, "short and full ids must name the same hunk");
+
+    let spec = format!(r#"{{"files": {{"dup.json": {{"ids": ["{short}"]}}}}}}"#);
+    let by_spec = repo.hunk_ok(&["list", "--format", "text", "--spec", &spec]);
+    assert_eq!(by_spec, hunkset, "a spec must accept the short form too");
+}
+
+/// A repo whose diff has more hunks than there are hex digits, so by pigeonhole
+/// at least two ids start with the same one -- a prefix that is genuinely
+/// ambiguous, without hardcoding any hash.
+fn many_hunk_repo(name: &str) -> TestRepo {
+    const HUNKS: usize = 24;
+    let repo = TestRepo::new(name);
+
+    // Four lines apart, so no two hunks share a context window or get merged.
+    let base: String = (0..HUNKS).map(|i| format!("line{i}\npad\npad\npad\n")).collect();
+    let edited: String = (0..HUNKS).map(|i| format!("LINE{i}\npad\npad\npad\n")).collect();
+    repo.write_file("many.txt", &base);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("many.txt", &edited);
+    repo
+}
+
+#[test]
+fn short_ids_stay_unique_across_a_diff_with_many_hunks() {
+    let repo = many_hunk_repo("id-many");
+    let listed = listed_ids(&repo, &[]);
+    assert!(listed.len() > 16, "need more hunks than hex digits: {}", listed.len());
+
+    let shorts: std::collections::HashSet<&str> = listed.iter().map(|(_, _, s)| s.as_str()).collect();
+    assert_eq!(shorts.len(), listed.len(), "short ids must stay unique");
+}
+
+/// The one-hex-digit prefix shared by at least two hunks. Guaranteed to exist
+/// once the diff has more than 16 hunks.
+fn ambiguous_prefix(listed: &[(String, String, String)]) -> String {
+    let mut seen: HashMap<char, usize> = HashMap::new();
+    for (_, id, _) in listed {
+        let first = id.strip_prefix("hunk-").unwrap().chars().next().unwrap();
+        *seen.entry(first).or_default() += 1;
+    }
+    let (digit, _) = seen
+        .iter()
+        .find(|(_, count)| **count > 1)
+        .expect("more hunks than hex digits guarantees a shared first digit");
+    format!("hunk-{digit}")
+}
+
+#[test]
+fn an_ambiguous_id_prefix_is_an_error_everywhere_it_is_accepted() {
+    let repo = many_hunk_repo("id-ambiguous");
+    let listed = listed_ids(&repo, &[]);
+    let prefix = ambiguous_prefix(&listed);
+
+    let hunkset_err = repo.hunk_fail(&["list", "--spec", &format!(r#"id("{prefix}")"#)]);
+    assert!(
+        hunkset_err.to_lowercase().contains("ambiguous"),
+        "id() should reject an ambiguous prefix: {hunkset_err}"
+    );
+
+    let spec = format!(r#"{{"files": {{"many.txt": {{"ids": ["{prefix}"]}}}}}}"#);
+    let list_err = repo.hunk_fail(&["list", "--spec", &spec]);
+    assert!(
+        list_err.to_lowercase().contains("ambiguous"),
+        "a spec should reject an ambiguous prefix: {list_err}"
+    );
+
+    // Most important: it must never reach `select` and quietly keep both.
+    let split_err = repo.hunk_fail(&["split", &spec, "msg"]);
+    assert!(
+        split_err.to_lowercase().contains("ambiguous"),
+        "split should refuse an ambiguous prefix: {split_err}"
+    );
+}
+
+#[test]
+fn a_spec_template_of_a_many_hunk_diff_round_trips() {
+    let repo = many_hunk_repo("id-template-roundtrip");
+    let before = repo.hunk_ok(&["list", "--format", "diff"]);
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    // Outside the repo: a spec file dropped inside it is itself a change, and
+    // this test asserts the working copy is empty afterwards.
+    let template_path = std::env::temp_dir().join(format!("jj-hunk-tmpl-{}.json", std::process::id()));
+    std::fs::write(&template_path, &template).unwrap();
+
+    repo.hunk_ok(&["split", "-f", template_path.to_str().unwrap(), "all of it"]);
+    let _ = std::fs::remove_file(&template_path);
+
+    // Everything the template named ended up in the commit, and nothing is
+    // left behind.
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+    let committed = repo.hunk_ok(&["list", "-r", "@-", "--format", "diff"]);
+    assert_eq!(committed, before, "the split commit should hold the whole diff");
 }

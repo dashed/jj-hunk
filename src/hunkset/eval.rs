@@ -441,9 +441,11 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
 
 // --- stable ID ---
 
-/// Match by hunk ID, supporting prefix matching for abbreviated IDs
-/// (e.g., `id("hunk-162b7798da21...")` matches the full ID).
 /// Select by stable hunk id, with jj-style abbreviation.
+///
+/// Takes either form: the full id, or any prefix of it -- including the
+/// abbreviation `list` prints, which is chosen to be unambiguous over the
+/// whole diff.
 ///
 /// An abbreviated id that matches more than one hunk is an error, not a
 /// multi-select: `id()` is the identity predicate, the one destructive commands
@@ -451,8 +453,9 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
 /// collided is the worst possible reading of the user's intent. jj errors on
 /// ambiguous change-id prefixes for the same reason.
 ///
-/// `exact:"..."` disables abbreviation, so it is also the escape hatch when a
-/// full id happens to prefix another.
+/// `exact:"..."` disables prefix matching. Every full id is the same length,
+/// so one can never prefix another and the escape hatch is not needed for
+/// that; it is there for anyone who wants to rule abbreviation out.
 fn eval_id(
     patterns: &[CompiledPattern],
     hunks: &[EnrichedHunk],
@@ -471,19 +474,21 @@ fn eval_id(
             .iter()
             .enumerate()
             .filter(|(_, h)| {
-                if !exact_only && id.len() < h.hunk.id.len() {
-                    h.hunk.id.starts_with(id.as_str())
-                } else {
+                if exact_only {
                     h.hunk.id == *id
+                } else {
+                    crate::diff::id_matches(&id, &h.hunk.id)
                 }
             })
             .map(|(i, _)| i)
             .collect();
 
         if matched.len() > 1 {
+            // Named by their abbreviations: those are long enough to be
+            // unambiguous over this diff, so the list is directly usable.
             let mut which: Vec<String> = matched
                 .iter()
-                .map(|&i| format!("{} ({})", &hunks[i].hunk.id[..17.min(hunks[i].hunk.id.len())], hunks[i].file_path))
+                .map(|&i| format!("{} ({})", hunks[i].hunk.short_id, hunks[i].file_path))
                 .collect();
             which.sort();
             return Err(HunksetError::AmbiguousId {
@@ -648,6 +653,7 @@ mod tests {
         Hunk {
             index,
             id: format!("hunk-{:064x}", index),
+            short_id: format!("hunk-{:08x}", index),
             hunk_type: hunk_type.to_string(),
             removed: removed.to_string(),
             added: added.to_string(),
