@@ -20,10 +20,44 @@ enum TokenKind {
     Colon,
 }
 
+impl TokenKind {
+    /// How this token looked in the input.
+    ///
+    /// Error messages quote the user's own text; `{:?}` on the variant would
+    /// show internal names like `RParen` and `Tilde`, which mean nothing to
+    /// someone who typed `)` and `~`.
+    fn describe(&self) -> String {
+        match self {
+            TokenKind::LParen => "'('".to_string(),
+            TokenKind::RParen => "')'".to_string(),
+            TokenKind::Pipe => "'|'".to_string(),
+            TokenKind::Ampersand => "'&'".to_string(),
+            TokenKind::Tilde => "'~'".to_string(),
+            TokenKind::Comma => "','".to_string(),
+            TokenKind::DotDot => "'..'".to_string(),
+            TokenKind::Colon => "':'".to_string(),
+            TokenKind::Ident(name) => format!("'{name}'"),
+            TokenKind::Str(value) => format!("string \"{value}\""),
+            TokenKind::Number(n) => format!("number {n}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Token {
     kind: TokenKind,
     pos: usize,
+}
+
+/// A tokenizer failure that already knows where it happened.
+///
+/// The position travels with the message rather than being scraped back out
+/// of it, so a message is free to mention anything -- including another
+/// "position" -- without moving the caret.
+#[derive(Debug)]
+struct TokenizeError {
+    message: String,
+    position: usize,
 }
 
 struct Tokenizer {
@@ -65,7 +99,11 @@ impl Tokenizer {
         Token { kind, pos }
     }
 
-    fn tokenize(&mut self) -> Result<Vec<Token>, String> {
+    fn error_at(&self, position: usize, message: impl Into<String>) -> TokenizeError {
+        TokenizeError { message: message.into(), position }
+    }
+
+    fn tokenize(&mut self) -> Result<Vec<Token>, TokenizeError> {
         let mut tokens = Vec::new();
 
         loop {
@@ -88,14 +126,24 @@ impl Tokenizer {
                         self.pos += 2;
                         tokens.push(self.emit(TokenKind::DotDot, start));
                     } else {
-                        return Err(format!("unexpected '.' at position {}", self.pos));
+                        return Err(self.error_at(start, "unexpected '.' -- a range is written '..', as in lines(10..20)"));
                     }
+                }
+                // `!` is not an operator here. Accepting it silently -- which
+                // is what happened while this fell through to the YAML parser
+                // -- selected nothing and gave the user no clue why.
+                '!' => {
+                    return Err(self.error_at(
+                        start,
+                        "'!' is not an operator -- use '~' for negation ('~x') \
+                         and for difference ('x ~ y')",
+                    ));
                 }
                 '"' => { tokens.push(self.read_string(start)?); }
                 _ if ch.is_ascii_digit() => { tokens.push(self.read_number(start)?); }
                 _ if is_ident_start(ch) => { tokens.push(self.read_ident(start)); }
                 _ => {
-                    return Err(format!("unexpected character '{}' at position {}", ch, self.pos));
+                    return Err(self.error_at(start, format!("unexpected character '{ch}'")));
                 }
             }
         }
@@ -103,7 +151,7 @@ impl Tokenizer {
         Ok(tokens)
     }
 
-    fn read_string(&mut self, start: usize) -> Result<Token, String> {
+    fn read_string(&mut self, start: usize) -> Result<Token, TokenizeError> {
         self.next_char(); // consume opening quote
         let mut value = String::new();
         loop {
@@ -115,15 +163,17 @@ impl Tokenizer {
                     Some('\\') => value.push('\\'),
                     Some('"') => value.push('"'),
                     Some(c) => { value.push('\\'); value.push(c); }
-                    None => return Err("unterminated string escape".to_string()),
+                    // Point at the quote that opened the string, not at the
+                    // end of the input: that is the character to fix.
+                    None => return Err(self.error_at(start, "unterminated string escape")),
                 },
                 Some(c) => value.push(c),
-                None => return Err("unterminated string literal".to_string()),
+                None => return Err(self.error_at(start, "unterminated string literal")),
             }
         }
     }
 
-    fn read_number(&mut self, start: usize) -> Result<Token, String> {
+    fn read_number(&mut self, start: usize) -> Result<Token, TokenizeError> {
         let mut digits = String::new();
         while let Some(ch) = self.peek_char() {
             if ch.is_ascii_digit() {
@@ -133,9 +183,9 @@ impl Tokenizer {
                 break;
             }
         }
-        let n: usize = digits.parse().map_err(|_| {
-            format!("number too large at position {}", start)
-        })?;
+        let n: usize = digits
+            .parse()
+            .map_err(|_| self.error_at(start, format!("number '{digits}' is too large")))?;
         Ok(Token { kind: TokenKind::Number(n), pos: start })
     }
 
@@ -165,15 +215,70 @@ fn is_ident_char(ch: char) -> bool {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// How many levels of `(` / `~` nesting the parser will descend through.
+///
+/// The descent is recursive, so without a ceiling a long enough run of `(` or
+/// `~` exhausts the stack and aborts the process -- a crash, not an error.
+///
+/// The number is bounded from both sides:
+///
+/// * From above, by what an expression can plausibly need. Real ones nest two
+///   or three deep, and the chaining operators cost nothing here -- `a | b | c`
+///   is parsed in a loop, not by recursion -- so only literal parentheses and
+///   stacked `~` count against the limit. 128 leaves ample room.
+/// * From below, by the stack. A debug build spends roughly 8 KiB per level
+///   (measured: at 255 levels a 1 MiB thread overflows and a 2 MiB one does
+///   not), so 128 levels peak around 1 MiB. That fits the 2 MiB a spawned
+///   thread gets by default, not just the 8 MiB of the main thread -- a limit
+///   sized only for the main thread would still crash everywhere else.
+///
+/// `nesting_at_the_limit_fits_a_default_thread_stack` pins that second bound,
+/// so raising this constant without re-measuring fails loudly.
+const MAX_DEPTH: usize = 128;
+
 struct Parser {
     input: String,
+    /// Length of `input` in characters, not bytes.
+    ///
+    /// Token positions come from the tokenizer, which indexes characters, so
+    /// the "one past the end" position used for end-of-input errors has to be
+    /// counted the same way or a caret after any non-ASCII text lands too far
+    /// right.
+    input_len: usize,
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
     fn new(input: &str, tokens: Vec<Token>) -> Self {
-        Self { input: input.to_string(), tokens, pos: 0 }
+        Self {
+            input: input.to_string(),
+            input_len: input.chars().count(),
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Descend one level, running `f` there.
+    ///
+    /// Every recursive path in the parser goes through here, so the counter
+    /// cannot drift out of step with the actual stack depth.
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, HunksetError>,
+    ) -> Result<T, HunksetError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error_at(
+                self.current_pos(),
+                &format!("expression is too deeply nested (limit is {MAX_DEPTH})"),
+            ));
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
     }
 
     fn peek(&self) -> Option<&TokenKind> {
@@ -195,8 +300,14 @@ impl Parser {
     fn expect(&mut self, expected: &TokenKind) -> Result<(), HunksetError> {
         match self.next_token() {
             Some(tok) if tok.kind == *expected => Ok(()),
-            Some(tok) => Err(self.error_at(tok.pos, &format!("expected {:?}, got {:?}", expected, tok.kind))),
-            None => Err(self.error_at(self.input.len(), &format!("expected {:?}, got end of input", expected))),
+            Some(tok) => {
+                let msg = format!("expected {}, got {}", expected.describe(), tok.kind.describe());
+                Err(self.error_at(tok.pos, &msg))
+            }
+            None => {
+                let msg = format!("expected {}, got end of input", expected.describe());
+                Err(self.error_at(self.input_len, &msg))
+            }
         }
     }
 
@@ -209,14 +320,24 @@ impl Parser {
     }
 
     fn current_pos(&self) -> usize {
-        self.tokens.get(self.pos).map(|t| t.pos).unwrap_or(self.input.len())
+        self.tokens.get(self.pos).map(|t| t.pos).unwrap_or(self.input_len)
     }
 
     fn parse(&mut self) -> Result<Expr, HunksetError> {
         let expr = self.parse_union()?;
         if self.pos < self.tokens.len() {
-            let tok = &self.tokens[self.pos];
-            return Err(self.error_at(tok.pos, &format!("unexpected {:?}", tok.kind)));
+            let tok = self.tokens[self.pos].clone();
+            let mut msg = format!("unexpected {}", tok.kind.describe());
+            // The overwhelmingly likely way to arrive here with a `~` is a
+            // chain like `a ~ b ~ c`, which this grammar does not group for
+            // you. Say so rather than leave the user guessing.
+            if tok.kind == TokenKind::Tilde {
+                msg.push_str(
+                    " -- difference does not chain; add parentheses, \
+                     as in '(a ~ b) ~ c'",
+                );
+            }
+            return Err(self.error_at(tok.pos, &msg));
         }
         Ok(expr)
     }
@@ -242,7 +363,15 @@ impl Parser {
     }
 
     /// Difference is intentionally non-associative (`a ~ b ~ c` is a parse
-    /// error). Use parentheses: `(a ~ b) ~ c`. This matches jj's revset.
+    /// error). Use parentheses: `(a ~ b) ~ c`.
+    ///
+    /// This is stricter than jj, whose revset parser treats `~` as an ordinary
+    /// left-associative infix operator, so `all() ~ none() ~ none()` is
+    /// accepted there and means `(all() ~ none()) ~ none()`. The stricter rule
+    /// is a deliberate choice for this language: `~` is also the prefix
+    /// negation operator, so a bare chain reads ambiguously to a human even
+    /// where the grammar is unambiguous, and requiring the parentheses makes
+    /// the grouping impossible to misread.
     fn parse_difference(&mut self) -> Result<Expr, HunksetError> {
         let left = self.parse_negation()?;
         if self.peek() == Some(&TokenKind::Tilde) {
@@ -258,7 +387,7 @@ impl Parser {
     fn parse_negation(&mut self) -> Result<Expr, HunksetError> {
         if self.peek() == Some(&TokenKind::Tilde) {
             self.next_kind();
-            let inner = self.parse_negation()?;
+            let inner = self.nested(|p| p.parse_negation())?;
             Ok(Expr::Negation(Box::new(inner)))
         } else {
             self.parse_atom()
@@ -269,7 +398,7 @@ impl Parser {
         match self.peek() {
             Some(TokenKind::LParen) => {
                 self.next_kind();
-                let expr = self.parse_union()?;
+                let expr = self.nested(|p| p.parse_union())?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(expr)
             }
@@ -393,16 +522,10 @@ impl Parser {
 /// Parse a hunkset expression string into an AST.
 pub fn parse(input: &str) -> Result<Expr, HunksetError> {
     let mut tokenizer = Tokenizer::new(input);
-    let tokens = tokenizer.tokenize().map_err(|e| {
-        let pos = e
-            .rfind("position ")
-            .and_then(|idx| e[idx + 9..].trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        HunksetError::Parse {
-            message: e,
-            input: input.to_string(),
-            position: pos,
-        }
+    let tokens = tokenizer.tokenize().map_err(|e| HunksetError::Parse {
+        message: e.message,
+        input: input.to_string(),
+        position: e.position,
     })?;
     if tokens.is_empty() {
         return Err(HunksetError::Parse {
@@ -607,5 +730,214 @@ mod tests {
         let display = err.display_with_context();
         assert!(display.contains("type(insert"));
         assert!(display.contains("^"));
+    }
+
+    /// The caret must sit under the token the message is about. These are the
+    /// positions the pre-existing behaviour got right; they are pinned so the
+    /// error-message rewording below cannot quietly move them.
+    fn caret_column(input: &str) -> usize {
+        let err = parse(input).unwrap_err();
+        let display = err.display_with_context();
+        let caret_line = display.lines().nth(1).expect("caret line");
+        caret_line.find('^').expect("caret")
+    }
+
+    #[test]
+    fn caret_points_at_the_offending_token() {
+        // End of input: one past the last character.
+        assert_eq!(caret_column("type(insert"), "type(insert".len());
+        // The second `~` in a chained difference.
+        assert_eq!(caret_column("all() ~ none() ~ all()"), 15);
+        // A stray character sits at its own offset.
+        assert_eq!(caret_column("type(insert) @"), 13);
+    }
+
+    // -- bug: `!` was silently accepted (via the YAML fallback) ------------
+
+    #[test]
+    fn bang_is_rejected_and_points_at_tilde() {
+        let err = parse("!import()").unwrap_err();
+        let msg = err.display_with_context();
+        assert!(msg.contains('!'), "should quote the offending '!': {msg}");
+        assert!(
+            msg.contains('~'),
+            "should name '~' as the operator to use: {msg}"
+        );
+        assert_eq!(caret_column("!import()"), 0);
+    }
+
+    /// Rejecting `!` is the tokenizer's job, so it must not reach inside a
+    /// string literal -- `content("no!")` is a perfectly ordinary query.
+    #[test]
+    fn bang_inside_a_string_literal_is_still_content() {
+        assert_eq!(
+            parse(r#"content("no!")"#).unwrap(),
+            Expr::Function(
+                "content".into(),
+                vec![Arg::Pattern(StringPattern {
+                    kind: PatternKind::Substring,
+                    value: "no!".into(),
+                    explicit: false,
+                })]
+            )
+        );
+        assert!(parse(r#"added(regex:"^\\s*!")"#).is_ok());
+    }
+
+    #[test]
+    fn bang_is_rejected_in_infix_position() {
+        let err = parse("all() ! none()").unwrap_err();
+        let msg = err.display_with_context();
+        assert!(msg.contains('~'), "should name '~': {msg}");
+        assert_eq!(caret_column("all() ! none()"), 6);
+    }
+
+    // -- bug: unbounded recursion aborted the process ----------------------
+
+    #[test]
+    fn deeply_nested_parens_are_a_parse_error_not_a_crash() {
+        let input = format!("{}all(){}", "(".repeat(20_000), ")".repeat(20_000));
+        let err = parse(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("too deeply nested"),
+            "expected a nesting error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deeply_stacked_negations_are_a_parse_error_not_a_crash() {
+        let input = format!("{}all()", "~".repeat(100_000));
+        let err = parse(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("too deeply nested"),
+            "expected a nesting error, got: {err}"
+        );
+    }
+
+    /// The boundary itself: `MAX_DEPTH` levels parse, one more is an error.
+    /// Pinning both sides keeps an off-by-one in the guard from silently
+    /// costing a level (or handing back one it cannot afford).
+    #[test]
+    fn nesting_is_accepted_up_to_the_limit_and_rejected_past_it() {
+        let nest = |depth: usize| format!("{}all(){}", "(".repeat(depth), ")".repeat(depth));
+        assert_eq!(parse(&nest(MAX_DEPTH)).unwrap(), Expr::All);
+        assert!(parse(&nest(MAX_DEPTH + 1))
+            .unwrap_err()
+            .to_string()
+            .contains("too deeply nested"));
+
+        let tildes = |depth: usize| format!("{}all()", "~".repeat(depth));
+        assert!(matches!(
+            parse(&tildes(MAX_DEPTH)).unwrap(),
+            Expr::Negation(_)
+        ));
+        assert!(parse(&tildes(MAX_DEPTH + 1))
+            .unwrap_err()
+            .to_string()
+            .contains("too deeply nested"));
+    }
+
+    /// The limit is only worth anything if parsing *at* it still fits on a
+    /// small stack -- otherwise the guard just moves the crash. 2 MiB is what
+    /// a spawned thread gets by default, well under the main thread's 8 MiB.
+    ///
+    /// This aborts rather than fails if the budget is blown, which is the
+    /// point: raising `MAX_DEPTH` past what the stack holds is exactly the
+    /// bug the limit exists to prevent.
+    #[test]
+    fn nesting_at_the_limit_fits_a_default_thread_stack() {
+        let parsed = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                // One level past the limit: the parser descends the full
+                // `MAX_DEPTH` before refusing, which is the deepest the stack
+                // ever has to hold.
+                let depth = MAX_DEPTH + 1;
+                let parens = format!("{}all(){}", "(".repeat(depth), ")".repeat(depth));
+                parse(&parens).is_err()
+            })
+            .expect("spawn")
+            .join()
+            .expect("parsing at the depth limit overflowed a 2 MiB stack");
+        assert!(parsed);
+    }
+
+    #[test]
+    fn union_chains_do_not_consume_nesting_depth() {
+        // `a | b | c` is parsed iteratively, so a long flat chain must not be
+        // mistaken for deep nesting.
+        let chain = vec!["all()"; MAX_DEPTH * 4].join(" | ");
+        assert!(matches!(parse(&chain).unwrap(), Expr::Union(_, _)));
+    }
+
+    // -- bug: parse errors leaked Rust token debug names -------------------
+
+    #[test]
+    fn error_names_the_typed_operator_not_the_token_variant() {
+        let msg = parse("all() ~ none() ~ all()")
+            .unwrap_err()
+            .display_with_context();
+        assert!(msg.contains('~'), "should show the typed '~': {msg}");
+        assert!(
+            !msg.contains("Tilde"),
+            "leaked the TokenKind variant name: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_names_the_missing_paren_not_the_token_variant() {
+        let msg = parse("type(insert").unwrap_err().display_with_context();
+        assert!(msg.contains(')'), "should show the missing ')': {msg}");
+        assert!(
+            !msg.contains("RParen"),
+            "leaked the TokenKind variant name: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_error_message_leaks_a_token_variant_name() {
+        const VARIANTS: [&str; 11] = [
+            "LParen", "RParen", "Pipe", "Ampersand", "Tilde", "Comma", "DotDot", "Ident", "Str",
+            "Number", "Colon",
+        ];
+        for input in [
+            "type(insert",
+            "all() ~ none() ~ all()",
+            "lines(1..)",
+            "file(,)",
+            "type(insert) type(delete)",
+            "|",
+            "all() &",
+            "added(bogus:\"x\")",
+        ] {
+            let msg = parse(input).unwrap_err().display_with_context();
+            for variant in VARIANTS {
+                assert!(
+                    !msg.contains(variant),
+                    "{input:?} leaked TokenKind::{variant}: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chained_difference_error_explains_the_fix() {
+        let msg = parse("all() ~ none() ~ all()")
+            .unwrap_err()
+            .display_with_context();
+        assert!(
+            msg.contains("parenthes"),
+            "should point at parentheses as the fix: {msg}"
+        );
+    }
+
+    // -- bare `all` / `none` reach the parser ------------------------------
+
+    #[test]
+    fn parse_bare_all_and_none() {
+        assert_eq!(parse("all").unwrap(), Expr::All);
+        assert_eq!(parse("none").unwrap(), Expr::None);
+        assert_eq!(parse("(all)").unwrap(), Expr::All);
+        assert!(matches!(parse("all | none").unwrap(), Expr::Union(_, _)));
     }
 }
