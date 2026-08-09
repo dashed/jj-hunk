@@ -9,8 +9,9 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
@@ -72,6 +73,28 @@ impl Default for ListMode {
     }
 }
 
+/// Caps applied to a file's contents *before* it is diffed, so a very large
+/// file can be listed without materialising its whole diff.
+///
+/// Deliberately not plumbed into the paths that build or consume a spec. A
+/// hunk id is a hash of the text the hunk was computed from, so ids taken from
+/// a truncated file do not exist in the real diff; a spec built from them would
+/// select nothing. `list` is the only consumer, and `build_spec_template`
+/// refuses outright for any file this actually cut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Truncation {
+    pub max_bytes: Option<usize>,
+    pub max_lines: Option<usize>,
+}
+
+impl Truncation {
+    /// Read the file whole.
+    pub const NONE: Self = Self {
+        max_bytes: None,
+        max_lines: None,
+    };
+}
+
 #[derive(Debug, Clone)]
 pub struct ListOptions {
     pub rev: Option<String>,
@@ -83,6 +106,7 @@ pub struct ListOptions {
     pub spec: Option<String>,
     pub spec_file: Option<String>,
     pub binary: BinaryMode,
+    pub truncation: Truncation,
 }
 
 impl Default for ListOptions {
@@ -97,6 +121,7 @@ impl Default for ListOptions {
             spec: None,
             spec_file: None,
             binary: BinaryMode::default(),
+            truncation: Truncation::NONE,
         }
     }
 }
@@ -135,6 +160,10 @@ struct FileEntry {
     binary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ModeChange>,
+    /// Set when `--max-bytes`/`--max-lines` actually cut this file, so the
+    /// listed hunks describe only its opening slice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -168,6 +197,8 @@ struct FileSummary {
     binary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ModeChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,7 +293,8 @@ where
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
 
-    let all_file_hunks = load_file_hunks(options.rev.as_deref(), options.binary)?;
+    let all_file_hunks =
+        load_file_hunks(options.rev.as_deref(), options.binary, options.truncation)?;
 
     let mut files = Vec::new();
 
@@ -299,6 +331,7 @@ where
             hunks,
             binary: if fh.is_binary { Some(true) } else { None },
             mode: fh.mode,
+            truncated: if fh.truncated { Some(true) } else { None },
         });
     }
 
@@ -350,7 +383,7 @@ where
             if matches!(options.format, ListFormat::Text | ListFormat::Diff) {
                 anyhow::bail!("--spec-template does not support text output (use json or yaml)");
             }
-            let template = build_spec_template(files);
+            let template = build_spec_template(files)?;
             match options.format {
                 ListFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&template)?);
@@ -460,7 +493,7 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
         .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
-    let file_hunks = load_file_hunks(rev, BinaryMode::Skip)?;
+    let file_hunks = load_file_hunks(rev, BinaryMode::Skip, Truncation::NONE)?;
 
     let enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
@@ -498,6 +531,8 @@ struct FileHunks {
     rename: Option<RenameInfo>,
     is_binary: bool,
     mode: Option<ModeChange>,
+    /// Whether either side of this file was cut short before diffing.
+    truncated: bool,
 }
 
 impl FileHunks {
@@ -515,7 +550,11 @@ impl FileHunks {
 
 /// Load all file hunks for a revision, applying semantic enrichment.
 /// This is the shared core used by both `list` and `evaluate_hunkset`.
-fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunks>> {
+fn load_file_hunks(
+    rev: Option<&str>,
+    binary: BinaryMode,
+    truncation: Truncation,
+) -> Result<Vec<FileHunks>> {
     // Validate the revision *before* doing any work: a merge or a
     // multi-revision revset makes every hunk below meaningless.
     let revisions = resolve_revisions(rev)?;
@@ -545,13 +584,13 @@ fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunk
         }
 
         let should_diff = !is_binary || binary == BinaryMode::Include;
-        let (before_text, after_text) = if should_diff {
+        let ((before_text, before_cut), (after_text, after_cut)) = if should_diff {
             (
-                String::from_utf8_lossy(&before_bytes).into_owned(),
-                String::from_utf8_lossy(&after_bytes).into_owned(),
+                truncate_text(&String::from_utf8_lossy(&before_bytes), truncation),
+                truncate_text(&String::from_utf8_lossy(&after_bytes), truncation),
             )
         } else {
-            (String::new(), String::new())
+            ((String::new(), false), (String::new(), false))
         };
 
         let mut hunks = if should_diff {
@@ -569,6 +608,7 @@ fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunk
             rename: rename_info(entry),
             is_binary,
             mode: mode_change_for_entry(entry),
+            truncated: before_cut || after_cut,
         });
     }
 
@@ -863,6 +903,41 @@ fn is_binary_data(bytes: &[u8]) -> bool {
     bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
+/// Cut `content` down to the configured caps, reporting whether anything was
+/// dropped. A limit the content already fits inside is not a truncation.
+fn truncate_text(content: &str, truncation: Truncation) -> (String, bool) {
+    let mut truncated = false;
+    let mut result = content.to_string();
+
+    if let Some(max_lines) = truncation.max_lines {
+        // `split_inclusive` keeps each line's terminator, so the kept prefix is
+        // byte-identical to the head of the original.
+        let mut rest = result.split_inclusive('\n');
+        let kept: String = rest.by_ref().take(max_lines).collect();
+        // Only a line we did not keep counts as a truncation, so a limit the
+        // file already fits under changes nothing.
+        if rest.next().is_some() {
+            truncated = true;
+            result = kept;
+        }
+    }
+
+    if let Some(max_bytes) = truncation.max_bytes {
+        if result.len() > max_bytes {
+            // Never split a multi-byte character: the tail would not be valid
+            // UTF-8, and `String::truncate` panics on a non-boundary index.
+            let mut end = max_bytes;
+            while !result.is_char_boundary(end) {
+                end -= 1;
+            }
+            result.truncate(end);
+            truncated = true;
+        }
+    }
+
+    (result, truncated)
+}
+
 fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
     let Some(spec) = spec else {
         return SpecDecision::KeepAll;
@@ -901,10 +976,16 @@ fn filter_hunks(hunks: Vec<Hunk>, selection: &HunkSelection) -> Vec<Hunk> {
         .collect()
 }
 
+/// One flag occurrence is one pattern.
+///
+/// These used to be split on `,` as well. A comma is an ordinary character in
+/// a path and carries no meaning in a glob, so that made every comma-containing
+/// path unreachable by a filter, with no way to escape it -- the last place
+/// such paths could not be named. `--include`/`--exclude` are repeatable, which
+/// is how the README documents them, so nothing is lost.
 fn normalize_patterns(patterns: &[String]) -> Vec<String> {
     patterns
         .iter()
-        .flat_map(|pattern| pattern.split(','))
         .map(|pattern| pattern.trim())
         .filter(|pattern| !pattern.is_empty())
         .map(|pattern| pattern.to_string())
@@ -951,6 +1032,7 @@ fn build_summary_output(files: Vec<FileEntry>, grouping: ListGrouping) -> ListSu
             hunk_count: file.hunks.len(),
             binary: file.binary,
             mode: file.mode,
+            truncated: file.truncated,
         })
         .collect();
 
@@ -1004,22 +1086,48 @@ fn rename_source(rename: &Option<RenameInfo>, path: &str) -> Option<String> {
         .map(|r| r.from.clone())
 }
 
-fn build_spec_template(files: Vec<FileEntry>) -> SpecTemplateOutput {
+fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
+    // A hunk id is a hash of the text it was diffed from, so ids taken from a
+    // file that was cut short do not exist in the real diff. Emitting them
+    // would hand over a template that `split` is bound to reject, naming ids
+    // this very command had just printed.
+    let cut: Vec<&str> = files
+        .iter()
+        .filter(|file| file.truncated == Some(true))
+        .map(|file| file.path.as_str())
+        .collect();
+    if !cut.is_empty() {
+        anyhow::bail!(
+            "cannot build a spec template from truncated files:\n  {}\n\
+             Hunk ids are computed from the file contents, so ids taken from a \
+             truncated file will not match the real diff.\n\
+             Drop --max-bytes/--max-lines to template these files.",
+            cut.join("\n  ")
+        );
+    }
+
     let mut output = HashMap::new();
 
     for file in files {
         let from = rename_source(&file.rename, &file.path);
 
+        // A binary file is kept or reset whole, never hunk-wise -- `select`
+        // rebuilds a file from text, and a non-UTF-8 file cannot survive that
+        // round trip. Under `--binary include` it does carry hunks, but they
+        // are for reading, not for selecting, so the template keeps naming the
+        // action rather than ids it could not honour.
+        if file.binary == Some(true) {
+            output.insert(
+                file.path,
+                SpecTemplateEntry::Action {
+                    action: "keep".to_string(),
+                    from,
+                },
+            );
+            continue;
+        }
+
         if file.hunks.is_empty() {
-            if file.binary == Some(true) {
-                output.insert(
-                    file.path,
-                    SpecTemplateEntry::Action {
-                        action: "keep".to_string(),
-                        from,
-                    },
-                );
-            }
             continue;
         }
 
@@ -1027,10 +1135,10 @@ fn build_spec_template(files: Vec<FileEntry>) -> SpecTemplateOutput {
         output.insert(file.path, SpecTemplateEntry::Ids { ids, from });
     }
 
-    SpecTemplateOutput {
+    Ok(SpecTemplateOutput {
         files: output,
         default: "reset".to_string(),
-    }
+    })
 }
 
 fn directory_group(path: &str) -> String {
@@ -1373,6 +1481,9 @@ fn format_summary_text(lines: &mut Vec<String>, files: &[FileSummary]) {
         if file.binary == Some(true) {
             line.push_str(" [binary]");
         }
+        if file.truncated == Some(true) {
+            line.push_str(" [truncated]");
+        }
         if let Some(mode) = &file.mode {
             line.push_str(&format_mode_change(mode));
         }
@@ -1387,6 +1498,9 @@ fn format_file_header(file: &FileEntry) -> String {
     }
     if file.binary == Some(true) {
         header.push_str(" [binary]");
+    }
+    if file.truncated == Some(true) {
+        header.push_str(" [truncated]");
     }
     if let Some(mode) = &file.mode {
         header.push_str(&format_mode_change(mode));
@@ -1626,7 +1740,19 @@ fn apply_hunk_selection(
     let existed_at_this_path = source.is_none() && fs::symlink_metadata(&left_file).is_ok();
 
     let before = fs::read_to_string(&left_file).unwrap_or_default();
-    let after = fs::read_to_string(&right_file)?;
+    // A non-UTF-8 file lands here whenever a spec selects hunks in one, and
+    // used to fail as a bare "stream did not contain valid UTF-8" naming
+    // nothing at all. Reading it lossily instead is not an option: `select`
+    // writes this text back out, so the replacement characters would become the
+    // committed file.
+    let after = fs::read_to_string(&right_file).with_context(|| {
+        format!(
+            "Failed to read {} as text. A file that is not valid UTF-8 cannot \
+             be selected hunk-wise; keep or reset it whole instead \
+             (`{{\"action\": \"keep\"}}`).",
+            filepath
+        )
+    })?;
 
     let result = apply_selected_hunks(&before, &after, selection);
     let keeps_change = result != before;
@@ -1841,7 +1967,7 @@ fn run_jj_with_selection(
         if !is_hunkset {
             // `Mark`, not `Skip`: a binary file has no hunks but is still a
             // legitimate spec target via `{"action": "keep"}`.
-            let file_hunks = load_file_hunks(rev, BinaryMode::Mark)?;
+            let file_hunks = load_file_hunks(rev, BinaryMode::Mark, Truncation::NONE)?;
             if !allow_empty {
                 validate_spec_resolves(&parsed, &file_hunks)?;
             }
@@ -1852,24 +1978,128 @@ fn run_jj_with_selection(
         }
     }
 
-    let temp_file = std::env::temp_dir().join(format!("jj-hunk-{}.spec", std::process::id()));
-    fs::write(&temp_file, spec_content)?;
+    let temp_spec = TempSpec::create(&spec_content)?;
 
     let config_args = jj_hunk_tool_config_args()?;
 
     let status = Command::new("jj")
         .args(&config_args)
         .args(args)
-        .env("JJ_HUNK_SELECTION", &temp_file)
+        .env("JJ_HUNK_SELECTION", temp_spec.path())
         .status()
         .context("Failed to run jj")?;
 
-    fs::remove_file(&temp_file).ok();
-
+    // `temp_spec` is removed by its `Drop`, so it goes whichever way we leave
+    // here -- including the `?` above, which used to return past the cleanup
+    // and leave the file behind whenever jj could not be spawned.
     if !status.success() {
         anyhow::bail!("jj command failed");
     }
     Ok(())
+}
+
+/// Attempts to find a free name before giving up. A collision needs the random
+/// suffix to repeat, so more than a couple means something else is wrong.
+const TEMP_SPEC_ATTEMPTS: usize = 16;
+
+/// The spec file handed to the `select` child process through the environment.
+///
+/// The path used to be `<tmpdir>/jj-hunk-<pid>.spec`. A pid is a small and
+/// guessable number, so anyone able to write to the temp directory could
+/// pre-create that path as a symlink: the write then landed on the link's
+/// target, and the cleanup unlinked only the link, leaving the victim file
+/// overwritten (CWE-377). The name is now unpredictable and the file is created
+/// with `O_CREAT|O_EXCL`, which refuses to open anything already at the path
+/// rather than following it.
+#[derive(Debug)]
+struct TempSpec {
+    path: PathBuf,
+}
+
+impl TempSpec {
+    fn create(contents: &str) -> Result<Self> {
+        let dir = std::env::temp_dir();
+
+        for _ in 0..TEMP_SPEC_ATTEMPTS {
+            let path = dir.join(format!("jj-hunk-{:016x}.spec", random_suffix()));
+
+            return match create_new_exclusive(&path) {
+                Ok(mut file) => {
+                    // Own the path before the first write, so a failure part
+                    // way through still cleans up after itself.
+                    let temp = Self { path };
+                    file.write_all(contents.as_bytes()).with_context(|| {
+                        format!("Failed to write spec to {}", temp.path.display())
+                    })?;
+                    Ok(temp)
+                }
+                // Someone else holds that name. Pick another.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => Err(anyhow::Error::new(e)
+                    .context(format!("Failed to create a spec file in {}", dir.display()))),
+            };
+        }
+
+        anyhow::bail!(
+            "Failed to create a spec file in {} after {} attempts",
+            dir.display(),
+            TEMP_SPEC_ATTEMPTS
+        )
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSpec {
+    fn drop(&mut self) {
+        // Best effort: reporting a cleanup failure here would displace whatever
+        // error we are already on our way out with.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Create `path` for writing, failing if anything is already there.
+///
+/// `create_new` is `O_CREAT|O_EXCL`, which is the part that matters: it does
+/// not follow a symlink sitting at `path`, it refuses. On unix the file is also
+/// created 0600 from the start, rather than being widened and narrowed again.
+fn create_new_exclusive(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The spec names paths in a repo; it is nobody else's business.
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// An unguessable suffix for the temp file name.
+///
+/// `RandomState` is seeded from the OS, which is what makes the result
+/// unpredictable; the pid, the clock and the counter only keep successive calls
+/// in one process apart.
+fn random_suffix() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.finish()
 }
 
 fn jj_hunk_tool_config_args() -> Result<Vec<String>> {
@@ -1907,6 +2137,17 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization should not fail")
 }
 
+/// The `--message` argument to hand to jj, as a single token.
+///
+/// Passing the message as a separate `-m <msg>` argument made jj's own parser
+/// read a message like `--wip` as a flag, so a description could never begin
+/// with a dash -- not even via `--`, which got the value past *our* parser only
+/// to have jj reject it. `--message=<msg>` is one argument, so everything after
+/// the first `=` is the value whatever it looks like.
+fn message_arg(message: &str) -> String {
+    format!("--message={}", message)
+}
+
 pub fn split(
     spec: Option<&str>,
     spec_file: Option<&str>,
@@ -1914,7 +2155,8 @@ pub fn split(
     rev: Option<&str>,
     allow_empty: bool,
 ) -> Result<()> {
-    let mut args = vec!["split", JJ_HUNK_TOOL_ARG, "-m", message];
+    let message = message_arg(message);
+    let mut args = vec!["split", JJ_HUNK_TOOL_ARG, message.as_str()];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
@@ -1928,8 +2170,9 @@ pub fn commit(
     message: &str,
     allow_empty: bool,
 ) -> Result<()> {
+    let message = message_arg(message);
     run_jj_with_selection(
-        &["commit", "-i", JJ_HUNK_TOOL_ARG, "-m", message],
+        &["commit", "-i", JJ_HUNK_TOOL_ARG, message.as_str()],
         spec,
         spec_file,
         None, // commit always operates on @
@@ -2023,5 +2266,195 @@ mod tests {
         assert!(preview.contains("id0"));
         assert!(preview.contains("... and 3 more"), "{preview}");
         assert!(!preview.contains("id5"), "{preview}");
+    }
+
+    // --- truncation ---------------------------------------------------------
+
+    fn lines(max: usize) -> Truncation {
+        Truncation {
+            max_lines: Some(max),
+            ..Truncation::NONE
+        }
+    }
+
+    fn bytes(max: usize) -> Truncation {
+        Truncation {
+            max_bytes: Some(max),
+            ..Truncation::NONE
+        }
+    }
+
+    #[test]
+    fn no_limits_leave_the_text_alone() {
+        let (out, cut) = truncate_text("a\nb\nc\n", Truncation::NONE);
+        assert_eq!(out, "a\nb\nc\n");
+        assert!(!cut);
+    }
+
+    #[test]
+    fn a_limit_the_text_already_fits_is_not_a_truncation() {
+        assert_eq!(truncate_text("a\nb\n", lines(9)), ("a\nb\n".to_string(), false));
+        assert_eq!(truncate_text("abc", bytes(3)), ("abc".to_string(), false));
+    }
+
+    #[test]
+    fn max_lines_keeps_whole_lines_with_their_terminators() {
+        let (out, cut) = truncate_text("a\nb\nc\nd\n", lines(2));
+        assert_eq!(out, "a\nb\n");
+        assert!(cut);
+    }
+
+    #[test]
+    fn max_lines_zero_empties_the_text() {
+        assert_eq!(truncate_text("a\n", lines(0)), (String::new(), true));
+        // Nothing to drop, so nothing was truncated.
+        assert_eq!(truncate_text("", lines(0)), (String::new(), false));
+    }
+
+    #[test]
+    fn max_bytes_cuts_mid_line() {
+        let (out, cut) = truncate_text("abcdef", bytes(3));
+        assert_eq!(out, "abc");
+        assert!(cut);
+    }
+
+    /// Cutting inside a multi-byte character would panic in `String::truncate`
+    /// and leave invalid UTF-8 behind; the cut backs up to a boundary instead.
+    #[test]
+    fn max_bytes_never_splits_a_character() {
+        // "é" is two bytes, so a limit of 2 lands inside the second character.
+        let (out, cut) = truncate_text("aé", bytes(2));
+        assert_eq!(out, "a");
+        assert!(cut);
+        assert_eq!(truncate_text("☃", bytes(1)), (String::new(), true));
+    }
+
+    #[test]
+    fn both_limits_apply_together() {
+        // Lines first (a\nb\n = 4 bytes), then the byte cap on what is left.
+        let (out, cut) = truncate_text("a\nb\nc\n", Truncation {
+            max_lines: Some(2),
+            max_bytes: Some(3),
+        });
+        assert_eq!(out, "a\nb");
+        assert!(cut);
+    }
+
+    // --- temp spec file -----------------------------------------------------
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jj-hunk-unit-{}-{}-{:x}",
+            name,
+            std::process::id(),
+            random_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of `O_EXCL`: a symlink planted at the target path is
+    /// refused, not followed. Following it wrote the spec over the link's
+    /// target and then unlinked only the link (CWE-377).
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_spec_file_refuses_to_follow_a_planted_symlink() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victim");
+        fs::write(&victim, "PRECIOUS").unwrap();
+
+        let planted = dir.join("jj-hunk-planted.spec");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let err = create_new_exclusive(&planted).expect_err("should refuse an existing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn creating_a_spec_file_refuses_an_existing_regular_file() {
+        let dir = scratch_dir("exists");
+        let taken = dir.join("taken.spec");
+        fs::write(&taken, "mine").unwrap();
+
+        let err = create_new_exclusive(&taken).expect_err("should refuse an existing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "mine");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn temp_spec_names_do_not_repeat() {
+        let names: HashSet<String> = (0..64)
+            .map(|_| format!("{:016x}", random_suffix()))
+            .collect();
+        assert_eq!(names.len(), 64, "suffixes collided");
+    }
+
+    /// The pid alone is a guessable name. Whatever the suffix is, it must not
+    /// be that.
+    #[test]
+    fn temp_spec_names_are_not_derived_from_the_pid_alone() {
+        let temp = TempSpec::create("{}").unwrap();
+        let name = temp.path().file_name().unwrap().to_string_lossy().to_string();
+        assert_ne!(name, format!("jj-hunk-{}.spec", std::process::id()));
+        assert!(name.starts_with("jj-hunk-"), "{name}");
+        assert!(name.ends_with(".spec"), "{name}");
+    }
+
+    #[test]
+    fn temp_spec_is_written_then_removed_on_drop() {
+        let path = {
+            let temp = TempSpec::create("hello spec").unwrap();
+            assert_eq!(fs::read_to_string(temp.path()).unwrap(), "hello spec");
+            temp.path().to_path_buf()
+        };
+        assert!(!path.exists(), "temp spec should be gone after drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_spec_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempSpec::create("{}").unwrap();
+        let mode = fs::metadata(temp.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    // A bad temp dir is covered by the `temp_spec_file_error_names_the
+    // _directory` integration test: setting TMPDIR here would mutate
+    // process-global state that every other test in this binary shares.
+
+    // --- pattern normalization ---------------------------------------------
+
+    /// A comma is an ordinary path character and means nothing in a glob.
+    /// Splitting on it made comma-containing paths unreachable by a filter.
+    #[test]
+    fn patterns_are_not_split_on_commas() {
+        assert_eq!(
+            normalize_patterns(&["has,comma.txt".to_string()]),
+            vec!["has,comma.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn patterns_are_trimmed_and_blanks_dropped() {
+        assert_eq!(
+            normalize_patterns(&["  src/**  ".to_string(), "   ".to_string()]),
+            vec!["src/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_message_is_passed_to_jj_as_one_argument() {
+        // `-m <msg>` let jj read a dash-leading message as a flag.
+        assert_eq!(message_arg("--wip"), "--message=--wip");
+        assert_eq!(message_arg("plain"), "--message=plain");
+        // An `=` in the message belongs to the value, not the split.
+        assert_eq!(message_arg("a=b"), "--message=a=b");
     }
 }

@@ -2104,3 +2104,366 @@ fn diff_format_preserves_crlf() {
 fn diff_format_preserves_crlf_without_final_newline() {
     diff_roundtrip("crlf-nonl", b"a\r\nb\r\nc", b"a\r\nB\r\nc");
 }
+
+// ---------------------------------------------------------------------------
+// CLI and robustness fixes
+// ---------------------------------------------------------------------------
+
+/// Run jj-hunk with extra environment overrides.
+///
+/// A free function rather than a `TestRepo` method so the shared `impl` block
+/// stays untouched. `envs` is applied last, so it wins over the defaults.
+fn hunk_with_env(repo: &TestRepo, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(jj_hunk_bin());
+    cmd.args(args)
+        .current_dir(repo.path())
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("JJ_CONFIG", &repo.config_path)
+        .env("PATH", path_with_jj_hunk());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("failed to run jj-hunk")
+}
+
+/// A repo whose single file has 20 four-byte lines, with the first and the
+/// last changed. Untruncated that is two hunks; any cut before line 20 drops
+/// the second.
+fn truncation_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    let before: String = (1..=20).map(|i| format!("a{:02}\n", i)).collect();
+    repo.write_file("f.txt", &before);
+    repo.jj_ok(&["new", "-m", "base"]);
+
+    let after = before.replace("a01\n", "Z01\n").replace("a20\n", "Z20\n");
+    repo.write_file("f.txt", &after);
+    repo
+}
+
+#[test]
+fn without_truncation_both_ends_of_the_file_are_diffed() {
+    let repo = truncation_repo("trunc-none");
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text"]);
+    assert!(out.contains("(2 hunks)"), "{out}");
+    assert!(!out.contains("[truncated]"), "{out}");
+}
+
+#[test]
+fn max_lines_truncates_before_diffing() {
+    let repo = truncation_repo("trunc-lines");
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text", "--max-lines", "5"]);
+    // Only the line-1 change survives the cut.
+    assert!(out.contains("(1 hunks)"), "{out}");
+    assert!(out.contains("[truncated]"), "{out}");
+}
+
+#[test]
+fn max_bytes_truncates_before_diffing() {
+    let repo = truncation_repo("trunc-bytes");
+    // 20 bytes == the first five 4-byte lines.
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text", "--max-bytes", "20"]);
+    assert!(out.contains("(1 hunks)"), "{out}");
+    assert!(out.contains("[truncated]"), "{out}");
+}
+
+#[test]
+fn a_limit_larger_than_the_file_does_not_mark_it_truncated() {
+    let repo = truncation_repo("trunc-slack");
+    let out = repo.hunk_ok(&["list", "--files", "--format", "text", "--max-lines", "500"]);
+    assert!(out.contains("(2 hunks)"), "{out}");
+    assert!(!out.contains("[truncated]"), "{out}");
+}
+
+#[test]
+fn truncation_is_reported_in_json_output() {
+    let repo = truncation_repo("trunc-json");
+    let out = repo.hunk_ok(&["list", "--max-lines", "5"]);
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(json["files"][0]["truncated"], serde_json::json!(true), "{out}");
+}
+
+/// Hunk ids are content-addressed over the text they were diffed from, so ids
+/// computed from truncated text do not exist in the real diff. Emitting them
+/// into a spec template hands over a file that `split` is guaranteed to
+/// reject, so refuse to produce it.
+#[test]
+fn spec_template_refuses_files_whose_content_was_truncated() {
+    let repo = truncation_repo("trunc-template");
+    let err = repo.hunk_fail(&["list", "--spec-template", "--max-lines", "5"]);
+    assert!(err.contains("f.txt"), "error should name the file: {err}");
+    assert!(
+        err.contains("truncat"),
+        "error should explain truncation: {err}"
+    );
+}
+
+#[test]
+fn spec_template_still_works_when_nothing_was_actually_truncated() {
+    let repo = truncation_repo("trunc-template-ok");
+    let out = repo.hunk_ok(&["list", "--spec-template", "--max-lines", "500"]);
+    assert!(out.contains("f.txt"), "{out}");
+}
+
+// --- commit messages that begin with a dash ---------------------------------
+
+#[test]
+fn split_accepts_a_message_starting_with_a_dash() {
+    let repo = TestRepo::new("dash-split");
+    repo.write_file("a.txt", "one\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+
+    repo.hunk_ok(&["split", "all()", "--", "--not-a-flag"]);
+
+    let log = repo.log_descriptions();
+    assert!(
+        log.iter().any(|d| d == "--not-a-flag"),
+        "a message beginning with a dash should round-trip: {log:?}"
+    );
+}
+
+#[test]
+fn commit_accepts_a_message_starting_with_a_dash() {
+    let repo = TestRepo::new("dash-commit");
+    repo.write_file("a.txt", "one\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+
+    repo.hunk_ok(&["commit", "all()", "--", "-m"]);
+
+    let log = repo.log_descriptions();
+    assert!(
+        log.iter().any(|d| d == "-m"),
+        "a message that is itself a flag name should round-trip: {log:?}"
+    );
+}
+
+// --- temp spec file ---------------------------------------------------------
+
+/// A spec that parses as neither hunkset nor Spec skips every pre-flight `jj`
+/// call, so the run reaches the point where the temp file has been written and
+/// `jj` is spawned. With `jj` unreachable that spawn fails, and the file used
+/// to be left behind.
+const UNPARSEABLE_SPEC: &str = r#"{"files": {"a.txt": {"bogus_field": 1}}}"#;
+
+#[test]
+fn temp_spec_file_is_cleaned_up_when_jj_cannot_be_spawned() {
+    let repo = TestRepo::new("tmp-leak");
+    repo.write_file("a.txt", "one\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+
+    let tmp = repo.path().join("scratch-tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let out = hunk_with_env(
+        &repo,
+        &["split", UNPARSEABLE_SPEC, "msg"],
+        &[("TMPDIR", tmp.to_str().unwrap()), ("PATH", "/nonexistent")],
+    );
+    assert!(!out.status.success(), "expected the jj spawn to fail");
+
+    let leftover: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "temp spec file leaked when jj could not be spawned: {leftover:?}"
+    );
+}
+
+#[test]
+fn temp_spec_file_error_names_the_directory() {
+    let repo = TestRepo::new("tmp-badenv");
+    repo.write_file("a.txt", "one\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+
+    let missing = "/nonexistent/jj-hunk-temp-dir";
+    let out = hunk_with_env(
+        &repo,
+        &["split", UNPARSEABLE_SPEC, "msg"],
+        &[("TMPDIR", missing)],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(missing),
+        "error should name the unusable temp dir: {err}"
+    );
+}
+
+// --- comma-containing paths in --include / --exclude ------------------------
+
+/// Two files, one of which has a comma in its name, both modified.
+fn comma_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("plain.txt", "x\n");
+    repo.write_file("has,comma.txt", "x\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("plain.txt", "y\n");
+    repo.write_file("has,comma.txt", "y\n");
+    repo
+}
+
+#[test]
+fn include_can_name_a_path_containing_a_comma() {
+    let repo = comma_repo("comma-include");
+    let out = repo.hunk_ok(&[
+        "list",
+        "--files",
+        "--format",
+        "text",
+        "--include",
+        "has,comma.txt",
+    ]);
+    assert!(out.contains("has,comma.txt"), "{out}");
+    assert!(!out.contains("plain.txt"), "{out}");
+}
+
+#[test]
+fn exclude_can_name_a_path_containing_a_comma() {
+    let repo = comma_repo("comma-exclude");
+    let out = repo.hunk_ok(&[
+        "list",
+        "--files",
+        "--format",
+        "text",
+        "--exclude",
+        "has,comma.txt",
+    ]);
+    assert!(out.contains("plain.txt"), "{out}");
+    assert!(!out.contains("has,comma.txt"), "{out}");
+}
+
+#[test]
+fn include_stays_repeatable() {
+    let repo = TestRepo::new("comma-repeat");
+    repo.write_file("a.txt", "x\n");
+    repo.write_file("b.txt", "x\n");
+    repo.write_file("c.txt", "x\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    repo.write_file("a.txt", "y\n");
+    repo.write_file("b.txt", "y\n");
+    repo.write_file("c.txt", "y\n");
+
+    let out = repo.hunk_ok(&[
+        "list", "--files", "--format", "text", "-i", "a.txt", "-i", "b.txt",
+    ]);
+    assert!(out.contains("a.txt"), "{out}");
+    assert!(out.contains("b.txt"), "{out}");
+    assert!(!out.contains("c.txt"), "{out}");
+}
+
+// --- binary files in spec templates -----------------------------------------
+
+/// A repo with one binary file and one text file, both modified.
+fn binary_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    std::fs::write(repo.path().join("bin.dat"), [0u8, 1, 2, 0, 255, 254]).unwrap();
+    repo.write_file("t.txt", "a\nb\n");
+    repo.jj_ok(&["new", "-m", "base"]);
+    std::fs::write(repo.path().join("bin.dat"), [0u8, 1, 2, 0, 255, 253, 9, 9]).unwrap();
+    repo.write_file("t.txt", "A\nb\n");
+    repo
+}
+
+/// `--binary include` used to put hunk ids for the binary file in the template.
+/// `select` reads files as UTF-8, so consuming that template died with a bare
+/// "stream did not contain valid UTF-8" naming no file. A binary change cannot
+/// be split hunk-wise at all, so the template keeps it wholesale instead.
+#[test]
+fn spec_template_with_binary_include_round_trips_through_split() {
+    let repo = binary_repo("bin-template");
+
+    let template = repo.hunk_ok(&["list", "--spec-template", "--binary", "include"]);
+    let spec_path = repo.path().join("t.json");
+    std::fs::write(&spec_path, &template).unwrap();
+
+    repo.hunk_ok(&["split", "-f", spec_path.to_str().unwrap(), "everything"]);
+
+    let log = repo.log_descriptions();
+    assert!(log.iter().any(|d| d == "everything"), "{log:?}");
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("bin.dat")),
+        "binary change should be in the commit: {committed:?}"
+    );
+    assert!(
+        committed.iter().any(|l| l.contains("t.txt")),
+        "text change should be in the commit: {committed:?}"
+    );
+
+    // The point of keeping a binary file wholesale: its bytes go in untouched.
+    // Routing them through a lossy String would land replacement characters in
+    // the commit, which is worse than the error this replaced.
+    let out = Command::new("jj")
+        .args(["file", "show", "-r", "@-", "bin.dat"])
+        .current_dir(repo.path())
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("JJ_CONFIG", &repo.config_path)
+        .env("PATH", path_with_jj_hunk())
+        .output()
+        .expect("jj file show failed");
+    assert_eq!(
+        out.stdout,
+        vec![0u8, 1, 2, 0, 255, 253, 9, 9],
+        "binary content was not preserved byte for byte"
+    );
+}
+
+#[test]
+fn binary_files_are_kept_wholesale_in_a_spec_template() {
+    let repo = binary_repo("bin-template-shape");
+    let template = repo.hunk_ok(&["list", "--spec-template", "--binary", "include"]);
+    let json: serde_json::Value = serde_json::from_str(&template).unwrap();
+    assert_eq!(
+        json["files"]["bin.dat"]["action"],
+        serde_json::json!("keep"),
+        "binary entry should be an action, not hunk ids: {template}"
+    );
+    assert!(
+        json["files"]["t.txt"]["ids"].is_array(),
+        "text entry should still carry ids: {template}"
+    );
+}
+
+/// A hand-written spec can still point hunk ids at a non-UTF-8 file. That is a
+/// real error, but it used to name nothing at all.
+#[test]
+fn a_spec_selecting_hunks_in_a_binary_file_names_the_file() {
+    let repo = binary_repo("bin-handwritten");
+
+    let listing: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--binary", "include"])).unwrap();
+    let bin_id = listing["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "bin.dat")
+        .expect("bin.dat should be listed")["hunks"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let spec = format!(r#"{{"files": {{"bin.dat": {{"ids": ["{bin_id}"]}}}}}}"#);
+    let spec_path = repo.path().join("hand.json");
+    std::fs::write(&spec_path, spec).unwrap();
+
+    let err = repo.hunk_fail(&[
+        "split",
+        "-f",
+        spec_path.to_str().unwrap(),
+        "msg",
+        "--allow-empty",
+    ]);
+    assert!(
+        err.contains("bin.dat"),
+        "error should name the offending file: {err}"
+    );
+}

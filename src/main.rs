@@ -7,7 +7,7 @@ mod hunkset;
 mod spec;
 mod commands;
 
-use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions};
+use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
 
 #[derive(Parser)]
 #[command(name = "jj-hunk")]
@@ -97,6 +97,12 @@ struct ListArgs {
     /// Binary handling
     #[arg(long, value_enum, default_value_t = BinaryMode::Mark)]
     binary: BinaryMode,
+    /// Truncate file contents to N bytes before diffing
+    #[arg(long)]
+    max_bytes: Option<usize>,
+    /// Truncate file contents to N lines before diffing
+    #[arg(long)]
+    max_lines: Option<usize>,
     /// Filter output with a hunkset expression or JSON/YAML spec
     #[arg(long)]
     spec: Option<String>,
@@ -134,6 +140,10 @@ fn main() -> Result<()> {
                 spec: args.spec,
                 spec_file: args.spec_file,
                 binary: args.binary,
+                truncation: Truncation {
+                    max_bytes: args.max_bytes,
+                    max_lines: args.max_lines,
+                },
             };
 
             commands::list(options)
