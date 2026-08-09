@@ -144,8 +144,9 @@ enum Token {
     Alternates(Vec<Vec<Token>>),
 }
 
-/// A malformed pattern. The variants exist to make the parser self-documenting;
-/// callers only ever see "this pattern matches nothing".
+/// A malformed pattern. `jj` reports which way it was malformed; [`glob_match`]
+/// has no error channel, so the reason is discarded and the pattern simply
+/// matches nothing.
 #[derive(Debug)]
 struct ParseError;
 
@@ -686,9 +687,22 @@ mod tests {
     fn unicode_paths() {
         assert_selects("uni/*.rs", &["uni/héllo.rs"]);
         assert_selects("uni/h*llo.rs", &["uni/héllo.rs"]);
-        // jj matches bytes, so `?` consumes one byte: `é` needs two.
+        assert_selects("uni/*é*", &["uni/héllo.rs"]);
+    }
+
+    #[test]
+    fn unicode_literals_in_patterns() {
+        assert_selects("uni/héllo.rs", &["uni/héllo.rs"]);
+        assert_selects("**/héllo.rs", &["uni/héllo.rs"]);
+    }
+
+    #[test]
+    fn wildcards_consume_bytes_not_characters() {
+        // jj matches bytes, so `?` and a character class each consume one
+        // byte, and the two-byte `é` needs two of them.
         assert_selects("uni/h?llo.rs", &[]);
         assert_selects("uni/h??llo.rs", &["uni/héllo.rs"]);
+        assert_selects("uni/h[é]llo.rs", &[]);
     }
 
     #[test]
