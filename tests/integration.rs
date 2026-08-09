@@ -2198,6 +2198,68 @@ fn spec_template_refuses_files_whose_content_was_truncated() {
     );
 }
 
+/// Everything one `list` prints must describe one view of the diff. The
+/// hunkset used to be evaluated against the whole file while the listing it
+/// filtered was truncated, so any hunk the cut reshaped had an id the selector
+/// had never seen and vanished -- `--files` and `--spec` disagreed about how
+/// many hunks the same command was looking at.
+///
+/// A byte cut landing mid-line is what exposes it: it rewrites the boundary
+/// hunk rather than merely dropping later ones, so the id changes.
+#[test]
+fn a_selector_filters_the_same_view_that_is_listed() {
+    let repo = TestRepo::new("trunc-spec-view");
+    let before: String = (1..=20).map(|i| format!("line {}\n", i)).collect();
+    repo.write_file("big.txt", &before);
+    repo.jj_ok(&["new", "-m", "base"]);
+    let after = before
+        .replace("line 2\n", "line 2 CHANGED\n")
+        .replace("line 18\n", "line 18 CHANGED\n");
+    repo.write_file("big.txt", &after);
+
+    // 40 bytes lands inside "line 6\n", which reshapes the hunk at the cut.
+    let count = |args: &[&str]| -> usize {
+        repo.hunk_ok(args)
+            .lines()
+            .filter(|l| l.trim_start().starts_with("hunk "))
+            .count()
+    };
+
+    let plain = count(&["list", "--max-bytes", "40", "--format", "text"]);
+    assert_eq!(plain, 2, "the truncated view should have two hunks");
+
+    let summary = repo.hunk_ok(&["list", "--files", "--max-bytes", "40", "--format", "text"]);
+    assert!(
+        summary.contains("(2 hunks)"),
+        "summary should agree with the listing: {summary}"
+    );
+
+    for selector in ["all()", r#"file("big.txt")"#] {
+        let selected = count(&[
+            "list", "--max-bytes", "40", "--spec", selector, "--format", "text",
+        ]);
+        assert_eq!(
+            selected, plain,
+            "`--spec {selector}` should keep every hunk of the view it filters"
+        );
+    }
+}
+
+/// A selector is still applied against the whole file when no truncation was
+/// asked for -- the common case must not have moved.
+#[test]
+fn a_selector_without_truncation_sees_the_whole_file() {
+    let repo = truncation_repo("trunc-spec-whole");
+    let all = repo.hunk_ok(&["list", "--spec", "all()", "--format", "text"]);
+    assert_eq!(
+        all.lines()
+            .filter(|l| l.trim_start().starts_with("hunk "))
+            .count(),
+        2,
+        "{all}"
+    );
+}
+
 #[test]
 fn spec_template_still_works_when_nothing_was_actually_truncated() {
     let repo = truncation_repo("trunc-template-ok");

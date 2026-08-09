@@ -283,7 +283,9 @@ where
     let resolved_spec_input = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
     let spec = match &resolved_spec_input {
         Some(content) if hunkset::is_hunkset(content) => {
-            let json = evaluate_hunkset(content, options.rev.as_deref())?;
+            // The same view being listed, so the selector filters exactly the
+            // hunks this command is about to print.
+            let json = evaluate_hunkset(content, options.rev.as_deref(), options.truncation)?;
             Some(Spec::from_str(&json)?)
         }
         Some(content) => Some(Spec::from_str(content)?),
@@ -489,11 +491,21 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 
 /// Evaluate a hunkset expression against the current diff state for a given
 /// revision, returning a JSON-serialized Spec.
-fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
+///
+/// `truncation` must be the same view the result will be applied to. The
+/// returned spec names concrete hunk ids, and an id only means anything
+/// relative to the text it was computed from -- evaluating against the whole
+/// file and then filtering a truncated listing with the result silently drops
+/// any hunk the cut reshaped.
+fn evaluate_hunkset(
+    hunkset_expr: &str,
+    rev: Option<&str>,
+    truncation: Truncation,
+) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
         .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
-    let file_hunks = load_file_hunks(rev, BinaryMode::Skip, Truncation::NONE)?;
+    let file_hunks = load_file_hunks(rev, BinaryMode::Skip, truncation)?;
 
     let enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
@@ -1942,7 +1954,9 @@ fn run_jj_with_selection(
     let raw_spec = resolve_spec_input(spec, spec_file)?;
     let is_hunkset = hunkset::is_hunkset(&raw_spec);
     let mut spec_content = if is_hunkset {
-        evaluate_hunkset(&raw_spec, rev)?
+        // Never truncated: this spec is about to mutate history, and `select`
+        // works from the files whole.
+        evaluate_hunkset(&raw_spec, rev, Truncation::NONE)?
     } else {
         raw_spec.clone()
     };
