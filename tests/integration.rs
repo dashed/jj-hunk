@@ -11,8 +11,20 @@ struct TestRepo {
 
 impl TestRepo {
     fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("jj-hunk-test-{}-{}", name, std::process::id()));
+        // The directory must be unique per TestRepo, not per name. Keying it on
+        // name+pid alone means two tests that happen to pick the same name share
+        // a directory, and since the suite runs in parallel one wipes the
+        // other's repo mid-run -- a flake that reproduces roughly one run in
+        // three and vanishes under --test-threads=1. The counter makes name
+        // collisions harmless instead of merely unlikely.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "jj-hunk-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            seq
+        ));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }
