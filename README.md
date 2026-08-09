@@ -54,7 +54,7 @@ jj-hunk list --format yaml
 # List files only (hunk counts)
 jj-hunk list --files
 
-# Emit a spec template using stable ids
+# Emit a spec template using short hunk ids
 jj-hunk list --spec-template --format yaml
 
 # Split changes: hunks 0,1 of foo.rs → first commit, rest → second
@@ -127,18 +127,18 @@ is a no-op for binary files under the default `--binary mark`, since those are n
 Both flags are on `list` only, deliberately. A hunk id is a hash of the text it was diffed from, so
 ids computed from truncated content would not exist in the real diff; `split`/`commit`/`squash`
 always read files whole. For the same reason `--spec-template` fails, naming the offending files,
-if any file was actually truncated — the template would contain ids that `split` is guaranteed to
-reject.
+if any file was actually truncated — rather than sort out which of the template's ids survive the
+cut, it refuses to emit a template that `split` might reject.
 
 ## Spec Format
 
-Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `--spec-file` or stdin for larger ones. You can select hunks by index (`hunks`) or by stable `ids` (sha256) emitted by `jj-hunk list`. IDs are emitted as `hunk-<sha256>`. `hunks` entries may also be id strings.
+Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `--spec-file` or stdin for larger ones. You can select hunks by index (`hunks`) or by `ids` emitted by `jj-hunk list`. An id entry may be a full `hunk-<sha256>`, the abbreviated `short_id`, or any unambiguous prefix of one — see [Hunk IDs](#hunk-ids). `hunks` entries may also be id strings.
 
 ```json
 {
   "files": {
-    "path/to/file": {"hunks": [0, "hunk-7c3d...", 2]},
-    "path/to/other": {"ids": ["hunk-9a2b..."]},
+    "path/to/file": {"hunks": [0, "hunk-1b26091b", 2]},
+    "path/to/other": {"ids": ["hunk-8a30a9af"]},
     "path/to/another": {"action": "keep"},
     "path/to/skip": {"action": "reset"}
   },
@@ -147,7 +147,7 @@ Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `-
 ```
 
 - `{"hunks": [indices|ids]}` — select by index (0-based) or id string
-- `{"ids": ["hunk-..."]}` — select hunks by id from `jj-hunk list`
+- `{"ids": ["hunk-8a30a9af"]}` — select hunks by id from `jj-hunk list`
 - `{"action": "keep"}` — keep all changes in file
 - `{"action": "reset"}` — discard all changes in file
 - `{"from": "old/path"}` — source path of a renamed or copied file (see below)
@@ -164,7 +164,7 @@ is keyed under the *new* path, and `--spec-template` emits it for you:
 files:
   new_name.txt:
     ids:
-    - hunk-b55c2cba516e...
+    - hunk-ca38eba7
     from: old_name.txt
 default: reset
 ```
@@ -183,6 +183,112 @@ Note that `from` only appears when jj itself reports the file as renamed or copi
 changes the file too much for jj's rename detection is reported as an ordinary add plus delete, and
 the spec names both paths separately.
 
+## Hunk IDs
+
+A hunk id is `hunk-` followed by a SHA-256 over the hunk's **path**, its type, its removed and added
+lines, and up to three lines of surrounding context from the *parent* side of the diff. (Two
+byte-identical hunks in one file are told apart by a tiebreak ordinal, so an id always names exactly
+one hunk.)
+
+Every id has two written forms:
+
+| Form | Length | Where it appears |
+|------|--------|------------------|
+| Full | `hunk-` + 64 hex | The `id` field in `--format json` and `--format yaml` |
+| Short | `hunk-` + 8 hex (widened on collision) | The `short_id` field, `--format text`, `--format diff` headers, and `--spec-template` |
+
+The short form is the shortest prefix that is still unique across the whole diff, and never fewer
+than eight hex digits — the same floor jj uses for change and commit ids. If two hunks in one diff
+would otherwise share a prefix, every short id in that diff widens together, so they stay in
+columns.
+
+The same hunk, seen through each format:
+
+```text
+$ jj-hunk list --format text
+M src/lib.rs
+  hunk 0 replace hunk-8a30a9af (before 2+1 after 2+1)
+    - old_fn()
+    + new_fn()
+
+$ jj-hunk list --format json     # excerpt
+    "id": "hunk-8a30a9af59936de30a9a364b3bce467052dfc7a0a12c52f106410b04723417ef",
+    "short_id": "hunk-8a30a9af",
+```
+
+Anywhere an id is *accepted* — `ids` and `hunks` entries in a spec, and the `id()` predicate — the
+full form, the short form, and any unambiguous prefix all work, so `hunk-8a3` is a fine way to name
+that hunk in a small diff. A trailing `...` is tolerated too: nothing emits it any more, but older
+diff headers did, and ids copied out of them still resolve.
+
+The one exception is `id(exact:"...")`, which means what it says: only the full 64-hex form matches,
+and a short id passed under `exact:` selects nothing. Prefix resolution is what the bare form is for.
+
+A prefix that names more than one hunk is an error listing the candidates, never a guess:
+
+```text
+$ jj-hunk list --spec 'id("hunk-8")'
+Error: hunkset evaluation error: hunk id 'hunk-8' is ambiguous -- it matches 2 hunks: hunk-83ccb3c5 (wide.rs), hunk-8a28fbf7 (wide.rs). Use more characters, or exact:"<full-id>".
+```
+
+### How long an id stays valid
+
+Short answer: for as long as it takes to copy it out of one command and into the next. That is the
+workflow these ids are for — `list`, choose, then `split`/`commit`/`squash` against the same
+working-copy state — and within it they are solid.
+
+An id **survives**:
+
+- other hunks appearing or disappearing elsewhere in the same file, including work by a concurrent
+  agent;
+- edits to any other file;
+- line numbers shifting. Positions are not hashed, so prepending six lines to a file leaves the ids
+  of the hunks below it untouched.
+
+An id **does not survive**:
+
+- **renaming or moving the file.** The path is hashed, so the same edit under a new name is a new
+  id. (This is also why one edit applied to several files yields a distinct id per file rather than
+  one shared id, which is the point — `id()` is the identity predicate.)
+- **an edit that changes the hunk itself.** Touching a line immediately adjacent to a hunk merges
+  the two into one larger hunk with different text, and therefore a different id. A line or more of
+  untouched code in between keeps them separate, and keeps the id.
+- **a change to the parent's content around the hunk** — a rebase onto a parent that rewrote those
+  lines, or squashing something into the parent. Context is read from the parent side, so it moves
+  when the parent does. A rebase that leaves those lines alone does keep the id, but do not rely on
+  it: treat any rebase as invalidating.
+
+Folding the context in is a deliberate trade. It costs durability across rebases and buys
+distinctness: two identical one-line edits in one file are told apart by where they sit rather than
+by an ordinal, which is what you want from a selector.
+
+**In practice: re-run `list` after you edit, and use the ids from that run.** Do not cache ids
+across an editing session, a rebase, or a rename — regenerating them costs one command.
+
+### When an id does not resolve
+
+`split`, `commit`, and `squash` check every spec entry against the diff before doing anything, and
+refuse the whole operation if one does not name exactly what it meant to:
+
+```text
+$ jj-hunk split '{"files": {"wide.rs": {"ids": ["hunk-deadbeef"]}}, "default": "reset"}' "nope"
+Error: spec does not resolve against the diff:
+  wide.rs: no hunk with id hunk-deadbeef
+Those entries do not name exactly what they meant to. Check them against `jj-hunk list --spec-template`, or pass --allow-empty if that is intended.
+```
+
+The middle line names the specific problem, one per bad entry:
+
+| Line | Cause |
+|------|-------|
+| `no hunk with id hunk-deadbeef` | The id matches nothing in this diff — usually stale, see above |
+| `id hunk-3 is ambiguous, it names 3 hunks -- use a longer prefix` | The prefix is too short *within that file* |
+| `no hunk with index 99 (file has 10)` | An out-of-range `hunks` index |
+
+`jj-hunk list --spec` does not apply this check — an id that matches nothing simply selects nothing,
+which is what makes `list --spec` safe to iterate with. The check runs where it matters, on the
+commands that write.
+
 ## Hunkset Query Language
 
 As an alternative to JSON/YAML specs, jj-hunk supports a **hunkset** query language inspired by jj's [filesets](https://docs.jj-vcs.dev/latest/filesets/) and [revsets](https://docs.jj-vcs.dev/latest/revsets/). Hunkset expressions are auto-detected (anything that doesn't start with `{` or `[`).
@@ -195,7 +301,7 @@ jj-hunk split 'type(insert) & glob("src/**/*.rs")' "add new code"
 jj-hunk list --spec 'function("parse_spec")'
 
 # Verify a selection covers all changes in a scope
-jj-hunk list --spec 'function("apply") ~ id("hunk-7c3d...")'
+jj-hunk list --spec 'function("apply") ~ id("hunk-397f491f")'
 # Empty output = the id covers everything in that function
 ```
 
@@ -291,10 +397,11 @@ includes line 20, and `lines(7..7)` selects the hunk on line 7. `depth()` ranges
 
 | Function | Description |
 |----------|-------------|
-| `id("hunk-...")` | Select by stable hunk ID (from `jj-hunk list`); an unambiguous prefix is enough |
-| `id("hunk-a...", "hunk-b...")` | Several IDs in one call |
+| `id("hunk-8a30a9af")` | Select by hunk ID (from `jj-hunk list`); full, short, or any unambiguous prefix |
+| `id("hunk-8a30a9af", "hunk-1b26091b")` | Several IDs in one call; the forms may be mixed |
 
-A prefix matching more than one hunk — or the bare `hunk-` — is rejected rather than guessed at.
+A prefix matching more than one hunk — or the bare `hunk-` — is rejected rather than guessed at. See
+[Hunk IDs](#hunk-ids) for the two written forms and for how long an id stays valid.
 
 #### Semantic (tree-sitter powered)
 
@@ -404,13 +511,14 @@ $ jj-hunk list --format json
       "status": "modified",
       "hunks": [
         {
-          "id": "hunk-4c1b1b3...",
           "index": 0,
+          "id": "hunk-8a30a9af59936de30a9a364b3bce467052dfc7a0a12c52f106410b04723417ef",
+          "short_id": "hunk-8a30a9af",
           "type": "replace",
           "removed": "old_fn()\n",
           "added": "new_fn()\n",
-          "before": {"start": 10, "lines": 1},
-          "after": {"start": 10, "lines": 1},
+          "before": {"start": 2, "lines": 1},
+          "after": {"start": 2, "lines": 1},
           "context": {"pre": "// prev\n", "post": "// next\n"}
         }
       ]
@@ -420,8 +528,9 @@ $ jj-hunk list --format json
       "status": "removed",
       "hunks": [
         {
-          "id": "hunk-771ad9f...",
           "index": 0,
+          "id": "hunk-1b26091bd874d9fe00c61ef49b52052985205b17abc77b2c18f52184e276e388",
+          "short_id": "hunk-1b26091b",
           "type": "delete",
           "removed": "dead_code()\n",
           "added": "",
@@ -435,7 +544,7 @@ $ jj-hunk list --format json
 ```
 
 - `files` is a list of file entries. Each entry includes `status`, optional `rename`, and `hunks`.
-- Each hunk includes a stable `id` (sha256), `index`, line ranges (`before`/`after`), and optional `context`.
+- Each hunk includes `index`, the full `id` (sha256), its abbreviated `short_id`, line ranges (`before`/`after`), and optional `context`. `--format text`, `--format diff`, and `--spec-template` print the short form; see [Hunk IDs](#hunk-ids).
 - When grouped (`--group`), output uses `groups: [{name, files}]` instead of `files`.
 - With `--files`, entries carry `hunk_count` instead of a `hunks` array.
 - In a `semantic`-enabled build, hunks also carry `enclosing_function`, `enclosing_scope`, `annotations`, `nesting_depth`, and `is_analyzed` where the language could be parsed.
@@ -455,19 +564,24 @@ jj-hunk list --spec-template --format yaml
 ### Diff Output
 
 `--format diff` emits a unified patch whose `@@` headers carry the enclosing function name (when
-semantic analysis is available) and the hunk id:
+semantic analysis is available) and the hunk's short id:
 
 ```diff
 --- a/wide.rs
 +++ b/wide.rs
-@@ -17,7 +17,7 @@ func_2 [hunk-8e7229073a43...]
+@@ -4,7 +4,7 @@ func_2 [hunk-f5696093]
  
  
  fn func_2() {
 -    let v = 2;
 +    let v = 200;
  }
+ 
+ 
 ```
+
+The id in the header is the short form and is written plain, with no trailing `...`. It can be
+pasted straight into `id()` or a spec's `ids`.
 
 Combine it with `--spec` to export exactly the hunks a query selects. Adjacent hunks whose context
 overlaps are emitted as a single `@@` block labelled with the first hunk's id, so the patch is not a

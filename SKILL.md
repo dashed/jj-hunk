@@ -109,11 +109,12 @@ includes line 20, and `lines(7..7)` selects the hunk on line 7. The same applies
 
 | Function | Description |
 |----------|-------------|
-| `id("hunk-7c3d...")` | Select by stable hunk ID; an unambiguous prefix is enough |
-| `id("hunk-7c3d...", "hunk-9a2b...")` | Multiple IDs in one call |
+| `id("hunk-b6548253")` | Select by hunk ID — full, short, or any unambiguous prefix |
+| `id("hunk-b6548253", "hunk-397f491f")` | Multiple IDs in one call; the forms may be mixed |
 | `all()` / `none()` | Everything / nothing |
 
-A prefix that matches more than one hunk — or the bare `hunk-` — is rejected rather than guessed at.
+A prefix that matches more than one hunk — or the bare `hunk-` — is rejected rather than guessed at,
+with the candidates named. See [Hunk IDs](#hunk-ids) for the two forms and their shelf life.
 
 **Semantic (tree-sitter powered, requires the `semantic` feature):**
 
@@ -228,27 +229,34 @@ which hunks belong to which logical change:
 
 ```
 M src/svc.rs
-  hunk 0 insert hunk-4374236d5123... (before 2+0 after 2+1)
+  hunk 0 insert hunk-b6548253 (before 2+0 after 2+1)
     + use std::io;
-  hunk 2 replace hunk-d78dfedc173e... (before 8+1 after 9+1) in UserService::handle_request
+  hunk 1 insert hunk-f2c7f434 (before 5+0 after 6+1) in UserService
+    +     hits: u64,
+  hunk 2 replace hunk-397f491f (before 9+1 after 11+1) in UserService::handle_request
     -         let a = 1;
     +         let a = 111;
 ```
 
 `--format diff` produces a unified patch whose `@@` headers carry the enclosing function name and
-the hunk ID:
+the hunk's short ID:
 
 ```diff
 --- a/wide.rs
 +++ b/wide.rs
-@@ -17,7 +17,7 @@ func_2 [hunk-8e7229073a43...]
+@@ -4,7 +4,7 @@ func_2 [hunk-f5696093]
  
  
  fn func_2() {
 -    let v = 2;
 +    let v = 200;
  }
+ 
+ 
 ```
+
+The ID in the header is written plain, with no trailing `...`, and can be pasted straight into
+`id()` or a spec.
 
 Combine it with `--spec` to export just the hunks a query selects.
 
@@ -257,6 +265,60 @@ diff with no mail headers, so `git am` rejects it outright (`Patch format detect
 `git apply` handles it, including added files, deleted files, CRLF line endings, and missing
 trailing newlines. Renames are the exception — the patch records a rename as a plain modification
 of the new path, so it will not apply against a tree that still has the old path.
+
+## Hunk IDs
+
+A hunk ID is `hunk-` plus a SHA-256 over the hunk's **path**, its type, its removed and added lines,
+and up to three lines of surrounding context from the *parent* side of the diff.
+
+Two written forms, both naming the same hunk:
+
+| Form | Length | Where it appears |
+|------|--------|------------------|
+| Full | `hunk-` + 64 hex | The `id` field in `--format json` / `--format yaml` |
+| Short | `hunk-` + 8 hex | The `short_id` field, `--format text`, `--format diff` headers, `--spec-template` |
+
+The short form is the shortest prefix that is unique across the diff, never under eight hex digits.
+Everywhere an ID is *accepted* — `ids` and `hunks` in a spec, and `id()` — the full form, the short
+form, and any unambiguous prefix all work, and the forms may be mixed in one call. A trailing `...`
+is tolerated for IDs copied out of older diff headers. An ambiguous prefix is an error naming the
+candidates, never a guess. (`id(exact:"...")` is the one form that demands the full 64 hex.)
+
+### How long an ID stays valid
+
+Long enough to carry it from one command to the next against the same working-copy state. That is
+the workflow — `list`, choose, `split` — and within it IDs are solid.
+
+**Survives:** other hunks appearing or disappearing elsewhere in the same file (concurrent agent
+work), edits to other files, and line numbers shifting — positions are not hashed.
+
+**Does not survive:**
+
+- **renaming or moving the file** — the path is hashed;
+- **an edit touching a line immediately adjacent to the hunk**, which merges the two into one larger
+  hunk with different text. A line of untouched code in between keeps them separate;
+- **a rebase, or a squash into the parent**, when it rewrites the lines around the hunk. Context is
+  read from the parent side. Treat any rebase as invalidating.
+
+**So: re-run `list` after editing, and use the IDs from that run.** Do not cache IDs across an
+editing session, a rebase, or a rename.
+
+### When an ID does not resolve
+
+`split`, `commit`, and `squash` validate every spec entry before touching anything and refuse the
+whole operation if one does not name exactly what it meant to:
+
+```
+Error: spec does not resolve against the diff:
+  wide.rs: no hunk with id hunk-deadbeef
+Those entries do not name exactly what they meant to. Check them against `jj-hunk list --spec-template`, or pass --allow-empty if that is intended.
+```
+
+The middle line names the specific problem — `no hunk with id ...` (usually a stale ID), `id hunk-3
+is ambiguous, it names 3 hunks -- use a longer prefix`, or `no hunk with index 99 (file has 10)`.
+
+`jj-hunk list --spec` does not run this check: an ID matching nothing simply selects nothing, which
+is what makes `list --spec` safe to iterate with.
 
 ## Core Workflow
 
@@ -270,8 +332,8 @@ jj-hunk list --format text
 jj-hunk list --spec 'scope("UserService")' --format text
 
 # Verify a selection covers everything you expect
-jj-hunk list --spec 'scope("UserService") ~ id("hunk-7c3d...")' --format text
-# Empty output = the id covers everything in that scope
+jj-hunk list --spec 'scope("UserService") ~ id("hunk-f2c7f434", "hunk-397f491f")' --format text
+# Empty output = those ids cover everything in that scope
 ```
 
 Other `list` options:
@@ -312,17 +374,23 @@ This is the main guard against a typo'd selector silently producing a no-op comm
 
 ### 3. Use stable IDs for safety
 
-When other changes may arrive concurrently, **always resolve your hunkset query to stable IDs before executing the split**. This protects against new hunks appearing between the query and the split:
+When other changes may arrive concurrently, **always resolve your hunkset query to hunk IDs before executing the split**. This protects against new hunks appearing between the query and the split:
 
 ```bash
 # Step 1: Query to find the hunks you want
-jj-hunk list --spec 'function("handle_request") & glob("src/api/**")' --format json
+jj-hunk list --spec 'function("handle_request") & glob("src/api/**")' --format text
 
 # Step 2: Note the hunk IDs from the output, then split using IDs
-jj-hunk split 'id("hunk-7c3d...", "hunk-9a2b...", "hunk-ff01...")' "feat: handle_request implementation"
+jj-hunk split 'id("hunk-b6548253", "hunk-397f491f")' "feat: handle_request implementation"
 ```
 
-Hunk IDs are stable SHA256 hashes of the hunk content — they won't change even if other hunks are added to the same file by concurrent work.
+`--format text` and `--format diff` print the short ID directly, so you can copy it out of either
+one. `--spec-template` writes short IDs too, which makes it the quickest way to get a full,
+correctly-shaped starting spec.
+
+An ID survives another agent adding, removing, or shifting hunks elsewhere in the same file — that
+is exactly what it is for. It does **not** survive a rename or a rebase. See
+[Hunk IDs](#hunk-ids).
 
 ### 4. JSON specs (alternative)
 
@@ -331,7 +399,7 @@ For complex selections or when building specs programmatically:
 ```json
 {
   "files": {
-    "src/foo.rs": {"ids": ["hunk-7c3d...", "hunk-2f91..."]},
+    "src/foo.rs": {"ids": ["hunk-b6548253", "hunk-397f491f"]},
     "src/bar.rs": {"action": "keep"},
     "src/qux.rs": {"action": "reset"}
   },
@@ -342,7 +410,7 @@ For complex selections or when building specs programmatically:
 | Spec | Effect |
 |------|--------|
 | `{"hunks": [0, 2]}` | Include only hunks 0 and 2 (indices or ID strings) |
-| `{"ids": ["hunk-..."]}` | Include hunks by stable ID |
+| `{"ids": ["hunk-b6548253"]}` | Include hunks by ID (full, short, or unambiguous prefix) |
 | `{"action": "keep"}` | Include all changes in the file |
 | `{"action": "reset"}` | Discard all changes in the file |
 | `"default": "reset"` | Unlisted files are discarded |
@@ -355,7 +423,7 @@ or loaded with `--spec-file`. `jj-hunk list --spec-template` generates an ID-bas
 cannot tell that `right/new_name` used to be `left/old_name`; `from` supplies that link:
 
 ```json
-{"files": {"new_name.txt": {"ids": ["hunk-..."], "from": "old_name.txt"}}, "default": "reset"}
+{"files": {"new_name.txt": {"ids": ["hunk-ca38eba7"], "from": "old_name.txt"}}, "default": "reset"}
 ```
 
 `split`/`commit`/`squash` fill this in for you from jj's rename detection, so a hand-written spec
@@ -401,11 +469,13 @@ jj-hunk list --spec 'scope("UserService") & glob("src/api/**")' --format text
 # 3. Verify the query captures exactly your work — refine if needed
 jj-hunk list --spec 'function("handle_request") & file("src/api/handler.rs")' --format text
 
-# 4. Resolve to stable IDs (protects against concurrent changes)
-#    Collect the hunk IDs from the output above.
+# 4. Resolve to hunk IDs (protects against concurrent changes)
+#    Collect the short IDs from the output above.
 
 # 5. Split your changes into a clean commit
-jj-hunk split 'id("hunk-7c3d...", "hunk-9a2b...")' "feat: add request handler"
+#    Do this from the same working-copy state you listed — do not reuse IDs
+#    collected before an edit or a rebase.
+jj-hunk split 'id("hunk-b6548253", "hunk-397f491f")' "feat: add request handler"
 
 # 6. Rebase the clean commit to its proper place in the graph
 jj rebase -r <new_change> -d main
@@ -438,7 +508,7 @@ main
 
 ### Key principles
 
-- **Query first, split by ID**: Use hunkset queries to explore, but resolve to stable hunk IDs before executing the split. IDs are content-addressed (SHA256) and immune to concurrent modifications.
+- **Query first, split by ID**: Use hunkset queries to explore, but resolve to hunk IDs before executing the split. IDs are content-addressed (SHA256), so another agent's hunks arriving elsewhere in the same file do not disturb yours. Re-list if you rebase or rename in between — see [Hunk IDs](#hunk-ids).
 - **Combine predicates for precision**: Use `&` to intersect scope and file queries — `scope("MyClass") & file("src/models.rs")` is safer than either alone, because it won't accidentally capture unrelated changes that happen to be in the same file or an identically-named scope in a different file.
 - **Verify the merge**: After splitting, the merge change should be empty. If it's not, something was missed — use `jj-hunk list -r $MERGE` to find and dispatch remaining hunks.
 - **Rebase, don't move**: After `jj-hunk split` creates a new change, use `jj rebase` to position it in the graph. The split creates the change as a child of the current revision; rebasing moves it to its logical location.
@@ -456,7 +526,7 @@ main
 - **Prefer hunkset over JSON**: Hunkset expressions are more readable and composable. Reserve JSON specs for programmatic generation.
 - **Use `--format text` for exploration**: Shows semantic context (enclosing function/scope) inline.
 - **Use `--format diff` for export**: A unified patch with hunk IDs, appliable with `git apply` (not `git am`) or archivable for review.
-- **Prefer IDs for stability**: Hunk IDs (SHA256) are immune to concurrent changes. Always resolve queries to IDs before executing splits in concurrent workflows.
+- **Prefer IDs for stability**: Hunk IDs (SHA256) are unaffected by concurrent changes elsewhere in the file. Always resolve queries to IDs before executing splits in concurrent workflows — and re-run `list` if you edited or rebased since collecting them.
 - **Use `--spec` on `list` to verify**: Preview what a split would select before executing it. An empty result means your query matches nothing; refine it.
 - **`"default": "reset"` is safer**: Explicitly include what you want rather than excluding what you don't.
 - **Watch the matching mode**: `function("x")` is exact. If a query unexpectedly returns nothing, try `substring:"x"` before assuming the hunk isn't there.
