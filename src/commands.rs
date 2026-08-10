@@ -1692,6 +1692,15 @@ pub fn select(left: &str, right: &str) -> Result<()> {
     let right_files = list_files(right_path);
     let all_files: HashSet<_> = left_files.union(&right_files).cloned().collect();
 
+    // Both spellings of every path, because the spec speaks one and the
+    // directories jj materialised are laid out in the other.
+    let frame = PathFrame::discover();
+    let files: Vec<SelectPath> = all_files.iter().map(|path| frame.resolve(path)).collect();
+    let by_display: HashMap<&str, &SelectPath> = files
+        .iter()
+        .map(|file| (file.display.as_str(), file))
+        .collect();
+
     // jj hands a rename to the tool as two unrelated paths: the old one in
     // `left`, the new one in `right`. Only the new one is named in the spec,
     // so the old one has to be resolved through the entry that claims it.
@@ -1708,13 +1717,20 @@ pub fn select(left: &str, right: &str) -> Result<()> {
     // source can only be resolved once its target has been decided.
     let mut kept: HashMap<&str, bool> = HashMap::new();
 
-    for filepath in &all_files {
-        let Some(file_spec) = spec.files.get(filepath) else {
+    for file in &files {
+        let Some(file_spec) = spec.files.get(&file.display) else {
             continue;
         };
+        // A `from` is written in the spec's frame like every other path, and
+        // it has to name a file that is really there. Resolving it through the
+        // file union rather than joining it onto `left` means a stale or
+        // mis-framed one falls back to "same path" instead of pointing at
+        // whatever happens to sit at that name.
         let source = file_spec
             .source_path()
-            .filter(|from| *from != filepath.as_str());
+            .filter(|from| *from != file.display.as_str())
+            .and_then(|from| by_display.get(from))
+            .map(|found| found.fs.as_str());
 
         let keeps_change = match file_spec {
             FileSpec::Action {
@@ -1725,22 +1741,22 @@ pub fn select(left: &str, right: &str) -> Result<()> {
                 action: Action::Reset,
                 ..
             } => {
-                reset_file(left_path, right_path, filepath)?;
+                reset_file(left_path, right_path, &file.fs)?;
                 false
             }
             FileSpec::Selection(selection) => apply_hunk_selection(
                 left_path,
                 right_path,
                 source,
-                filepath,
+                file,
                 &selection.to_selection(),
             )?,
         };
-        kept.insert(filepath.as_str(), keeps_change);
+        kept.insert(file.display.as_str(), keeps_change);
     }
 
-    for filepath in &all_files {
-        if spec.files.contains_key(filepath) {
+    for file in &files {
+        if spec.files.contains_key(&file.display) {
             continue;
         }
 
@@ -1749,21 +1765,115 @@ pub fn select(left: &str, right: &str) -> Result<()> {
         // leaves it deleted, a reset one puts it back. (A copy leaves the
         // source in place on the right, so it takes the default action like
         // any other file.)
-        if let Some(target) = rename_sources.get(filepath.as_str()) {
-            if !right_files.contains(filepath) {
+        if let Some(target) = rename_sources.get(file.display.as_str()) {
+            if !right_files.contains(&file.fs) {
                 if !kept.get(target).copied().unwrap_or(false) {
-                    reset_file(left_path, right_path, filepath)?;
+                    reset_file(left_path, right_path, &file.fs)?;
                 }
                 continue;
             }
         }
 
         if spec.default == DefaultAction::Reset {
-            reset_file(left_path, right_path, filepath)?;
+            reset_file(left_path, right_path, &file.fs)?;
         }
     }
 
     Ok(())
+}
+
+/// One file's path in both the frames `select` has to straddle.
+///
+/// jj materialises the two diff directories with **repo-relative** paths, but
+/// every path jj *prints* is relative to the **cwd**: `jj diff --summary`, and
+/// `self.path().display()` in `SUMMARY_TEMPLATE`, which is where `list` --
+/// and so every spec key, and every `file:` pattern -- gets its paths from.
+///
+/// Run from the repo root the two spellings are identical and the difference
+/// is invisible. Run from `pkg/` they are not, and conflating them cost the
+/// spec both of its footholds at once: the key `pkg/a.txt` is not what any
+/// producer wrote, and the hunk ids hash the path, so even a key that matched
+/// would have resolved against ids computed over a different string.
+struct SelectPath {
+    /// The path under `left`/`right`: repo-relative, for filesystem access.
+    fs: String,
+    /// The path as jj prints it: cwd-relative. The spec key, and the string
+    /// the file's hunk ids were hashed with.
+    display: String,
+}
+
+/// Translates jj's materialised paths into the frame every producer speaks.
+struct PathFrame {
+    /// The cwd relative to the workspace root, one component per element.
+    /// Empty when `select` is running at the root, which makes every
+    /// translation the identity.
+    prefix: Vec<String>,
+}
+
+impl PathFrame {
+    /// jj runs a merge tool with its own cwd, so the frame is discovered from
+    /// the process rather than passed in. A cwd that is not inside a workspace
+    /// leaves the prefix empty, which is what `select` did before it knew
+    /// about frames at all.
+    fn discover() -> Self {
+        Self {
+            prefix: workspace_prefix().unwrap_or_default(),
+        }
+    }
+
+    fn resolve(&self, fs_path: &str) -> SelectPath {
+        SelectPath {
+            display: self.to_display(fs_path),
+            fs: fs_path.to_string(),
+        }
+    }
+
+    /// The same relative path jj would print for `fs_path`: the part below the
+    /// cwd, prefixed with one `..` per directory the cwd has to climb out of.
+    fn to_display(&self, fs_path: &str) -> String {
+        if self.prefix.is_empty() {
+            return fs_path.to_string();
+        }
+
+        let parts: Vec<_> = Path::new(fs_path).components().collect();
+        let shared = self
+            .prefix
+            .iter()
+            .zip(&parts)
+            .take_while(|(dir, part)| part.as_os_str() == dir.as_str())
+            .count();
+
+        let mut display = PathBuf::new();
+        for _ in shared..self.prefix.len() {
+            display.push("..");
+        }
+        for part in &parts[shared..] {
+            display.push(part.as_os_str());
+        }
+        display.to_string_lossy().into_owned()
+    }
+}
+
+/// The current directory relative to the workspace root, or `None` when it is
+/// not inside one.
+///
+/// The root is found the way jj finds it: the nearest ancestor holding a `.jj`.
+/// Asking `jj` itself would be authoritative, but `select` runs *inside* a jj
+/// invocation, and a subprocess is a poor thing to owe an answer to there.
+fn workspace_prefix() -> Option<Vec<String>> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir = cwd.as_path();
+    let mut prefix: Vec<String> = Vec::new();
+
+    loop {
+        if dir.join(".jj").exists() {
+            prefix.reverse();
+            return Some(prefix);
+        }
+        // No `.jj` anywhere up to the filesystem root.
+        prefix.push(dir.file_name()?.to_string_lossy().into_owned());
+        dir = dir.parent()?;
+    }
 }
 
 fn list_files(dir: &Path) -> HashSet<String> {
@@ -1790,19 +1900,20 @@ fn list_files(dir: &Path) -> HashSet<String> {
 }
 
 fn reset_file(left: &Path, right: &Path, filepath: &str) -> Result<()> {
-    let left_file = left.join(filepath);
-    let right_file = right.join(filepath);
+    // No entry to restore *to*, so there is nothing to do here -- and every
+    // write would land somewhere else entirely.
+    let Some(right_file) = contained_join(right, filepath) else {
+        return Ok(());
+    };
+    let right_exists = fs::symlink_metadata(&right_file).is_ok();
 
     // `symlink_metadata` deliberately does NOT traverse the link. `exists()`
     // does, so a dangling symlink in `left` (jj materialises only the changed
     // files, so a link's target is usually absent) reported "not there" and we
     // deleted a file that was never selected. `fs::copy` traverses too, and
     // wrote the *target's* bytes into the link's path.
-    let left_meta = fs::symlink_metadata(&left_file).ok();
-    let right_exists = fs::symlink_metadata(&right_file).is_ok();
-
-    match left_meta {
-        Some(meta) => {
+    match locate(left, filepath) {
+        Some((left_file, meta)) => {
             if let Some(parent) = right_file.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -1825,6 +1936,49 @@ fn reset_file(left: &Path, right: &Path, filepath: &str) -> Result<()> {
     Ok(())
 }
 
+/// `dir.join(relative)`, unless the path would lead *through* a symlink.
+///
+/// Only the last component may be a link; that is an entry in its own right.
+/// A link at any earlier component is a way out of `dir` altogether, and jj
+/// materialises exactly that shape whenever a commit replaces a directory with
+/// a symlink: one side gets `conf` as a link, the other `conf/x.txt` as a file,
+/// and every read, unlink and write under `conf/` lands wherever the link
+/// points -- outside the repo, at exit 0. A tree cannot hold both entries, so
+/// the honest answer is that this path is not in this one.
+///
+/// `..` and absolute components are refused for the same reason. Nothing here
+/// should produce them -- these paths come from `strip_prefix`-ing a walk of
+/// the directory itself -- but joining one on is the whole escape in miniature.
+fn contained_join(dir: &Path, relative: &str) -> Option<PathBuf> {
+    let mut path = dir.to_path_buf();
+    let mut components = Path::new(relative).components().peekable();
+
+    while let Some(component) = components.next() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+        path.push(component.as_os_str());
+        if components.peek().is_none() {
+            break; // the leaf itself may be a link
+        }
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return None;
+        }
+    }
+
+    Some(path)
+}
+
+/// The entry `relative` names inside `dir`, if there is one.
+///
+/// `None` covers both "not there" and "not reachable without going through a
+/// symlink", which for a tree jj materialised mean the same thing.
+fn locate(dir: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
+    let path = contained_join(dir, relative)?;
+    let meta = fs::symlink_metadata(&path).ok()?;
+    Some((path, meta))
+}
+
 #[cfg(unix)]
 fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -1837,109 +1991,198 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
 
 /// Apply a hunk selection to one file, reporting whether anything was kept.
 ///
-/// `source` is the file's path on the left side when it differs from
-/// `filepath` (renames and copies). The spec's hunk ids were computed by
-/// diffing `left/<source>` against `right/<filepath>`; joining `filepath` onto
-/// both sides instead recomputes the change as one whole-file insertion under
-/// a different id, so nothing matches and the file is written out empty.
+/// `source` is the file's path on the left side when it differs from the spec's
+/// own (renames and copies), and like every path under `left`/`right` it is in
+/// `SelectPath::fs` form. The spec's hunk ids were computed by diffing
+/// `left/<source>` against the right-hand file; joining the target name onto
+/// both sides instead recomputes the change as one whole-file insertion under a
+/// different id, so nothing matches and the file is written out empty.
+///
+/// Every id here is recomputed from `file.display`, not from the path the
+/// directories are laid out under: the id hashes the path, so the two have to
+/// be the same string the producer used or no selection can ever resolve.
 fn apply_hunk_selection(
     left: &Path,
     right: &Path,
     source: Option<&str>,
-    filepath: &str,
+    file: &SelectPath,
     selection: &HunkSelection,
 ) -> Result<bool> {
-    // A `from` naming something that is not on the left is unusable. Fall back
-    // to the spec key rather than reading an empty "before" and concluding the
-    // file is new -- that path ends in deleting it.
-    let source = source.filter(|from| fs::symlink_metadata(left.join(from)).is_ok());
+    // `locate`, not `join` plus `exists()`: the latter traverses symlinks, so a
+    // dangling link (jj materialises only the changed files, so a link's target
+    // is usually absent) reads as "not there", and a link standing where a
+    // directory component should be reads as a path in a different tree.
+    //
+    // A `from` naming something that is not on the left is unusable, so it
+    // falls back to the spec's own path rather than reading an empty "before"
+    // and concluding the file is new -- that path ends in deleting it.
+    let left_entry = source
+        .and_then(|from| locate(left, from))
+        .or_else(|| locate(left, &file.fs));
+    let right_entry = locate(right, &file.fs);
 
-    let left_file = left.join(source.unwrap_or(filepath));
-    let right_file = right.join(filepath);
-
-    // Not `exists()`: that traverses symlinks, so a dangling link (jj
-    // materialises only the changed files, so a link's target is usually
-    // absent) reads as "not there".
-    let right_exists = fs::symlink_metadata(&right_file).is_ok();
-
-    // Deleted on the right: the whole file is a single delete hunk. Keep the
-    // deletion only if that hunk is selected -- otherwise the file is reset,
-    // which for a deletion means putting it back. Returning early here left
-    // every deletion in the commit no matter what the spec said.
-    if !right_exists {
-        // A deletion is always same-path, so read the left side at `filepath`
-        // rather than at a `source` a malformed spec might have supplied.
-        // Unreadable (a symlink, say) reads as empty, which yields no hunks
-        // and so restores the file -- the safe direction.
-        let before = fs::read_to_string(left.join(filepath)).unwrap_or_default();
-        let hunks = get_hunks(filepath, &before, "");
-        let keeps_deletion = !selection.resolve(&hunks)?.is_empty();
-        if !keeps_deletion {
-            reset_file(left, right, filepath)?;
-        }
-        return Ok(keeps_deletion);
-    }
-
-    // A file that exists on the right but not at `filepath` on the left is
-    // either newly added or the target of a rename. Either way its "reset"
-    // state is: not present.
-    let existed_at_this_path = source.is_none() && fs::symlink_metadata(&left_file).is_ok();
-
-    let before = fs::read_to_string(&left_file).unwrap_or_default();
-    // A non-UTF-8 file lands here whenever a spec selects hunks in one, and
-    // used to fail as a bare "stream did not contain valid UTF-8" naming
-    // nothing at all. Reading it lossily instead is not an option: `select`
-    // writes this text back out, so the replacement characters would become the
-    // committed file.
-    let after = fs::read_to_string(&right_file).with_context(|| {
-        format!(
-            "Failed to read {} as text. A file that is not valid UTF-8 cannot \
-             be selected hunk-wise; keep or reset it whole instead \
-             (`{{\"action\": \"keep\"}}`).",
-            filepath
-        )
-    })?;
-
-    let result = apply_selected_hunks(filepath, &before, &after, selection)?;
-    let keeps_change = result != before;
-
-    if !existed_at_this_path && !keeps_change {
-        // Writing `result` here would leave a 0-byte file in the commit for an
-        // added file, or an unwanted copy of the old content for a rename.
-        fs::remove_file(&right_file)?;
+    // A selection that names nothing keeps nothing, and that is decidable
+    // without reading a single byte of either side. Deciding it here is what
+    // makes `{"ids": []}` -- the documented "keep nothing from this file"
+    // spelling -- work on files no hunk selection could ever describe: a
+    // binary, a symlink, one whose parent is not valid UTF-8. Reading them
+    // first is how an unreadable parent came to be committed as an empty file.
+    if selection.is_empty() {
+        reset_file(left, right, &file.fs)?;
         return Ok(false);
     }
 
-    fs::write(&right_file, &result)?;
-    // `fs::write` keeps whatever mode the destination already had, so a
-    // `chmod +x` in the working copy survived even when none of the file's
-    // hunks were selected. A mode change is not a hunk and cannot be selected,
-    // so it is restored from the left side exactly like unselected content.
-    restore_exec_bit(&left_file, &right_file)?;
-    Ok(keeps_change)
+    // Nothing on the right: the whole file is a single delete hunk. Keep the
+    // deletion only if that hunk is selected -- otherwise the file is reset,
+    // which for a deletion means putting it back. Returning early here left
+    // every deletion in the commit no matter what the spec said.
+    let Some((right_file, right_meta)) = right_entry else {
+        // A deletion is always same-path, so read the left side at the spec's
+        // own path rather than at a `source` a malformed spec might have
+        // supplied. An unreadable left side yields no delete hunk, so no id
+        // can name one and nothing is kept: the file goes back, which is both
+        // the safe direction and the only one available.
+        let deleted = locate(left, &file.fs);
+        let before = side_text(as_side(&deleted), &file.display).unwrap_or_default();
+        let hunks = get_hunks(&file.display, &before, "");
+        let keeps_deletion = !selection.resolve(&hunks)?.is_empty();
+        if !keeps_deletion {
+            reset_file(left, right, &file.fs)?;
+        }
+        return Ok(keeps_deletion);
+    };
+
+    let before = side_text(as_side(&left_entry), &file.display)?;
+    let after = side_text(Some((right_file.as_path(), &right_meta)), &file.display)?;
+
+    let result = apply_selected_hunks(&file.display, &before, &after, selection)?;
+
+    if result == before {
+        // Nothing of this file's change survived the selection. Restoring it
+        // from the left side is a byte copy, so it puts back content no text
+        // round-trip could reproduce -- and the mode along with it. Writing
+        // `result` instead committed whatever `before` had decoded as, and for
+        // an added file or a rename target that was a zero-byte file.
+        reset_file(left, right, &file.fs)?;
+        return Ok(false);
+    }
+
+    // A link's change was kept, and the right side already *is* it. There is
+    // nothing to write, and writing is the one thing that must not happen:
+    // `fs::write` follows the link and puts the text on its target, a path in
+    // neither directory jj handed us. (A link is also all-or-nothing in
+    // practice -- one side of the diff is empty, so its whole change is a
+    // single hunk.)
+    if right_meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+
+    // Something was kept, so the file's change rides along whole -- including a
+    // `chmod +x`, which is not a hunk, cannot be selected apart from the
+    // content it came with, and has no half to leave behind. Stripping it here
+    // discarded it outright under `diffedit`, which keeps no remainder commit.
+    write_regular_file(&right_file, &result, &right_meta)?;
+    Ok(true)
 }
 
-/// Give `right` the executable bits `left` has.
+/// One side of the diff as the text its hunk ids were computed over.
+///
+/// `list` reads both sides with `jj file show`, which prints *nothing* for a
+/// symlink: an entry that is a link on one side is described as that side being
+/// empty, and the ids the user selects from are hashed over that emptiness.
+/// `select` has to read it the same way, or the ids it recomputes name nothing
+/// and a selection that looked perfectly good resets the file instead.
+///
+/// An absent side is empty too -- that is what a newly added file, or the
+/// target of a rename, looks like. A side that is *there* but unreadable is
+/// neither, and reading it as `""` said it was: `select` then saw a whole-file
+/// insertion, matched none of it, and wrote the empty string over the file.
+fn side_text(entry: Option<(&Path, &fs::Metadata)>, display: &str) -> Result<String> {
+    match entry {
+        None => Ok(String::new()),
+        Some((_, meta)) if meta.file_type().is_symlink() => Ok(String::new()),
+        Some((path, _)) => Ok(read_selectable(path, display)?.unwrap_or_default()),
+    }
+}
+
+/// Borrow what `locate` returned, for `side_text`.
+fn as_side(entry: &Option<(PathBuf, fs::Metadata)>) -> Option<(&Path, &fs::Metadata)> {
+    entry.as_ref().map(|(path, meta)| (path.as_path(), meta))
+}
+
+/// Read a file as text, telling "not there" apart from "there but unreadable".
+///
+/// `fs::read_to_string(..).unwrap_or_default()` collapses the two, and `""` is
+/// exactly what a newly added file reads as. It also traverses symlinks, so a
+/// link in the tree could feed `select` the bytes of a file outside the two
+/// directories jj handed it; anything that is not a regular file is refused
+/// here instead.
+fn read_text(path: &Path) -> Result<Option<String>> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !meta.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .with_context(|| format!("Failed to read {}", path.display()))
+}
+
+/// `read_text`, with the advice that goes with failing to read one side of a
+/// hunk selection.
+///
+/// Reading lossily instead is not an option: `select` writes this text back
+/// out, so the replacement characters would become the committed file.
+fn read_selectable(path: &Path, display: &str) -> Result<Option<String>> {
+    read_text(path).with_context(|| {
+        format!(
+            "Failed to read {} as text. A file that is not valid UTF-8 cannot \
+             be selected hunk-wise; keep or reset it whole instead \
+             (`{{\"action\": \"keep\"}}`, `{{\"action\": \"reset\"}}`, or an \
+             empty selection `{{\"ids\": []}}`).",
+            display
+        )
+    })
+}
+
+/// Replace `path`'s contents, never through a symlink, keeping the mode
+/// `was` describes.
+///
+/// `fs::write` opens with `O_TRUNC` and follows links, so a link committed in
+/// the repo -- `link.txt -> ../../victim` -- sent the new contents to its
+/// target: a file in neither directory jj handed the tool, rewritten at exit 0.
+/// Unlinking first means the write lands on a fresh regular file at exactly
+/// this path whatever was sitting there, so no future caller can reintroduce
+/// that by reaching this function with a link.
+fn write_regular_file(path: &Path, contents: &str, was: &fs::Metadata) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let context = format!("Failed to replace {}", path.display());
+            return Err(anyhow::Error::new(e).context(context));
+        }
+    }
+    fs::write(path, contents).with_context(|| format!("Failed to write {}", path.display()))?;
+
+    // The unlink took the file's mode with it and `fs::write` created the
+    // replacement from the umask, so it has to be put back explicitly.
+    restore_mode(path, was)
+}
+
+/// Give `path` the permissions `was` recorded.
 #[cfg(unix)]
-fn restore_exec_bit(left: &Path, right: &Path) -> Result<()> {
+fn restore_mode(path: &Path, was: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    // A file that is absent on the left is newly added; there is no earlier
-    // mode to restore, and its own mode is part of the addition.
-    let Ok(left_meta) = fs::metadata(left) else {
-        return Ok(());
-    };
-    let right_meta =
-        fs::metadata(right).with_context(|| format!("Failed to stat {}", right.display()))?;
-
-    let exec = left_meta.permissions().mode() & 0o111;
-    let mode = (right_meta.permissions().mode() & !0o111) | exec;
-    fs::set_permissions(right, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("Failed to restore mode on {}", right.display()))
+    let mode = was.permissions().mode() & 0o7777;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to restore mode on {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn restore_exec_bit(_left: &Path, _right: &Path) -> Result<()> {
+fn restore_mode(_path: &Path, _was: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 

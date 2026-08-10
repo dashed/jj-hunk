@@ -1513,9 +1513,13 @@ fn single_revision_revsets_are_unaffected() {
 }
 
 // ---------------------------------------------------------------------------
-// Executable bit. `apply_hunk_selection` rewrote the right-hand file with
-// `fs::write`, which preserves that file's mode, so an unselected `chmod +x`
-// rode along in the split commit.
+// Executable bit. A mode change is not a hunk, so it cannot be selected on its
+// own: it follows the content. `apply_hunk_selection` rewrote the right-hand
+// file with `fs::write`, which preserves that file's mode, so an unselected
+// `chmod +x` rode along in the split commit.
+//
+// The converse -- a chmod riding along with hunks that *were* selected -- is
+// under "The executable bit is not a hunk" at the end of this file.
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1554,42 +1558,11 @@ fn an_unselected_exec_bit_change_does_not_leak_into_a_split() {
     );
 }
 
-/// The same leak, but through the `default: reset` path rather than an
-/// explicit empty selection.
-#[cfg(unix)]
-#[test]
-fn an_exec_bit_change_on_a_partially_selected_file_is_reset() {
-    let repo = TestRepo::new("exec-bit-partial");
-    repo.write_file("s.sh", "S1\nS2\n");
-    repo.jj_ok(&["commit", "-m", "base"]);
-
-    repo.write_file("s.sh", "S1\nS2\nS3\n");
-    let path = repo.path().join("s.sh");
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-    }
-    std::fs::set_permissions(&path, perms).unwrap();
-
-    // Select the content hunk. The mode change is not a hunk, so it must not
-    // be carried along with it.
-    repo.hunk_ok(&[
-        "split",
-        r#"{"files": {"s.sh": {"hunks": [0]}}, "default": "reset"}"#,
-        "content only",
-    ]);
-
-    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
-    assert!(
-        committed.contains("+S3"),
-        "the selected content hunk is missing:\n{committed}"
-    );
-    assert!(
-        !committed.contains("new mode 100755"),
-        "the mode change rode along with the selected hunk:\n{committed}"
-    );
-}
+// A test asserting that a chmod is stripped from a file whose hunks *were*
+// selected used to live here. That is the leak's mirror image, not another
+// instance of it: it left the chmod behind in the working copy for a split,
+// and discarded it outright for a `diffedit`, which keeps no remainder. See
+// `a_chmod_rides_along_with_the_hunks_it_accompanies`.
 
 /// A mode-only change produces zero hunks, so it was dropped from `list`
 /// entirely -- the user could not see that the file had changed at all.
@@ -4233,5 +4206,686 @@ fn a_spec_that_names_nothing_in_the_diff_is_rejected() {
     assert!(
         !repo.log_descriptions().iter().any(|d| d.contains("all stale")),
         "an empty commit was created from a spec that names nothing in the diff"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The `select` path: what jj hands the tool, and what the tool may touch.
+//
+// `select` is the only verb that writes to a filesystem, and jj gives it two
+// directories to write in. Everything below is a way it was caught reaching
+// outside them, committing bytes it was never given, or applying a spec to a
+// file the spec was not talking about.
+// ---------------------------------------------------------------------------
+
+/// Run jj-hunk with the process cwd set to `sub`, a directory relative to the
+/// repo root.
+///
+/// Every path jj prints is relative to the cwd, so this is the only way to
+/// exercise the frame `select` has to agree with: from the root the two
+/// spellings coincide and every disagreement hides.
+fn hunk_in(repo: &TestRepo, sub: &str, args: &[&str]) -> std::process::Output {
+    Command::new(jj_hunk_bin())
+        .args(args)
+        .current_dir(repo.path().join(sub))
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("JJ_CONFIG", &repo.config_path)
+        .env("PATH", path_with_jj_hunk())
+        .output()
+        .expect("failed to run jj-hunk")
+}
+
+fn hunk_in_ok(repo: &TestRepo, sub: &str, args: &[&str]) -> String {
+    let out = hunk_in(repo, sub, args);
+    assert!(
+        out.status.success(),
+        "jj-hunk {:?} in {sub} failed: {}{}",
+        args,
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn hunk_in_fail(repo: &TestRepo, sub: &str, args: &[&str]) -> String {
+    let out = hunk_in(repo, sub, args);
+    assert!(
+        !out.status.success(),
+        "jj-hunk {:?} in {sub} should have failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let mut combined = String::from_utf8_lossy(&out.stderr).to_string();
+    combined.push_str(&String::from_utf8_lossy(&out.stdout));
+    combined
+}
+
+/// The hunk ids `list` prints, keyed by the path it printed them under.
+fn listed_ids_in(repo: &TestRepo, sub: &str, args: &[&str]) -> HashMap<String, Vec<String>> {
+    let mut argv = vec!["list", "--format", "json"];
+    argv.extend_from_slice(args);
+    let listing: serde_json::Value = serde_json::from_str(&hunk_in_ok(repo, sub, &argv)).unwrap();
+    let mut out = HashMap::new();
+    for file in listing["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap().to_string();
+        let ids = file["hunks"]
+            .as_array()
+            .map(|hunks| {
+                hunks
+                    .iter()
+                    .map(|h| h["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.insert(path, ids);
+    }
+    out
+}
+
+/// A file's bytes at `rev`, without going through a lossy String.
+fn file_bytes_at(repo: &TestRepo, rev: &str, path: &str) -> Vec<u8> {
+    let out = Command::new("jj")
+        .args(["file", "show", "-r", rev, &format!("file:{path}")])
+        .current_dir(repo.path())
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("JJ_CONFIG", &repo.config_path)
+        .env("PATH", path_with_jj_hunk())
+        .output()
+        .expect("jj file show failed");
+    assert!(
+        out.status.success(),
+        "jj file show -r {rev} {path}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[cfg(unix)]
+fn chmod_exec(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Symlinks: a link has a target, not text, so no hunk selection can describe
+// it -- and nothing may be written *through* it. `fs::write` and
+// `fs::read_to_string` both traverse links, so a link committed in the repo
+// aimed `select`'s write at a path in neither directory.
+// ---------------------------------------------------------------------------
+
+/// The worst shape: a link whose target is outside both directories jj
+/// materialised. Asserting on the committed content would not catch this --
+/// the damage lands on a file jj never sees.
+#[cfg(unix)]
+#[test]
+fn select_never_writes_through_a_symlink_out_of_the_directories_it_was_given() {
+    let repo = TestRepo::new("select-link-escape");
+    let root = repo.path().to_path_buf();
+    let left = root.join("L");
+    let right = root.join("R");
+    let outside = root.join("outside");
+    for dir in [&left, &right, &outside] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    std::fs::write(outside.join("victim.txt"), "NEW CONTENT\n").unwrap();
+    std::fs::write(left.join("old-target.txt"), "OLD CONTENT\n").unwrap();
+    std::os::unix::fs::symlink("old-target.txt", left.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("../outside/victim.txt", right.join("link.txt")).unwrap();
+
+    let spec_path = root.join("sel.json");
+    std::fs::write(&spec_path, r#"{"files": {"link.txt": {"ids": []}}}"#).unwrap();
+
+    let out = Command::new(jj_hunk_bin())
+        .args(["select", left.to_str().unwrap(), right.to_str().unwrap()])
+        .current_dir(&root)
+        .env("JJ_HUNK_SELECTION", &spec_path)
+        .env("JJ_CONFIG", &repo.config_path)
+        .output()
+        .expect("failed to run jj-hunk select");
+    assert!(
+        out.status.success(),
+        "select failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(outside.join("victim.txt")).unwrap(),
+        "NEW CONTENT\n",
+        "select followed the link and rewrote a file outside both directories"
+    );
+    let meta = std::fs::symlink_metadata(right.join("link.txt")).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "resetting a link must restore a link, not a regular file"
+    );
+    assert_eq!(
+        std::fs::read_link(right.join("link.txt")).unwrap(),
+        Path::new("old-target.txt"),
+        "the link was not put back to the left side's target"
+    );
+}
+
+/// The same write-through, aimed at a file jj *does* see: the link's neighbour
+/// in the very same commit. `a.txt` is kept whole, so nothing rewrites it
+/// afterwards and the damage is what lands in history.
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_a_selection_does_not_overwrite_the_file_it_points_at() {
+    let repo = TestRepo::new("select-link-neighbour");
+    repo.write_file("a.txt", "AAA-line1\n");
+    repo.write_file("f.txt", "FFF\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("a.txt", "AAA-line1\nAAA-line2\n");
+    std::fs::remove_file(repo.path().join("f.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("f.txt")).unwrap();
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"action": "keep"}, "f.txt": {"ids": []}}, "default": "reset"}"#,
+        "keep a.txt",
+    ]);
+
+    assert_eq!(
+        repo.file_at("@-", "a.txt"),
+        "AAA-line1\nAAA-line2\n",
+        "the link's reset was written through the link and clobbered a.txt"
+    );
+}
+
+/// A link kept whole must stay a link. Flattening it to its target's bytes
+/// would turn a 120000 entry into a 100644 one.
+#[cfg(unix)]
+#[test]
+fn a_symlink_kept_whole_stays_a_link() {
+    let repo = TestRepo::new("select-link-keep");
+    repo.write_file("a.txt", "AAA-line1\n");
+    repo.write_file("f.txt", "FFF\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("a.txt", "AAA-line1\nAAA-line2\n");
+    std::fs::remove_file(repo.path().join("f.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("f.txt")).unwrap();
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"action": "keep"}, "f.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "keep both",
+    ]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("120000"),
+        "the kept link was committed as something other than a link:\n{committed}"
+    );
+}
+
+/// The same escape one component higher: the link is a *directory* on the
+/// path, not the leaf. jj materialises exactly this whenever a commit replaces
+/// a directory with a symlink -- one side has `conf` as a link, the other has
+/// `conf/x.txt` as a file -- and every read, unlink and write under `conf/`
+/// then lands wherever the link points. Keeping the link entry itself is what
+/// makes it deterministic; otherwise resetting it errors first.
+#[cfg(unix)]
+#[test]
+fn select_never_writes_through_a_symlinked_directory_on_the_path() {
+    let repo = TestRepo::new("select-link-dir");
+    let victim = std::env::temp_dir().join(format!(
+        "jj-hunk-test-victim-{}-{}",
+        std::process::id(),
+        "link-dir"
+    ));
+    let _ = std::fs::remove_dir_all(&victim);
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("x.txt"), "UNTOUCHED\n").unwrap();
+
+    repo.write_file("conf/x.txt", "SECRET\n");
+    repo.write_file("a.txt", "a1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_dir_all(repo.path().join("conf")).unwrap();
+    std::os::unix::fs::symlink(&victim, repo.path().join("conf")).unwrap();
+    repo.write_file("a.txt", "a1\na2\n");
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}, "conf": {"action": "keep"}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    let survived = std::fs::read_to_string(victim.join("x.txt")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&victim);
+    assert_eq!(
+        survived, "UNTOUCHED\n",
+        "select walked through a symlinked directory and rewrote a file outside the repo"
+    );
+}
+
+/// `jj file show` prints nothing for a symlink, so `list` describes a file that
+/// *became* a link as its old text being deleted, and prints a hunk id for it.
+/// Selecting that id has to keep the link -- refusing to write through it is
+/// not licence to quietly reset it instead.
+#[cfg(unix)]
+#[test]
+fn selecting_the_hunk_a_new_symlink_prints_keeps_the_link() {
+    let repo = TestRepo::new("select-link-becomes");
+    repo.write_file("a.txt", "AAA\n");
+    repo.write_file("f.txt", "FFF\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("f.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("f.txt")).unwrap();
+
+    let ids = listed_ids_in(&repo, ".", &[]);
+    let spec = format!(
+        r#"{{"files": {{"f.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["f.txt"][0]
+    );
+    repo.hunk_ok(&["split", &spec, "f.txt becomes a link"]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("f.txt") && committed.contains("120000"),
+        "the selected change was not committed as a link:\n{committed}"
+    );
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        "",
+        "the selected change was left behind in the working copy"
+    );
+}
+
+/// The same the other way round: a link replaced by a regular file. `list`
+/// describes it as an insertion, and selecting that hunk must write the file.
+#[cfg(unix)]
+#[test]
+fn selecting_the_hunk_that_replaces_a_symlink_writes_the_file() {
+    let repo = TestRepo::new("select-link-replaced");
+    repo.write_file("a.txt", "AAA\n");
+    std::os::unix::fs::symlink("a.txt", repo.path().join("g.txt")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("g.txt")).unwrap();
+    repo.write_file("g.txt", "GGG\n");
+
+    let ids = listed_ids_in(&repo, ".", &[]);
+    let spec = format!(
+        r#"{{"files": {{"g.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["g.txt"][0]
+    );
+    repo.hunk_ok(&["split", &spec, "g.txt becomes a file"]);
+
+    assert_eq!(
+        repo.file_at("@-", "g.txt"),
+        "GGG\n",
+        "the selected change did not reach the commit"
+    );
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        "",
+        "the selected change was left behind in the working copy"
+    );
+}
+
+/// jj materialises only the files that changed, so a link's target is usually
+/// absent on at least one side. Reading either side as text then fails -- and
+/// the failure aborts jj's whole edit over a file the spec asked to reset.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_in_a_selection_is_reset_rather_than_read() {
+    let repo = TestRepo::new("select-link-dangling");
+    repo.write_file("a.txt", "one\n");
+    std::os::unix::fs::symlink("absent-target.txt", repo.path().join("s")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("a.txt", "one\ntwo\n");
+    std::fs::remove_file(repo.path().join("s")).unwrap();
+    std::os::unix::fs::symlink("still-absent.txt", repo.path().join("s")).unwrap();
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"a.txt": {"hunks": [0]}, "s": {"ids": []}}, "default": "reset"}"#,
+        "only a.txt",
+    ]);
+
+    let summary = repo.changed_files("@-");
+    assert!(
+        summary.iter().any(|l| l.contains("a.txt")),
+        "the selected hunk is missing: {summary:?}"
+    );
+    assert!(
+        !summary.iter().any(|l| l.ends_with(" s")),
+        "the reset link rode along into the commit: {summary:?}"
+    );
+    let meta = std::fs::symlink_metadata(repo.path().join("s")).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "the working copy's link was replaced by a regular file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading the parent. `fs::read_to_string(..).unwrap_or_default()` turned any
+// read error into `""`, which is exactly what a newly added file reads as. A
+// parent that is not valid UTF-8 therefore looked like "no earlier content",
+// and `select` committed a zero-byte file over it at exit 0.
+// ---------------------------------------------------------------------------
+
+/// `{"ids": []}` is the documented "keep nothing from this file" spelling. It
+/// needs no bytes from either side to carry out, so it must work on a file no
+/// hunk selection could ever describe.
+#[test]
+fn an_empty_selection_restores_a_parent_that_is_not_valid_utf8() {
+    let repo = TestRepo::new("select-nonutf8-parent");
+    let original = vec![0x66u8, 0x6f, 0x6f, 0xff, 0xfe, 0x0a];
+    std::fs::write(repo.path().join("bin.dat"), &original).unwrap();
+    repo.write_file("t.txt", "a\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    // The working copy is valid text, so only the *parent* is unreadable.
+    repo.write_file("bin.dat", "now plain text\n");
+    repo.write_file("t.txt", "a\nb\n");
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"t.txt": {"hunks": [0]}, "bin.dat": {"ids": []}}, "default": "reset"}"#,
+        "only t.txt",
+    ]);
+
+    let summary = repo.changed_files("@-");
+    assert!(
+        !summary.iter().any(|l| l.contains("bin.dat")),
+        "a file the spec kept nothing from was rewritten into the commit: {summary:?}"
+    );
+    assert_eq!(
+        file_bytes_at(&repo, "@-", "bin.dat"),
+        original,
+        "the parent's bytes were destroyed"
+    );
+    assert_eq!(
+        file_bytes_at(&repo, "@", "bin.dat"),
+        b"now plain text\n".to_vec(),
+        "the working copy's change was not left behind"
+    );
+}
+
+/// The mirror image: the *right* side is the unreadable one. Erroring there
+/// aborted jj's whole edit over a file the spec had asked to reset.
+#[test]
+fn an_empty_selection_resets_a_working_copy_that_is_not_valid_utf8() {
+    let repo = TestRepo::new("select-nonutf8-child");
+    repo.write_file("bin.dat", "plain\n");
+    repo.write_file("t.txt", "a\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    let garbled = vec![0x00u8, 0x01, 0xff, 0xfe];
+    std::fs::write(repo.path().join("bin.dat"), &garbled).unwrap();
+    repo.write_file("t.txt", "a\nb\n");
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"t.txt": {"hunks": [0]}, "bin.dat": {"ids": []}}, "default": "reset"}"#,
+        "only t.txt",
+    ]);
+
+    let summary = repo.changed_files("@-");
+    assert!(
+        !summary.iter().any(|l| l.contains("bin.dat")),
+        "the reset binary rode along into the commit: {summary:?}"
+    );
+    assert_eq!(
+        file_bytes_at(&repo, "@", "bin.dat"),
+        garbled,
+        "the working copy's binary change was not left behind"
+    );
+}
+
+/// A selection that really does name hunks in a file whose parent cannot be
+/// read is a mistake, and it has to say so. Silently reading the parent as
+/// empty made the whole file look newly added.
+#[test]
+fn a_selection_against_an_unreadable_parent_names_the_file() {
+    let repo = TestRepo::new("select-nonutf8-named");
+    std::fs::write(repo.path().join("bin.dat"), [0x66u8, 0xff, 0xfe, 0x0a]).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("bin.dat", "now plain text\n");
+
+    let ids = listed_ids_in(&repo, ".", &["--binary", "include"]);
+    let id = ids["bin.dat"][0].clone();
+    let spec = format!(r#"{{"files": {{"bin.dat": {{"ids": ["{id}"]}}}}}}"#);
+
+    let err = repo.hunk_fail(&["split", &spec, "msg", "--allow-empty"]);
+    assert!(
+        err.contains("bin.dat"),
+        "the failure must name the offending file: {err}"
+    );
+    let log = repo.log_descriptions();
+    assert!(
+        !log.iter().any(|d| d == "msg"),
+        "nothing should have been committed: {log:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Path frames. jj materialises the diff directories with repo-relative paths,
+// but every path jj *prints* -- and so every spec key, and the string every
+// hunk id is hashed with -- is relative to the cwd. From a subdirectory the two
+// disagree, and `select` matched nothing: an empty commit at exit 0.
+// ---------------------------------------------------------------------------
+
+/// Two edited files under `pkg/`, to be split from inside `pkg/`.
+fn subdir_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("pkg/a.txt", "a1\n");
+    repo.write_file("pkg/b.txt", "b1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("pkg/a.txt", "a1\na2\n");
+    repo.write_file("pkg/b.txt", "b1\nb2\n");
+    repo
+}
+
+#[test]
+fn a_split_from_a_subdirectory_commits_the_file_the_listing_named() {
+    let repo = subdir_repo("subdir-split");
+
+    hunk_in_ok(&repo, "pkg", &["split", r#"file("a.txt")"#, "only-a"]);
+
+    let committed = repo.changed_files("@-");
+    assert_eq!(
+        committed,
+        vec!["M pkg/a.txt".to_string()],
+        "the selection did not reach the file it named: {committed:?}"
+    );
+    let remaining = repo.changed_files("@");
+    assert_eq!(
+        remaining,
+        vec!["M pkg/b.txt".to_string()],
+        "the unselected file did not stay behind: {remaining:?}"
+    );
+}
+
+/// The spec keys a user copies out of `list` are the ones that have to work.
+#[test]
+fn a_hand_written_spec_from_a_subdirectory_uses_the_printed_keys() {
+    let repo = subdir_repo("subdir-keys");
+    let ids = listed_ids_in(&repo, "pkg", &[]);
+    assert!(
+        ids.contains_key("a.txt"),
+        "precondition: `list` from pkg/ prints cwd-relative keys: {ids:?}"
+    );
+    let spec = format!(
+        r#"{{"files": {{"a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["a.txt"][0]
+    );
+
+    hunk_in_ok(&repo, "pkg", &["split", &spec, "only-a"]);
+
+    assert_eq!(repo.changed_files("@-"), vec!["M pkg/a.txt".to_string()]);
+}
+
+/// Two levels down, and a file *above* the cwd. jj spells that one `../a.txt`,
+/// and so must everything that reads or writes it.
+#[test]
+fn a_split_two_directories_down_reaches_files_above_the_cwd() {
+    let repo = TestRepo::new("subdir-nested");
+    repo.write_file("pkg/deep/d.txt", "d1\n");
+    repo.write_file("pkg/a.txt", "a1\n");
+    repo.write_file("root.txt", "r1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("pkg/deep/d.txt", "d1\nd2\n");
+    repo.write_file("pkg/a.txt", "a1\na2\n");
+    repo.write_file("root.txt", "r1\nr2\n");
+
+    let ids = listed_ids_in(&repo, "pkg/deep", &[]);
+    assert!(
+        ids.contains_key("d.txt") && ids.contains_key("../a.txt"),
+        "precondition: jj prints paths relative to the cwd: {ids:?}"
+    );
+
+    let spec = format!(
+        r#"{{"files": {{"d.txt": {{"ids": ["{}"]}}, "../a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["d.txt"][0], ids["../a.txt"][0]
+    );
+    hunk_in_ok(&repo, "pkg/deep", &["split", &spec, "two of three"]);
+
+    let mut committed = repo.changed_files("@-");
+    committed.sort();
+    assert_eq!(
+        committed,
+        vec!["M pkg/a.txt".to_string(), "M pkg/deep/d.txt".to_string()],
+        "the nested selection landed somewhere else: {committed:?}"
+    );
+    assert_eq!(repo.changed_files("@"), vec!["M root.txt".to_string()]);
+}
+
+/// The other half of agreeing on one frame: the spelling that does *not* work
+/// has to be refused rather than silently selecting nothing.
+#[test]
+fn a_repo_relative_key_from_a_subdirectory_is_refused() {
+    let repo = subdir_repo("subdir-wrong-frame");
+    let ids = listed_ids_in(&repo, "pkg", &[]);
+    let spec = format!(
+        r#"{{"files": {{"pkg/a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["a.txt"][0]
+    );
+
+    let err = hunk_in_fail(&repo, "pkg", &["split", &spec, "wrong frame"]);
+    assert!(
+        err.contains("pkg/a.txt"),
+        "the refusal must name the key that did not resolve: {err}"
+    );
+    let log = repo.log_descriptions();
+    assert!(
+        !log.iter().any(|d| d == "wrong frame"),
+        "an empty commit was made anyway: {log:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The executable bit is not a hunk, so it cannot be selected on its own. It
+// follows the content: kept with the hunks that were kept, reset with them
+// when nothing was.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_chmod_rides_along_with_the_hunks_it_accompanies() {
+    let repo = TestRepo::new("exec-rides-along");
+    repo.write_file("s.sh", "S1\nS2\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("s.sh", "S1\nS2\nS3\n");
+    chmod_exec(&repo.path().join("s.sh"));
+
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"s.sh": {"hunks": [0]}}, "default": "reset"}"#,
+        "content and mode",
+    ]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("+S3"),
+        "the selected content hunk is missing:\n{committed}"
+    );
+    assert!(
+        committed.contains("new mode 100755"),
+        "the chmod was stripped from the hunks it came with:\n{committed}"
+    );
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        "",
+        "something was left behind in the working copy"
+    );
+}
+
+/// Selecting only part of a file still keeps that file's change, so the mode
+/// goes with it. There is nowhere else for it to go: the remainder is what is
+/// left over, and a mode has no halves.
+#[cfg(unix)]
+#[test]
+fn a_chmod_rides_along_when_only_some_hunks_are_selected() {
+    let repo = TestRepo::new("exec-rides-partial");
+    repo.write_file("s.sh", "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("s.sh", "TOP\nL1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nBOTTOM\n");
+    chmod_exec(&repo.path().join("s.sh"));
+
+    let listing: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--format", "json"])).unwrap();
+    let hunks = listing["files"][0]["hunks"].as_array().unwrap();
+    assert_eq!(hunks.len(), 2, "precondition: two separate hunks");
+    let first = hunks[0]["id"].as_str().unwrap();
+
+    let spec = format!(r#"{{"files": {{"s.sh": {{"ids": ["{first}"]}}}}, "default": "reset"}}"#);
+    repo.hunk_ok(&["split", &spec, "top only"]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("+TOP") && !committed.contains("+BOTTOM"),
+        "the wrong hunk was selected:\n{committed}"
+    );
+    assert!(
+        committed.contains("new mode 100755"),
+        "the chmod was stripped from a partially selected file:\n{committed}"
+    );
+}
+
+/// `diffedit` rewrites a revision in place, so a mode dropped here is dropped
+/// from history: there is no remainder commit left holding it.
+#[cfg(unix)]
+#[test]
+fn diffedit_keeping_every_hunk_keeps_the_exec_bit() {
+    let repo = TestRepo::new("exec-diffedit");
+    repo.write_file("s.sh", "S1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("s.sh", "S1\nS2\n");
+    chmod_exec(&repo.path().join("s.sh"));
+    repo.jj_ok(&["commit", "-m", "edit"]);
+
+    let before = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        before.contains("new mode 100755"),
+        "precondition: the revision carries the chmod:\n{before}"
+    );
+
+    let ids = listed_ids_in(&repo, ".", &["-r", "@-"]);
+    let spec = format!(
+        r#"{{"files": {{"s.sh": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["s.sh"][0]
+    );
+    repo.hunk_ok(&["diffedit", "-r", "@-", &spec]);
+
+    let after = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(after.contains("+S2"), "the kept hunk was dropped:\n{after}");
+    assert!(
+        after.contains("new mode 100755"),
+        "keeping every hunk still discarded the chmod from history:\n{after}"
     );
 }
