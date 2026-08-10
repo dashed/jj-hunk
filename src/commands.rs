@@ -369,13 +369,7 @@ where
                 .with_context(|| format!("cannot resolve the selection for {}", fh.path))?;
         }
 
-        // A file with no hunks is still a real change if it is binary or if
-        // only its mode moved; dropping those made them invisible.
-        if hunks.is_empty() && !fh.is_binary && fh.mode.is_none() {
-            continue;
-        }
-
-        files.push(FileEntry {
+        let entry = FileEntry {
             path: fh.path,
             status: fh.status,
             rename: fh.rename,
@@ -383,7 +377,17 @@ where
             binary: if fh.is_binary { Some(true) } else { None },
             mode: fh.mode,
             truncated: if fh.truncated { Some(true) } else { None },
-        });
+        };
+
+        // An empty hunk list is only nothing to show when a selection filtered
+        // the hunks away. Everything else here came from `jj diff`, so it is a
+        // change by definition, and dropping the ones no hunk can express made
+        // them invisible to `list` and to `--spec-template` both.
+        if entry.hunks.is_empty() && !entry.changes_without_hunks() {
+            continue;
+        }
+
+        files.push(entry);
     }
 
     match options.mode {
@@ -1205,6 +1209,26 @@ fn rename_source(rename: &Option<RenameInfo>, path: &str) -> Option<String> {
         .map(|r| r.from.clone())
 }
 
+impl FileEntry {
+    /// Whether this file carries a change that no hunk can express, so an
+    /// empty hunk list does not mean "nothing happened here".
+    ///
+    /// Four shapes reach this: binary contents (never split hunk-wise), a
+    /// mode-only flip (jj's exec bit is not part of any hunk), a rename or copy
+    /// of a file whose text did not move (both sides diff identical), and an
+    /// empty file added or removed (nothing on either side to diff). All four
+    /// have to stay visible in `list` and be named by `--spec-template`,
+    /// because a file the template does not name takes `default: reset` --
+    /// which for a rename restores the old path and deletes the new one, and
+    /// for an added empty file deletes it outright.
+    fn changes_without_hunks(&self) -> bool {
+        self.binary == Some(true)
+            || self.mode.is_some()
+            || rename_source(&self.rename, &self.path).is_some()
+            || matches!(self.status.as_str(), "added" | "removed")
+    }
+}
+
 fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
     // A hunk id is a hash of the text it was diffed from, so ids taken from a
     // file that was cut short do not exist in the real diff. Emitting them
@@ -1230,12 +1254,19 @@ fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
     for file in files {
         let from = rename_source(&file.rename, &file.path);
 
-        // A binary file is kept or reset whole, never hunk-wise -- `select`
-        // rebuilds a file from text, and a non-UTF-8 file cannot survive that
-        // round trip. Under `--binary include` it does carry hunks, but they
-        // are for reading, not for selecting, so the template keeps naming the
-        // action rather than ids it could not honour.
-        if file.binary == Some(true) {
+        // Whole-file entries, for the two kinds of file that cannot be named
+        // hunk by hand:
+        //
+        // - Binary. `select` rebuilds a file from text and a non-UTF-8 file
+        //   cannot survive that round trip. Under `--binary include` it does
+        //   carry hunks, but they are for reading, not for selecting, so the
+        //   template names the action rather than ids it could not honour.
+        // - A change with no hunks at all (see `changes_without_hunks`).
+        //   Skipping these emitted a template that did not mention the file,
+        //   and `select` resets every file the spec leaves unnamed -- so the
+        //   documented `--spec-template` -> `split` round trip silently undid
+        //   the very rename it had just been asked to carry.
+        if file.binary == Some(true) || file.hunks.is_empty() {
             output.insert(
                 file.path,
                 SpecTemplateEntry::Action {
@@ -1243,10 +1274,6 @@ fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
                     from,
                 },
             );
-            continue;
-        }
-
-        if file.hunks.is_empty() {
             continue;
         }
 
@@ -1940,33 +1967,68 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
     Ok(spec.to_string())
 }
 
-/// Check that a spec actually resolves against the diff it will be applied to.
+/// Check that a spec actually refers to the diff it will be applied to.
 ///
 /// `Spec::selects_nothing` is structural: a non-empty id list satisfies it even
 /// when no such hunk exists. So a typo'd path or a stale id passed the guard,
 /// selected nothing, and produced an empty commit at exit 0 -- the exact
 /// failure that guard was added to prevent.
 ///
-/// An entry that deliberately keeps nothing (`"ids": []`) is not an error:
-/// blanking out the ids you do not want is the documented workflow, and the
-/// structural check above already catches a spec where *every* entry is empty.
+/// This is about *reference*, not about emptiness, which is why `--allow-empty`
+/// does not gate it. An entry that deliberately keeps nothing (`"ids": []`) on
+/// a path that is in the diff refers to something real and is fine; a name that
+/// matches nothing in the diff is a different thing entirely.
+///
+/// Two kinds of mismatch, treated differently:
+///
+/// - A bad id, a bad index, or a key that is only the left-hand side of a
+///   rename: the file is right there, so the entry meant a specific thing and
+///   got it wrong. Always reported.
+/// - A path the diff does not contain at all: reported only when the spec names
+///   nothing that IS in the diff. A checked-in or script-generated spec lists a
+///   stable allowlist, and most of it is legitimately absent from any one diff;
+///   but a spec none of whose paths appear was written against some other diff,
+///   and would quietly select nothing.
 fn validate_spec_resolves(
     spec: &Spec,
     file_hunks: &[FileHunks],
     target: &DiffTarget,
 ) -> Result<()> {
-    let mut known: HashMap<&str, &FileHunks> = HashMap::new();
+    // Keyed by primary path only. Aliasing a rename's left-hand path to the
+    // same entry made a spec keyed by the old path validate and then do the
+    // opposite of what it said: `fill_rename_sources` and `select` both look
+    // the entry up under the NEW path, so nothing was filled in, the deletion
+    // branch ran, and the rename was reverted. For a copy the old path is a
+    // diff entry in its own right, so the alias could also shadow a real file
+    // -- whichever jj happened to list second won.
+    let known: HashMap<&str, &FileHunks> = file_hunks
+        .iter()
+        .map(|fh| (fh.path.as_str(), fh))
+        .collect();
+
+    // Paths that exist on the left of this diff only as the source of a rename
+    // or copy, mapped to the path the spec has to name instead.
+    let mut renamed_from: HashMap<&str, &str> = HashMap::new();
     for fh in file_hunks {
-        for path in fh.all_paths() {
-            known.insert(path, fh);
+        if let Some(rename) = fh.rename.as_ref().filter(|r| r.from != fh.path) {
+            renamed_from
+                .entry(rename.from.as_str())
+                .or_insert(fh.path.as_str());
         }
     }
 
     let mut problems: Vec<String> = Vec::new();
+    // Held back until the whole spec has been walked: whether an absent path
+    // matters depends on what the rest of the spec turned out to name.
+    let mut unresolved: Vec<String> = Vec::new();
+    // Whether any entry that means to keep something names a path this diff
+    // actually contains.
+    let mut keeps_a_real_path = false;
 
     for (path, file_spec) in &spec.files {
-        // An entry that keeps nothing by construction cannot produce the empty
-        // commit this guards against, so an unknown path there is harmless.
+        // An entry that keeps nothing by construction -- `{"action": "reset"}`,
+        // or a blanked-out `"ids": []` -- cannot produce the empty commit this
+        // guards against, so an unknown path there is harmless either way.
         let intends_to_keep = match file_spec {
             FileSpec::Action { action, .. } => *action == Action::Keep,
             FileSpec::Selection(selection) => {
@@ -1975,11 +2037,23 @@ fn validate_spec_resolves(
         };
 
         let Some(fh) = known.get(path.as_str()) else {
-            if intends_to_keep {
-                problems.push(format!("{path}: no such path in the diff"));
+            match renamed_from.get(path.as_str()) {
+                // Whatever this entry meant, `select` cannot carry it out under
+                // this key: it matches nothing on the right, and resetting it
+                // would resurrect the file the rename moved away. The hunk ids
+                // are printed under the new path, so that is the key to use.
+                Some(new_path) => problems.push(format!(
+                    "{path}: renamed to {new_path} in this diff -- \
+                     file the entry under {new_path} instead"
+                )),
+                None if intends_to_keep => {
+                    unresolved.push(format!("{path}: no such path in the diff"))
+                }
+                None => {}
             }
             continue;
         };
+        keeps_a_real_path |= intends_to_keep;
 
         let FileSpec::Selection(selection) = file_spec else {
             continue;
@@ -2021,17 +2095,31 @@ fn validate_spec_resolves(
         }
     }
 
+    // An allowlist that names a stable set of paths is a legitimate reusable
+    // spec, and most of it is legitimately absent from any one diff -- so an
+    // absent path is only worth reporting when nothing else in the spec keeps
+    // anything real. A spec in that state selects nothing at all, which is the
+    // silent empty commit this whole check exists to catch; a spec that keeps
+    // something has simply outlived a few of its entries.
+    if !keeps_a_real_path && spec.default != DefaultAction::Keep {
+        problems.append(&mut unresolved);
+    }
+
     if !problems.is_empty() {
         problems.sort();
         // The listing is named after the target rather than hardcoded, because
         // `restore` edits the diff the other way round: an id copied from
         // `list -r REV` cannot resolve there, and a fixed hint would send the
         // reader straight back to the listing that produced the bad id.
+        //
+        // `--allow-empty` is deliberately not offered as a way out: it says an
+        // empty result is acceptable, not that the names in the spec need not
+        // exist, and suggesting it here is what taught people to silence this
+        // check instead of fixing the spec.
         anyhow::bail!(
             "spec does not resolve against the diff:\n  {}\n\
              Those entries do not name exactly what they meant to. Check them \
-             against `{} --spec-template`, or pass --allow-empty if \
-             that is intended.",
+             against `{} --spec-template`.",
             problems.join("\n  "),
             target.listing_command()
         );
@@ -2127,9 +2215,14 @@ fn run_jj_with_selection_on(
             // `Mark`, not `Skip`: a binary file has no hunks but is still a
             // legitimate spec target via `{"action": "keep"}`.
             let file_hunks = load_file_hunks(target, BinaryMode::Mark, Truncation::NONE)?;
-            if !allow_empty {
-                validate_spec_resolves(&parsed, &file_hunks, target)?;
-            }
+            // Not gated on `allow_empty`. That flag says an empty *result* is
+            // acceptable; it never meant "do not check whether what I wrote
+            // refers to anything". Gating this too meant that passing it once
+            // -- because one entry was legitimately blanked out -- switched off
+            // typo detection for every other entry in the same spec, and a
+            // mistyped path or stale id then produced an empty commit at exit
+            // 0, which is precisely what this check exists to make loud.
+            validate_spec_resolves(&parsed, &file_hunks, target)?;
             if fill_rename_sources(&mut parsed, &file_hunks) {
                 spec_content = serde_json::to_string(&parsed)
                     .context("failed to re-serialize spec with rename sources")?;

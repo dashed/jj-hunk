@@ -1980,19 +1980,25 @@ fn unknown_hunk_id_in_a_spec_is_rejected() {
 }
 
 #[test]
-fn allow_empty_still_bypasses_the_resolution_check() {
+fn allow_empty_does_not_switch_off_the_resolution_check() {
+    // The flag used to gate this check as well, so a spec that referred to
+    // nothing at all still produced a commit at exit 0 -- the very outcome the
+    // check exists to make loud. `--allow-empty` says an empty RESULT is
+    // acceptable; it does not say the names in the spec need not exist.
     let repo = strict_repo("resolve-allow-empty");
-    repo.hunk_ok(&[
+    let err = repo.hunk_fail(&[
         "split",
         "--allow-empty",
         r#"{"files": {"nope.txt": {"action": "keep"}}, "default": "reset"}"#,
         "intentionally empty",
     ]);
+    assert!(err.contains("nope.txt"), "the error must name the path: {err}");
     assert!(
-        repo.log_descriptions()
+        !repo
+            .log_descriptions()
             .iter()
             .any(|d| d.contains("intentionally empty")),
-        "--allow-empty must remain the escape hatch"
+        "--allow-empty let a spec that refers to nothing create a commit"
     );
 }
 
@@ -3715,5 +3721,517 @@ fn absorb_says_what_it_could_not_route_when_there_is_nothing_else() {
     assert!(
         err.contains("blob.dat is binary"),
         "the refusal must not read as 'nothing is there': {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A change that produces no hunks is still a change.
+//
+// A pure rename, a pure copy and a mode-only flip all diff to zero hunks. The
+// guard in `list` kept binary and mode-only files but dropped the rest, and
+// `--spec-template` dropped every one of them -- and an unnamed file takes
+// `default: reset`, which restores the old name and deletes the new one. The
+// rename was thrown away at exit 0, having never been shown to anyone.
+// ---------------------------------------------------------------------------
+
+/// A working copy that renames `src.txt` to `dst.txt` without touching a byte
+/// of it, alongside an ordinary edit so the diff is not empty on its own.
+fn pure_rename_repo(name: &str) -> TestRepo {
+    const BASE: &str = "aaaaaaaaaaaa\nbbbbbbbbbbbb\ncccccccccccc\ndddddddddddd\neeeeeeeeeeee\n";
+
+    let repo = TestRepo::new(name);
+    repo.write_file("src.txt", BASE);
+    repo.write_file("other.txt", "other-line-1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::rename(repo.path().join("src.txt"), repo.path().join("dst.txt")).unwrap();
+    repo.write_file("other.txt", "other-line-1\nother-line-2\n");
+
+    // Guard against a vacuous test: add+delete exercises none of this.
+    let summary = repo.changed_files("@");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with('R') && l.contains("src.txt") && l.contains("dst.txt")),
+        "jj did not detect a pure rename, the test would be vacuous: {summary:?}"
+    );
+    repo
+}
+
+#[test]
+fn a_pure_rename_is_visible_in_list() {
+    let repo = pure_rename_repo("pure-rename-list");
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("dst.txt"),
+        "a rename with no content edit was invisible in `list`:\n{text}"
+    );
+    assert!(
+        text.contains("src.txt"),
+        "`list` should say where the file came from:\n{text}"
+    );
+}
+
+#[test]
+fn a_pure_rename_survives_the_spec_template_workflow() {
+    // The documented flow, and the one that lost the rename: template out,
+    // feed it straight back in.
+    let repo = pure_rename_repo("pure-rename-template");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("dst.txt"),
+        "--spec-template emitted no entry for a pure rename:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "everything the template names"]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed
+            .iter()
+            .any(|l| l.starts_with('R') && l.contains("src.txt") && l.contains("dst.txt")),
+        "the rename did not survive the template round trip: {committed:?}"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template should have moved the whole diff: {:?}",
+        repo.changed_files("@")
+    );
+}
+
+#[test]
+fn a_pure_rename_is_not_discarded_by_diffedit() {
+    // The destructive shape. `diffedit` applies `default: reset` in place, so
+    // an invisible rename was undone outright rather than left behind in a
+    // second commit.
+    let repo = pure_rename_repo("pure-rename-diffedit");
+    repo.jj_ok(&["commit", "-m", "rename plus edit"]);
+
+    let template = repo.hunk_ok(&["list", "-r", "@-", "--spec-template"]);
+    repo.hunk_ok(&["diffedit", &template, "-r", "@-"]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed
+            .iter()
+            .any(|l| l.starts_with('R') && l.contains("src.txt") && l.contains("dst.txt")),
+        "diffedit destroyed a rename its own template did not name: {committed:?}"
+    );
+}
+
+#[test]
+fn a_pure_rename_can_be_kept_by_a_hand_written_action_entry() {
+    // A hand-written spec names the file and nothing else; the rename source
+    // has to be filled in from the diff before `select` sees it.
+    let repo = pure_rename_repo("pure-rename-action");
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"dst.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "just the rename",
+    ]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed
+            .iter()
+            .any(|l| l.starts_with('R') && l.contains("src.txt") && l.contains("dst.txt")),
+        "an explicitly kept rename did not land in the commit: {committed:?}"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("other.txt")),
+        "the unselected edit rode along: {committed:?}"
+    );
+}
+
+/// jj only reports a copy when the source is still present on the right, so
+/// the source is edited too. That also makes `src.txt` both a copy source and
+/// a diff entry in its own right.
+fn copy_repo(name: &str) -> TestRepo {
+    const BASE: &str = "aaaaaaaaaaaa\nbbbbbbbbbbbb\ncccccccccccc\ndddddddddddd\neeeeeeeeeeee\n";
+    const EDITED: &str = "aaaaaaaaaaaa\nbbbbbbbbbbbb\nSRC-CHANGED\ndddddddddddd\neeeeeeeeeeee\n";
+
+    let repo = TestRepo::new(name);
+    repo.write_file("src.txt", BASE);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("copy.txt", BASE);
+    repo.write_file("src.txt", EDITED);
+
+    let summary = repo.changed_files("@");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with('C') && l.contains("src.txt") && l.contains("copy.txt")),
+        "jj did not detect a copy, the test would be vacuous: {summary:?}"
+    );
+    repo
+}
+
+#[test]
+fn a_pure_copy_is_visible_and_survives_the_spec_template_workflow() {
+    // The copy of an unedited file has no hunks of its own, exactly like a
+    // pure rename.
+    let repo = copy_repo("pure-copy-template");
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("copy.txt"),
+        "a copy with no content edit was invisible in `list`:\n{text}"
+    );
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("copy.txt"),
+        "--spec-template emitted no entry for a pure copy:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "copy and edit"]);
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("copy.txt")),
+        "the copy did not survive the template round trip: {committed:?}"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template should have moved the whole diff: {:?}",
+        repo.changed_files("@")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rename_with_a_mode_change_survives_the_spec_template_workflow() {
+    let repo = pure_rename_repo("rename-plus-mode");
+    let path = repo.path().join("dst.txt");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("dst.txt"),
+        "--spec-template dropped a rename that also changed mode:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "rename and chmod"]);
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("dst.txt") && committed.contains("100755"),
+        "the rename and its mode change did not both land:\n{committed}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mode_only_change_reaches_the_spec_template() {
+    // `list` already showed this one; the template did not, so the documented
+    // round trip reset the mode back at exit 0.
+    let repo = TestRepo::new("mode-only-template");
+    repo.write_file("only.sh", "x\n");
+    repo.write_file("other.txt", "o1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    let path = repo.path().join("only.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&path, perms).unwrap();
+    repo.write_file("other.txt", "o1\no2\n");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("only.sh"),
+        "--spec-template emitted no entry for a mode-only change:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "mode and edit"]);
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("100755"),
+        "the mode change did not survive the template round trip:\n{committed}"
+    );
+}
+
+#[test]
+fn an_added_empty_file_is_visible_and_survives_the_spec_template_workflow() {
+    // The fourth hunkless shape: an empty file has nothing on either side to
+    // diff. `diffedit` fed its own template deleted the file outright.
+    let repo = TestRepo::new("empty-file-template");
+    repo.write_file("other.txt", "o1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("added-empty.txt", "");
+    repo.write_file("other.txt", "o1\no2\n");
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("added-empty.txt"),
+        "an added empty file was invisible in `list`:\n{text}"
+    );
+
+    repo.jj_ok(&["commit", "-m", "add empty file plus edit"]);
+    let template = repo.hunk_ok(&["list", "-r", "@-", "--spec-template"]);
+    assert!(
+        template.contains("added-empty.txt"),
+        "--spec-template emitted no entry for an added empty file:\n{template}"
+    );
+
+    repo.hunk_ok(&["diffedit", &template, "-r", "@-"]);
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("added-empty.txt")),
+        "diffedit deleted an empty file its own template did not name: {committed:?}"
+    );
+}
+
+#[test]
+fn a_removed_empty_file_is_visible_and_survives_the_spec_template_workflow() {
+    // The mirror: deleting a file that was empty produces no hunks either, so
+    // the deletion was silently undone.
+    let repo = TestRepo::new("empty-file-removed-template");
+    repo.write_file("was-empty.txt", "");
+    repo.write_file("other.txt", "o1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("was-empty.txt")).unwrap();
+    repo.write_file("other.txt", "o1\no2\n");
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("was-empty.txt"),
+        "a removed empty file was invisible in `list`:\n{text}"
+    );
+
+    repo.jj_ok(&["commit", "-m", "remove empty file plus edit"]);
+    let template = repo.hunk_ok(&["list", "-r", "@-", "--spec-template"]);
+    repo.hunk_ok(&["diffedit", &template, "-r", "@-"]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("was-empty.txt")),
+        "diffedit resurrected a deleted empty file: {committed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A spec keyed by a rename's OLD path.
+//
+// `validate_spec_resolves` indexed every entry of `all_paths()`, so the old
+// path validated -- and then `fill_rename_sources` and `select` both look the
+// entry up under the NEW path, found nothing, and reverted the rename. The
+// tool said "this resolves" and then undid the change, at exit 0.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_spec_keyed_by_a_renames_old_path_is_rejected() {
+    let (repo, _) = rename_repo("rename-old-path-key");
+    let id = first_hunk_id(&repo, "dst.txt");
+    let spec = format!(r#"{{"files": {{"src.txt": {{"ids": ["{id}"]}}}}, "default": "reset"}}"#);
+
+    let err = repo.hunk_fail(&["split", &spec, "keyed by the old path"]);
+    assert!(
+        err.contains("dst.txt"),
+        "the error must name the path to use instead: {err}"
+    );
+    assert!(
+        !repo
+            .log_descriptions()
+            .iter()
+            .any(|d| d.contains("keyed by the old path")),
+        "a commit was created from a spec keyed by the old path"
+    );
+    assert!(
+        repo.changed_files("@")
+            .iter()
+            .any(|l| l.contains("src.txt") && l.contains("dst.txt")),
+        "the rename must be left exactly as it was"
+    );
+}
+
+#[test]
+fn a_spec_keyed_by_a_copys_source_still_validates_against_that_source() {
+    // The old path of a COPY is a real diff entry of its own. Aliasing it to
+    // the copy meant a spec naming the source's own hunk could be validated
+    // against the copy's hunks instead -- and which one won depended on the
+    // order jj happened to list them in.
+    let repo = copy_repo("copy-source-key");
+    let id = first_hunk_id(&repo, "src.txt");
+    let spec = format!(r#"{{"files": {{"src.txt": {{"ids": ["{id}"]}}}}, "default": "reset"}}"#);
+
+    repo.hunk_ok(&["split", &spec, "only the source edit"]);
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("src.txt")),
+        "the source's own edit was not committed: {committed:?}"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("copy.txt")),
+        "the unselected copy rode along: {committed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--allow-empty` means "an empty RESULT is acceptable", not "skip checking
+// whether what I wrote refers to anything". It used to gate the whole
+// resolution check, so passing it once for a legitimately blanked entry threw
+// away typo detection for every other entry in the same spec.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allow_empty_still_rejects_a_stale_hunk_id() {
+    let repo = strict_repo("allow-empty-stale-id");
+    let bogus = format!("hunk-{}", "a".repeat(64));
+    let spec = format!(r#"{{"files": {{"a.py": {{"ids": ["{bogus}"]}}}}, "default": "reset"}}"#);
+
+    let err = repo.hunk_fail(&["split", "--allow-empty", &spec, "stale id"]);
+    assert!(err.contains(&bogus), "the error must name the bad id: {err}");
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("stale id")),
+        "--allow-empty let a stale id through as an empty commit"
+    );
+}
+
+#[test]
+fn allow_empty_still_rejects_a_typo_beside_a_good_entry() {
+    // The concrete harm: one entry is legitimately blank, so the user passes
+    // --allow-empty, and the stale id in the entry next to it goes unreported.
+    let repo = strict_repo("allow-empty-mixed");
+    let py = first_hunk_id(&repo, "a.py");
+    let bogus = format!("hunk-{}", "b".repeat(64));
+    let spec = format!(
+        r#"{{"files": {{"a.py": {{"ids": ["{py}"]}}, "a.rs": {{"ids": ["{bogus}"]}}}}, "default": "reset"}}"#
+    );
+
+    let err = repo.hunk_fail(&["split", "--allow-empty", &spec, "mixed spec"]);
+    assert!(
+        err.contains(&bogus),
+        "the stale id beside a good entry must still be reported: {err}"
+    );
+}
+
+#[test]
+fn allow_empty_still_accepts_a_deliberately_blank_selection() {
+    // The flag's real purpose: every entry names a path that is in the diff
+    // and deliberately keeps none of it.
+    let repo = strict_repo("allow-empty-blank");
+    repo.hunk_ok(&[
+        "split",
+        "--allow-empty",
+        r#"{"files": {"a.py": {"ids": []}, "a.rs": {"ids": []}}, "default": "reset"}"#,
+        "deliberately empty",
+    ]);
+    assert!(
+        repo.log_descriptions()
+            .iter()
+            .any(|d| d.contains("deliberately empty")),
+        "--allow-empty must still allow an empty result"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A reusable spec names a stable allowlist of paths, most of which are absent
+// from any one diff. Rejecting every absent path made that shape unusable;
+// accepting all of them brings back the silent empty commit. The rule: an
+// absent path is reported only when the spec names nothing that IS in the
+// diff.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_spec_may_name_paths_this_diff_does_not_contain() {
+    let repo = strict_repo("allowlist-partly-stale");
+    repo.hunk_ok(&[
+        "commit",
+        r#"{"files": {"a.py": {"action": "keep"}, "untouched.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "allowlist",
+    ]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("a.py")),
+        "the one path that is in the diff was not committed: {committed:?}"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("a.rs")),
+        "an unlisted path rode along: {committed:?}"
+    );
+}
+
+#[test]
+fn several_unchanged_paths_beside_one_changed_one_are_accepted() {
+    let repo = strict_repo("allowlist-many-stale");
+    let py = first_hunk_id(&repo, "a.py");
+    let spec = format!(
+        r#"{{"files": {{"gone1.txt": {{"action": "keep"}}, "gone2.txt": {{"action": "keep"}}, "gone3.txt": {{"ids": []}}, "a.py": {{"ids": ["{py}"]}}}}, "default": "reset"}}"#
+    );
+    repo.hunk_ok(&["split", &spec, "long allowlist"]);
+    assert!(
+        repo.log_descriptions()
+            .iter()
+            .any(|d| d.contains("long allowlist")),
+        "a mostly-stale allowlist with one live entry must be accepted"
+    );
+}
+
+#[test]
+fn a_reset_allowlist_under_default_keep_may_name_unchanged_paths() {
+    // The mirror shape of the allowlist: "keep everything except these". It
+    // can never produce an empty result, so an entry naming a file this diff
+    // does not touch is a no-op, not a mistake worth aborting over.
+    let repo = strict_repo("denylist-default-keep");
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"secrets.env": {"action": "reset"}, "a.rs": {"action": "reset"}}, "default": "keep"}"#,
+        "everything but a.rs",
+    ]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("a.py")),
+        "the kept path is missing: {committed:?}"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("a.rs")),
+        "the reset path rode along: {committed:?}"
+    );
+}
+
+#[test]
+fn an_absent_keep_path_is_reported_when_the_only_live_entry_resets() {
+    // The forgiveness above must not extend this far: `a.py` is in the diff
+    // but is being thrown away, so nothing at all is kept and the spec still
+    // produces the silent empty commit. Tolerating the absent path because
+    // *some* entry resolved would have reopened exactly that hole.
+    let repo = strict_repo("allowlist-live-entry-resets");
+    let err = repo.hunk_fail(&[
+        "split",
+        r#"{"files": {"a.py": {"action": "reset"}, "nope.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "nothing kept",
+    ]);
+    assert!(err.contains("nope.txt"), "the error must name the path: {err}");
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("nothing kept")),
+        "an empty commit was created from a spec that keeps nothing real"
+    );
+}
+
+#[test]
+fn a_spec_that_names_nothing_in_the_diff_is_rejected() {
+    // Two typos, not one: a rule phrased as "the spec's only entry" would let
+    // this straight through into an empty commit.
+    let repo = strict_repo("allowlist-all-stale");
+    let err = repo.hunk_fail(&[
+        "commit",
+        r#"{"files": {"untouched.txt": {"action": "keep"}, "also-gone.txt": {"action": "keep"}}, "default": "reset"}"#,
+        "all stale",
+    ]);
+    assert!(
+        err.contains("untouched.txt") && err.contains("also-gone.txt"),
+        "the error must name every path that resolved to nothing: {err}"
+    );
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d.contains("all stale")),
+        "an empty commit was created from a spec that names nothing in the diff"
     );
 }
