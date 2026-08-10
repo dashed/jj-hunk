@@ -562,19 +562,51 @@ impl ParsedFile {
             .collect()
     }
 
-    /// Recursively walk the tree to find the innermost function and scope
-    /// containing the given 0-based line.
+    /// Walk the tree to find the innermost function and scope containing the
+    /// given 0-based line.
     ///
-    /// Invariant: since we recurse depth-first and inner nodes are visited
-    /// after outer ones, `enclosing_function` and `enclosing_scope` are
-    /// overwritten as we descend — the last match is the innermost.
+    /// Invariant: the walk is depth-first and pre-order, so inner nodes are
+    /// visited after outer ones and `enclosing_function` / `enclosing_scope`
+    /// are overwritten as we descend — the last match is the innermost.
+    ///
+    /// The descent uses an explicit stack rather than the call stack. A syntax
+    /// tree is as deep as the source nests, and generated or minified code
+    /// nests far deeper than anything written by hand — a file with 50_000
+    /// nested parentheses made the recursive walk abort the process with
+    /// `fatal runtime error: stack overflow`. That took no bad input from the
+    /// user: merely *containing* such a file was enough to crash `jj-hunk
+    /// list`.
     fn find_enclosing(
+        &self,
+        root: tree_sitter::Node,
+        line: usize,
+        ctx: &mut SemanticContext,
+        depth: usize,
+    ) {
+        let mut pending = vec![(root, depth)];
+        while let Some((node, depth)) = pending.pop() {
+            let depth = self.visit_node(node, line, ctx, depth);
+
+            // Pushed in reverse so siblings pop left to right, the order the
+            // recursive walk visited them in — which decides which of two
+            // siblings covering the same line has the last word.
+            let mut cursor = node.walk();
+            let children: Vec<tree_sitter::Node> = node
+                .named_children(&mut cursor)
+                .filter(|child| node_contains_line(child, line))
+                .collect();
+            pending.extend(children.into_iter().rev().map(|child| (child, depth)));
+        }
+    }
+
+    /// Fold one node into `ctx`, returning the depth its children sit at.
+    fn visit_node(
         &self,
         node: tree_sitter::Node,
         line: usize,
         ctx: &mut SemanticContext,
         depth: usize,
-    ) {
+    ) -> usize {
         let kind = node.kind();
 
         // Check if this node IS a doc-comment/import at the target line
@@ -640,18 +672,13 @@ impl ParsedFile {
             ctx.nesting_depth = new_depth;
         }
 
-        // Only descend into NAMED children. `children()` also yields the
-        // anonymous keyword tokens, and a keyword token's `kind()` *is* the
-        // keyword -- so Ruby's `class`/`module` tokens matched
+        // The caller descends into NAMED children only. `children()` also
+        // yields the anonymous keyword tokens, and a keyword token's `kind()`
+        // *is* the keyword -- so Ruby's `class`/`module` tokens matched
         // `scope_kinds: ["class", "module"]` and were counted as a second,
         // phantom scope (same for Haskell's `newtype`/`class`). Anonymous
         // nodes are always leaves, so nothing else is lost by skipping them.
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if node_contains_line(&child, line) {
-                self.find_enclosing(child, line, ctx, new_depth);
-            }
-        }
+        new_depth
     }
 
     /// Collect annotation nodes attached to a function/scope node.
@@ -2091,5 +2118,62 @@ mod language_config_tests {
         for (ext, src, line) in cases {
             assert!(ctx(ext, src, *line).is_import, "{ext}: import not detected");
         }
+    }
+
+    // -- bug: a deep syntax tree overflowed the stack ----------------------
+
+    /// A syntax tree is as deep as the source nests, and generated or minified
+    /// code nests far deeper than anything written by hand. Walking it
+    /// recursively aborted the process with `fatal runtime error: stack
+    /// overflow` -- and it took no bad input from the user, only a repository
+    /// that happened to contain such a file.
+    ///
+    /// Run on a 2 MiB stack, what a spawned thread gets by default. An
+    /// overflow aborts rather than fails, which is the point: it is the crash
+    /// under test and cannot be mistaken for a pass.
+    #[test]
+    fn a_deeply_nested_source_file_does_not_overflow_the_stack() {
+        let ctx = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let depth = 50_000;
+                let source = format!(
+                    "fn main() {{ let x = {}1{}; }}\n",
+                    "(".repeat(depth),
+                    ")".repeat(depth)
+                );
+                let parsed = ParsedFile::parse("rs", &source).expect("rust parser");
+                parsed.context_at_line(1)
+            })
+            .expect("spawn")
+            .join()
+            .expect("walking a deep syntax tree overflowed a 2 MiB stack");
+
+        // And it still answers correctly rather than merely surviving.
+        assert_eq!(ctx.enclosing_function.as_deref(), Some("main"));
+        assert!(ctx.is_analyzed);
+        assert!(!ctx.is_toplevel);
+    }
+
+    /// The iterative walk must visit nodes in the same order the recursive one
+    /// did -- pre-order, siblings left to right -- because the innermost
+    /// match is the one that survives.
+    #[test]
+    fn the_innermost_enclosing_scope_still_wins() {
+        let source = r#"
+mod outer {
+    struct Inner;
+    impl Inner {
+        fn deep(&self) {
+            let a = 1;
+        }
+    }
+}
+"#;
+        let parsed = ParsedFile::parse("rs", source).unwrap();
+        let ctx = parsed.context_at_line(6);
+        assert_eq!(ctx.enclosing_function.as_deref(), Some("deep"));
+        assert_eq!(ctx.enclosing_scope.as_deref(), Some("Inner"));
+        assert!(ctx.nesting_depth >= 2, "depth was {}", ctx.nesting_depth);
     }
 }
