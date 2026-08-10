@@ -75,13 +75,63 @@ enum Commands {
         #[arg(long = "allow-empty")]
         allow_empty: bool,
     },
+
+    /// Edit a revision's diff, keeping only the selected hunks
+    Diffedit {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin.
+        /// The hunks it names are the ones KEPT
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Revision to edit (default: @)
+        #[arg(short, long, conflicts_with_all = ["from", "to"])]
+        rev: Option<String>,
+        /// Show changes from this revision (default: @)
+        #[arg(long)]
+        from: Option<String>,
+        /// Edit changes in this revision (default: @)
+        #[arg(short = 't', long)]
+        to: Option<String>,
+        /// Allow a selection that keeps nothing (discards the whole diff)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+    },
+
+    /// Undo the selected hunks, restoring their content from another revision
+    Restore {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin.
+        /// The hunks it names are the ones UNDONE
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Undo the changes in this revision (default: @)
+        #[arg(short = 'c', long = "changes-in", conflicts_with_all = ["from", "into"])]
+        changes_in: Option<String>,
+        /// Revision to restore from, the source (default: @)
+        #[arg(long)]
+        from: Option<String>,
+        /// Revision to restore into, the destination (default: @)
+        #[arg(short = 't', long, alias = "to")]
+        into: Option<String>,
+        /// Allow a selection that undoes nothing
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+    },
 }
 
 #[derive(Args)]
 struct ListArgs {
     /// Revset to diff (e.g. @, @-, or a change id)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with_all = ["from", "to"])]
     rev: Option<String>,
+    /// Diff from this revision instead of a revision's parent (default: @)
+    #[arg(long)]
+    from: Option<String>,
+    /// Diff to this revision (default: @)
+    #[arg(long)]
+    to: Option<String>,
     /// Include glob patterns (repeatable)
     #[arg(short = 'i', long)]
     include: Vec<String>,
@@ -132,6 +182,8 @@ fn main() -> Result<()> {
 
             let options = ListOptions {
                 rev: args.rev,
+                from: args.from,
+                to: args.to,
                 include: args.include,
                 exclude: args.exclude,
                 group: args.group,
@@ -171,6 +223,42 @@ fn main() -> Result<()> {
         Commands::Squash { spec, spec_file, rev, allow_empty } => {
             let spec = normalize_spec_only(spec, &spec_file, "squash")?;
             commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref(), allow_empty)
+        }
+        Commands::Diffedit {
+            spec,
+            spec_file,
+            rev,
+            from,
+            to,
+            allow_empty,
+        } => {
+            let spec = normalize_spec_only(spec, &spec_file, "diffedit")?;
+            commands::diffedit(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                rev.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                allow_empty,
+            )
+        }
+        Commands::Restore {
+            spec,
+            spec_file,
+            changes_in,
+            from,
+            into,
+            allow_empty,
+        } => {
+            let spec = normalize_spec_only(spec, &spec_file, "restore")?;
+            commands::restore(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                changes_in.as_deref(),
+                from.as_deref(),
+                into.as_deref(),
+                allow_empty,
+            )
         }
     }
 }

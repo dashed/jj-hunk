@@ -95,9 +95,55 @@ impl Truncation {
     };
 }
 
+/// The two trees a diff is taken between.
+///
+/// `Rev` is the shape every revision-editing command wants: `jj diff -r REV`,
+/// i.e. parent(REV) -> REV, or the working copy against its parent when
+/// `None`.
+///
+/// `FromTo` is `jj diff --from A --to B`. It exists because `jj restore` hands
+/// its diff editor the *destination* on the left and the *source* on the
+/// right -- the reverse of `jj diff -r`. A hunk id is a hash of the text it was
+/// computed from, so a spec built from the forward diff names nothing at all in
+/// that view; building it from the reversed one is what makes ids resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffTarget {
+    Rev(Option<String>),
+    FromTo { from: String, to: String },
+}
+
+impl DiffTarget {
+    pub fn rev(rev: Option<&str>) -> Self {
+        DiffTarget::Rev(rev.map(str::to_string))
+    }
+
+    pub fn from_to(from: &str, to: &str) -> Self {
+        DiffTarget::FromTo {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    /// The `jj-hunk list` invocation that shows exactly this diff, so an error
+    /// about an id that did not resolve can name the listing it came from.
+    fn listing_command(&self) -> String {
+        match self {
+            DiffTarget::Rev(None) => "jj-hunk list".to_string(),
+            DiffTarget::Rev(Some(rev)) => format!("jj-hunk list -r {rev}"),
+            DiffTarget::FromTo { from, to } => format!("jj-hunk list --from {from} --to {to}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListOptions {
     pub rev: Option<String>,
+    /// Left side of an explicit two-revision diff. Mutually exclusive with
+    /// `rev`.
+    pub from: Option<String>,
+    /// Right side of an explicit two-revision diff. Mutually exclusive with
+    /// `rev`.
+    pub to: Option<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub group: ListGrouping,
@@ -113,6 +159,8 @@ impl Default for ListOptions {
     fn default() -> Self {
         Self {
             rev: None,
+            from: None,
+            to: None,
             include: Vec::new(),
             exclude: Vec::new(),
             group: ListGrouping::default(),
@@ -280,12 +328,13 @@ where
     T: Into<ListOptions>,
 {
     let options = options.into();
+    let target = list_target(&options)?;
     let resolved_spec_input = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
     let spec = match &resolved_spec_input {
         Some(content) if hunkset::is_hunkset(content) => {
             // The same view being listed, so the selector filters exactly the
             // hunks this command is about to print.
-            let json = evaluate_hunkset(content, options.rev.as_deref(), options.truncation)?;
+            let json = evaluate_hunkset(content, &target, options.truncation)?;
             Some(Spec::from_str(&json)?)
         }
         Some(content) => Some(Spec::from_str(content)?),
@@ -295,8 +344,7 @@ where
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
 
-    let all_file_hunks =
-        load_file_hunks(options.rev.as_deref(), options.binary, options.truncation)?;
+    let all_file_hunks = load_file_hunks(&target, options.binary, options.truncation)?;
 
     let mut files = Vec::new();
 
@@ -402,6 +450,25 @@ where
     Ok(())
 }
 
+/// Which diff `list` was asked for.
+///
+/// The clap layer already refuses `--rev` alongside `--from`/`--to`; this
+/// repeats the check because `ListOptions` is public and can be built without
+/// going through it.
+fn list_target(options: &ListOptions) -> Result<DiffTarget> {
+    if options.from.is_none() && options.to.is_none() {
+        return Ok(DiffTarget::rev(options.rev.as_deref()));
+    }
+    if options.rev.is_some() {
+        anyhow::bail!("--rev cannot be used with --from/--to");
+    }
+    // jj defaults whichever side was left out to the working copy.
+    Ok(DiffTarget::from_to(
+        options.from.as_deref().unwrap_or("@"),
+        options.to.as_deref().unwrap_or("@"),
+    ))
+}
+
 const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_executable\":" ++ if(self.source().executable(), "true", "false") ++ ",\"target_executable\":" ++ if(self.target().executable(), "true", "false") ++ "}\n""#;
 
 struct FilePaths {
@@ -500,13 +567,13 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 /// any hunk the cut reshaped.
 fn evaluate_hunkset(
     hunkset_expr: &str,
-    rev: Option<&str>,
+    target: &DiffTarget,
     truncation: Truncation,
 ) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
         .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
-    let file_hunks = load_file_hunks(rev, BinaryMode::Skip, truncation)?;
+    let file_hunks = load_file_hunks(target, BinaryMode::Skip, truncation)?;
 
     let enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
@@ -564,14 +631,14 @@ impl FileHunks {
 /// Load all file hunks for a revision, applying semantic enrichment.
 /// This is the shared core used by both `list` and `evaluate_hunkset`.
 fn load_file_hunks(
-    rev: Option<&str>,
+    target: &DiffTarget,
     binary: BinaryMode,
     truncation: Truncation,
 ) -> Result<Vec<FileHunks>> {
     // Validate the revision *before* doing any work: a merge or a
     // multi-revision revset makes every hunk below meaningless.
-    let revisions = resolve_revisions(rev)?;
-    let summary_entries = read_diff_summary(rev)?;
+    let revisions = resolve_revisions(target)?;
+    let summary_entries = read_diff_summary(target)?;
     let mut result = Vec::new();
 
     for entry in &summary_entries {
@@ -680,6 +747,27 @@ fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
         .collect())
 }
 
+/// The single revision `revset` names, or an error saying what it named
+/// instead.
+///
+/// Every diff jj-hunk builds is between two specific trees, so a revset that
+/// resolves to none or to several has no meaning here.
+fn resolve_single_revision(revset: &str) -> Result<ResolvedRevision> {
+    let mut resolved = resolve_revset(revset)?;
+    match resolved.len() {
+        0 => anyhow::bail!("revset `{}` did not resolve to any revision", revset),
+        1 => Ok(resolved.remove(0)),
+        n => anyhow::bail!(
+            "revset `{}` resolved to {} revisions, but jj-hunk needs exactly one.\n\
+             Hunks are only defined between a single revision and its parent.\n\
+             Resolved to: {}",
+            revset,
+            n,
+            preview_ids(resolved.iter().map(|r| r.id.as_str()))
+        ),
+    }
+}
+
 fn preview_ids<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> String {
     const MAX: usize = 5;
     let total = ids.len();
@@ -701,24 +789,23 @@ fn preview_ids<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> String {
 ///   * a merge commit, where `@-` is ambiguous.
 ///
 /// Both are now rejected outright.
-fn resolve_revisions(revset: Option<&str>) -> Result<DiffRevisions> {
+///
+/// A `FromTo` target names both sides itself, so neither failure applies to it:
+/// each side only has to resolve to exactly one revision.
+fn resolve_revisions(target: &DiffTarget) -> Result<DiffRevisions> {
+    let revset = match target {
+        DiffTarget::Rev(revset) => revset.as_deref(),
+        DiffTarget::FromTo { from, to } => {
+            return Ok(DiffRevisions {
+                before: Some(resolve_single_revision(from)?.id),
+                after: Some(resolve_single_revision(to)?.id),
+            })
+        }
+    };
+
     let target = revset.unwrap_or("@");
 
-    let mut targets = resolve_revset(target)?;
-    match targets.len() {
-        0 => anyhow::bail!("revset `{}` did not resolve to any revision", target),
-        1 => {}
-        n => anyhow::bail!(
-            "revset `{}` resolved to {} revisions, but jj-hunk needs exactly one.\n\
-             Hunks are only defined between a single revision and its parent.\n\
-             Resolved to: {}",
-            target,
-            n,
-            preview_ids(targets.iter().map(|r| r.id.as_str()))
-        ),
-    }
-
-    let resolved = targets.remove(0);
+    let resolved = resolve_single_revision(target)?;
     if resolved.parents.len() > 1 {
         anyhow::bail!(
             "`{}` ({}) is a merge commit with {} parents, so it has no single \
@@ -744,11 +831,20 @@ fn resolve_revisions(revset: Option<&str>) -> Result<DiffRevisions> {
     })
 }
 
-fn read_diff_summary(revset: Option<&str>) -> Result<Vec<DiffSummaryEntry>> {
+fn read_diff_summary(target: &DiffTarget) -> Result<Vec<DiffSummaryEntry>> {
     let mut diff_args = vec!["diff", "--template", SUMMARY_TEMPLATE];
-    if let Some(rev) = revset {
-        diff_args.push("-r");
-        diff_args.push(rev);
+    match target {
+        DiffTarget::Rev(Some(rev)) => {
+            diff_args.push("-r");
+            diff_args.push(rev);
+        }
+        DiffTarget::Rev(None) => {}
+        DiffTarget::FromTo { from, to } => {
+            diff_args.push("--from");
+            diff_args.push(from);
+            diff_args.push("--to");
+            diff_args.push(to);
+        }
     }
 
     let output = Command::new("jj")
@@ -1851,7 +1947,11 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
 /// An entry that deliberately keeps nothing (`"ids": []`) is not an error:
 /// blanking out the ids you do not want is the documented workflow, and the
 /// structural check above already catches a spec where *every* entry is empty.
-fn validate_spec_resolves(spec: &Spec, file_hunks: &[FileHunks]) -> Result<()> {
+fn validate_spec_resolves(
+    spec: &Spec,
+    file_hunks: &[FileHunks],
+    target: &DiffTarget,
+) -> Result<()> {
     let mut known: HashMap<&str, &FileHunks> = HashMap::new();
     for fh in file_hunks {
         for path in fh.all_paths() {
@@ -1920,12 +2020,17 @@ fn validate_spec_resolves(spec: &Spec, file_hunks: &[FileHunks]) -> Result<()> {
 
     if !problems.is_empty() {
         problems.sort();
+        // The listing is named after the target rather than hardcoded, because
+        // `restore` edits the diff the other way round: an id copied from
+        // `list -r REV` cannot resolve there, and a fixed hint would send the
+        // reader straight back to the listing that produced the bad id.
         anyhow::bail!(
             "spec does not resolve against the diff:\n  {}\n\
              Those entries do not name exactly what they meant to. Check them \
-             against `jj-hunk list --spec-template`, or pass --allow-empty if \
+             against `{} --spec-template`, or pass --allow-empty if \
              that is intended.",
-            problems.join("\n  ")
+            problems.join("\n  "),
+            target.listing_command()
         );
     }
 
@@ -1967,27 +2072,48 @@ fn run_jj_with_selection(
     rev: Option<&str>,
     allow_empty: bool,
 ) -> Result<()> {
+    run_jj_with_selection_on(args, spec, spec_file, &DiffTarget::rev(rev), allow_empty)
+}
+
+/// As `run_jj_with_selection`, but for a command whose diff editor is shown
+/// something other than `jj diff -r REV`.
+///
+/// `target` must be the view jj will hand to `select`, because that is the text
+/// the spec's hunk ids are hashes of. Naming the wrong one does not misfire
+/// loudly; it just matches nothing.
+fn run_jj_with_selection_on(
+    args: &[&str],
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    target: &DiffTarget,
+    allow_empty: bool,
+) -> Result<()> {
     let raw_spec = resolve_spec_input(spec, spec_file)?;
     let is_hunkset = hunkset::is_hunkset(&raw_spec);
     let mut spec_content = if is_hunkset {
         // Never truncated: this spec is about to mutate history, and `select`
         // works from the files whole.
-        evaluate_hunkset(&raw_spec, rev, Truncation::NONE)?
+        evaluate_hunkset(&raw_spec, target, Truncation::NONE)?
     } else {
         raw_spec.clone()
     };
 
     if let Ok(mut parsed) = Spec::from_str(&spec_content) {
-        // Refuse to mutate history with a selection that keeps nothing. jj
-        // would happily create an empty commit and exit 0, which hides a
-        // typo'd selector from any script driving this.
+        // Refuse to mutate history with a selection that keeps nothing: jj
+        // would carry it out and exit 0, which hides a typo'd selector from any
+        // script driving this. What it would carry out differs per verb -- an
+        // empty commit for `split`, a discarded diff for `diffedit`, nothing at
+        // all for `restore` -- so the message below stops at the one thing that
+        // holds everywhere.
         if !allow_empty && parsed.selects_nothing() {
             anyhow::bail!(
                 "selection matched no hunks: {}\n\
-                 Nothing would be kept, so this would create an empty commit.\n\
-                 Check the selector with `jj-hunk list --spec ...`, or pass \
-                 --allow-empty if that is intended.",
-                raw_spec.trim()
+                 An empty selection is nearly always a mistyped selector \
+                 rather than an intent, so it is refused.\n\
+                 Check it against `{} --spec ...`, or pass --allow-empty if \
+                 that is what you meant.",
+                raw_spec.trim(),
+                target.listing_command()
             );
         }
 
@@ -1997,9 +2123,9 @@ fn run_jj_with_selection(
         if !is_hunkset {
             // `Mark`, not `Skip`: a binary file has no hunks but is still a
             // legitimate spec target via `{"action": "keep"}`.
-            let file_hunks = load_file_hunks(rev, BinaryMode::Mark, Truncation::NONE)?;
+            let file_hunks = load_file_hunks(target, BinaryMode::Mark, Truncation::NONE)?;
             if !allow_empty {
-                validate_spec_resolves(&parsed, &file_hunks)?;
+                validate_spec_resolves(&parsed, &file_hunks, target)?;
             }
             if fill_rename_sources(&mut parsed, &file_hunks) {
                 spec_content = serde_json::to_string(&parsed)
@@ -2222,6 +2348,108 @@ pub fn squash(
         args.push(rev);
     }
     run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
+}
+
+/// Rewrite a revision so it contains only the selected hunks of its diff.
+///
+/// The named hunks are the ones **kept**; everything else in the diff is
+/// discarded. This is the plain reading of `jj diffedit`, whose editor is shown
+/// the same diff as `jj diff -r REV` and takes the right-hand side as the
+/// revision's new content.
+pub fn diffedit(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    rev: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    allow_empty: bool,
+) -> Result<()> {
+    let mut args = vec!["diffedit", JJ_HUNK_TOOL_ARG];
+
+    let target = if from.is_none() && to.is_none() {
+        if let Some(rev) = rev {
+            args.push("-r");
+            args.push(rev);
+        }
+        DiffTarget::rev(rev)
+    } else {
+        if rev.is_some() {
+            anyhow::bail!("-r/--rev cannot be used with --from/--to");
+        }
+        if let Some(from) = from {
+            args.push("--from");
+            args.push(from);
+        }
+        if let Some(to) = to {
+            args.push("--to");
+            args.push(to);
+        }
+        // jj defaults whichever side was left out to the working copy.
+        DiffTarget::from_to(from.unwrap_or("@"), to.unwrap_or("@"))
+    };
+
+    run_jj_with_selection_on(&args, spec, spec_file, &target, allow_empty)
+}
+
+/// Undo the selected hunks, taking their content from another revision.
+///
+/// The named hunks are the ones **undone** -- the exact opposite of
+/// `diffedit`, and the one place in jj-hunk where that is true.
+///
+/// It falls out of what `jj restore` shows its diff editor: the destination on
+/// the left and the source on the right, so the editor's right-hand side starts
+/// out fully restored and keeping a hunk there means letting that restoration
+/// stand. The spec is therefore built against `destination -> source`, the
+/// reverse of `jj diff -r`, which is also the view whose hunk ids it must name
+/// (`jj-hunk list --from <destination> --to <source>`).
+pub fn restore(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    changes_in: Option<&str>,
+    from: Option<&str>,
+    into: Option<&str>,
+    allow_empty: bool,
+) -> Result<()> {
+    if changes_in.is_some() && (from.is_some() || into.is_some()) {
+        anyhow::bail!("-c/--changes-in cannot be used with --from/--into");
+    }
+
+    let mut args = vec!["restore", "-i", JJ_HUNK_TOOL_ARG];
+
+    let target = if from.is_none() && into.is_none() {
+        // `jj restore` with no target is `jj restore --changes-in @`.
+        let revision = changes_in.unwrap_or("@");
+        if let Some(changes_in) = changes_in {
+            args.push("-c");
+            args.push(changes_in);
+        }
+
+        let revisions = resolve_revisions(&DiffTarget::rev(Some(revision)))?;
+        let destination = revisions
+            .after
+            .expect("an explicit revset always resolves to an id");
+        let source = revisions.before.ok_or_else(|| {
+            anyhow::anyhow!("`{revision}` has no parent, so there is nothing to restore from")
+        })?;
+        DiffTarget::FromTo {
+            from: destination,
+            to: source,
+        }
+    } else {
+        if let Some(from) = from {
+            args.push("--from");
+            args.push(from);
+        }
+        if let Some(into) = into {
+            args.push("--into");
+            args.push(into);
+        }
+        // jj defaults whichever side was left out to the working copy. Note the
+        // swap: the editor's *left* is the destination.
+        DiffTarget::from_to(into.unwrap_or("@"), from.unwrap_or("@"))
+    };
+
+    run_jj_with_selection_on(&args, spec, spec_file, &target, allow_empty)
 }
 
 #[cfg(test)]

@@ -181,6 +181,11 @@ impl TestRepo {
             .filter(|l| !l.is_empty())
             .collect()
     }
+
+    /// A file's whole content as of `rev`.
+    fn file_at(&self, rev: &str, path: &str) -> String {
+        self.jj_ok(&["file", "show", "-r", rev, &format!("file:{path}")])
+    }
 }
 
 impl Drop for TestRepo {
@@ -2782,4 +2787,444 @@ fn a_spec_template_of_a_many_hunk_diff_round_trips() {
     assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
     let committed = repo.hunk_ok(&["list", "-r", "@-", "--format", "diff"]);
     assert_eq!(committed, before, "the split commit should hold the whole diff");
+}
+
+// ---------------------------------------------------------------------------
+// diffedit / restore
+//
+// These two verbs disagree with each other, and with `split`/`squash`, about
+// what a named hunk *means*:
+//
+//   split     the named hunks go into the split-off commit
+//   squash    the named hunks move to the destination
+//   diffedit  the named hunks are KEPT
+//   restore   the named hunks are UNDONE
+//
+// The inversion is not a special case in jj-hunk: `jj restore` hands its diff
+// editor the destination on the left and the source on the right, which is the
+// reverse of `jj diff -r`, so "keep what is named" reads as "undo it".
+// ---------------------------------------------------------------------------
+
+/// `f.txt` before the change under test.
+const TWO_HUNK_BASE: &str = "L1\nL2\nL3\nL4\nL5\nL6\nL7\n";
+/// `f.txt` after it: two hunks, far enough apart not to merge into one.
+const TWO_HUNK_CHANGED: &str = "X1\nL2\nL3\nL4\nL5\nL6\nX7\n";
+/// Only the first hunk applied.
+const TWO_HUNK_FIRST_ONLY: &str = "X1\nL2\nL3\nL4\nL5\nL6\nL7\n";
+/// Only the second hunk applied.
+const TWO_HUNK_SECOND_ONLY: &str = "L1\nL2\nL3\nL4\nL5\nL6\nX7\n";
+
+/// A selector naming the first hunk and nothing else. `content()` looks at
+/// both sides of a hunk, so the same expression picks out the same region
+/// whichever way round the diff is presented.
+const FIRST_HUNK: &str = r#"content(substring:"X1")"#;
+
+/// A stack whose `@-` changes two well-separated lines of `f.txt`, so a
+/// selector can name one hunk and leave the other alone.
+///
+/// ```text
+/// @--  "base"    L1 L2 L3 L4 L5 L6 L7
+/// @-   "change"  X1 L2 L3 L4 L5 L6 X7
+/// @               (empty working copy)
+/// ```
+fn two_hunk_stack(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("f.txt", TWO_HUNK_BASE);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("f.txt", TWO_HUNK_CHANGED);
+    repo.jj_ok(&["commit", "-m", "change"]);
+    repo
+}
+
+/// The two hunks of `f.txt` as `(id, short_id)`, in hunk order, as seen from
+/// whichever side `args` selects.
+fn two_hunk_ids(repo: &TestRepo, args: &[&str]) -> Vec<(String, String)> {
+    let ids: Vec<(String, String)> = listed_ids(repo, args)
+        .into_iter()
+        .filter(|(path, _, _)| path == "f.txt")
+        .map(|(_, id, short)| (id, short))
+        .collect();
+    assert_eq!(ids.len(), 2, "fixture should have two hunks: {ids:?}");
+    ids
+}
+
+/// A spec naming exactly one hunk of `f.txt`.
+fn one_hunk_spec(id: &str) -> String {
+    format!(r#"{{"files": {{"f.txt": {{"ids": ["{id}"]}}}}, "default": "reset"}}"#)
+}
+
+#[test]
+fn diffedit_keeps_the_hunks_it_names() {
+    let repo = two_hunk_stack("diffedit-keeps");
+    repo.hunk_ok(&["diffedit", FIRST_HUNK, "-r", "@-"]);
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_FIRST_ONLY,
+        "diffedit must keep the named hunk and drop the other"
+    );
+}
+
+#[test]
+fn restore_undoes_the_hunks_it_names() {
+    let repo = two_hunk_stack("restore-undoes");
+    repo.hunk_ok(&["restore", FIRST_HUNK, "-c", "@-"]);
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_SECOND_ONLY,
+        "restore must undo the named hunk and leave the other alone"
+    );
+}
+
+/// The two verbs are near-inverses. One selector, one starting state, two
+/// results that must be exact complements -- an assertion that merely checked
+/// "something changed" would pass with the two implementations swapped.
+#[test]
+fn diffedit_and_restore_split_a_change_into_complementary_halves() {
+    let kept = {
+        let repo = two_hunk_stack("complement-diffedit");
+        repo.hunk_ok(&["diffedit", FIRST_HUNK, "-r", "@-"]);
+        repo.file_at("@-", "f.txt")
+    };
+    let undone = {
+        let repo = two_hunk_stack("complement-restore");
+        repo.hunk_ok(&["restore", FIRST_HUNK, "-c", "@-"]);
+        repo.file_at("@-", "f.txt")
+    };
+
+    assert_eq!(kept, TWO_HUNK_FIRST_ONLY);
+    assert_eq!(undone, TWO_HUNK_SECOND_ONLY);
+
+    // Nothing fell through the gap between them: on every line the original
+    // change touched, exactly one half carries the new text and the other
+    // carries the old one.
+    let lines = TWO_HUNK_BASE
+        .lines()
+        .zip(TWO_HUNK_CHANGED.lines())
+        .zip(kept.lines().zip(undone.lines()));
+    for (line_no, ((base, changed), (a, b))) in lines.enumerate() {
+        if base == changed {
+            assert_eq!(
+                (a, b),
+                (base, base),
+                "line {line_no} was not part of the change"
+            );
+            continue;
+        }
+        assert_eq!(
+            [a, b].iter().filter(|l| **l == changed).count(),
+            1,
+            "line {line_no}: exactly one half must carry the change ({a:?} / {b:?})"
+        );
+        assert_eq!(
+            [a, b].iter().filter(|l| **l == base).count(),
+            1,
+            "line {line_no}: exactly one half must carry the original ({a:?} / {b:?})"
+        );
+    }
+}
+
+/// The same inversion on the working copy, where neither verb is given a
+/// revision at all: `diffedit` keeps `a.txt`'s change and drops `b.txt`'s,
+/// `restore` does exactly the opposite.
+#[test]
+fn diffedit_without_a_revision_keeps_the_named_working_copy_change() {
+    let repo = TestRepo::new("diffedit-working-copy");
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("b.txt", "b\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "A\n");
+    repo.write_file("b.txt", "B\n");
+
+    repo.hunk_ok(&["diffedit", r#"file("a.txt")"#]);
+
+    assert_eq!(repo.file_at("@", "a.txt"), "A\n", "the named change is kept");
+    assert_eq!(
+        repo.file_at("@", "b.txt"),
+        "b\n",
+        "the unnamed change is dropped"
+    );
+}
+
+#[test]
+fn restore_without_a_target_undoes_the_named_working_copy_change() {
+    let repo = TestRepo::new("restore-working-copy");
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("b.txt", "b\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "A\n");
+    repo.write_file("b.txt", "B\n");
+
+    repo.hunk_ok(&["restore", r#"file("a.txt")"#]);
+
+    assert_eq!(repo.file_at("@", "a.txt"), "a\n", "the named change is undone");
+    assert_eq!(
+        repo.file_at("@", "b.txt"),
+        "B\n",
+        "the unnamed change is left alone"
+    );
+}
+
+#[test]
+fn restore_from_alone_restores_into_the_working_copy() {
+    let repo = TestRepo::new("restore-from-alone");
+    repo.write_file("a.txt", "a\n");
+    repo.write_file("b.txt", "b\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "A\n");
+    repo.write_file("b.txt", "B\n");
+
+    // `--into` defaults to the working copy.
+    repo.hunk_ok(&["restore", r#"file("a.txt")"#, "--from", "@-"]);
+
+    assert_eq!(repo.file_at("@", "a.txt"), "a\n");
+    assert_eq!(repo.file_at("@", "b.txt"), "B\n");
+}
+
+// --- naming hunks by id and by index --------------------------------------
+
+#[test]
+fn diffedit_accepts_a_hunk_id_from_the_listing() {
+    let repo = two_hunk_stack("diffedit-by-id");
+    let ids = two_hunk_ids(&repo, &["-r", "@-"]);
+
+    repo.hunk_ok(&["diffedit", &one_hunk_spec(&ids[1].1), "-r", "@-"]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_SECOND_ONLY);
+}
+
+/// A hunk's *index* is its position in the file's hunk list, and both
+/// directions put the same regions in the same order -- so an index read off
+/// `list -r @-` names the same region to `restore -c @-`.
+#[test]
+fn restore_hunk_indices_line_up_with_the_forward_listing() {
+    let repo = two_hunk_stack("restore-by-index");
+    repo.hunk_ok(&[
+        "restore",
+        r#"{"files": {"f.txt": {"hunks": [1]}}, "default": "reset"}"#,
+        "-c",
+        "@-",
+    ]);
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_FIRST_ONLY,
+        "index 1 is the X7 hunk, and restore undoes it"
+    );
+}
+
+/// Hunk ids are hashes of the text they were computed from, so restore's view
+/// -- the diff the other way round -- has ids of its own. `list --from/--to`
+/// is how you see them.
+#[test]
+fn list_from_to_shows_the_reversed_diff_that_restore_edits() {
+    let repo = two_hunk_stack("list-from-to");
+
+    let forward = repo.hunk_ok(&["list", "-r", "@-", "--format", "text"]);
+    assert!(forward.contains("- L1"), "forward diff removes L1:\n{forward}");
+    assert!(forward.contains("+ X1"), "forward diff adds X1:\n{forward}");
+
+    let reversed = repo.hunk_ok(&["list", "--from", "@-", "--to", "@--", "--format", "text"]);
+    assert!(reversed.contains("- X1"), "reversed diff removes X1:\n{reversed}");
+    assert!(reversed.contains("+ L1"), "reversed diff adds L1:\n{reversed}");
+}
+
+#[test]
+fn restore_accepts_a_hunk_id_from_the_reversed_listing() {
+    let repo = two_hunk_stack("restore-by-id");
+    let ids = two_hunk_ids(&repo, &["--from", "@-", "--to", "@--"]);
+
+    repo.hunk_ok(&["restore", &one_hunk_spec(&ids[0].1), "-c", "@-"]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_SECOND_ONLY);
+}
+
+/// An id from the forward listing describes text that does not exist in the
+/// view restore edits, so it must be refused rather than quietly select
+/// nothing -- and the error has to point at the listing that *would* work.
+#[test]
+fn restore_refuses_an_id_taken_from_the_forward_listing() {
+    let repo = two_hunk_stack("restore-forward-id");
+    let ids = two_hunk_ids(&repo, &["-r", "@-"]);
+
+    let err = repo.hunk_fail(&["restore", &one_hunk_spec(&ids[0].0), "-c", "@-"]);
+    assert!(err.contains(&ids[0].0), "error should name the id: {err}");
+    assert!(
+        err.contains("--from") && err.contains("--to"),
+        "error should point at the listing that shows restore's ids: {err}"
+    );
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_CHANGED,
+        "nothing should have been rewritten"
+    );
+}
+
+// --- targeting revisions other than the working copy ----------------------
+
+#[test]
+fn diffedit_from_to_targets_two_non_working_copy_revisions() {
+    let repo = two_hunk_stack("diffedit-from-to");
+    repo.write_file("g.txt", "G\n");
+    repo.jj_ok(&["commit", "-m", "tip"]);
+    // @ (empty) / @- "tip" / @-- "change" / @--- "base"
+
+    repo.hunk_ok(&["diffedit", FIRST_HUNK, "--from", "@---", "--to", "@--"]);
+
+    assert_eq!(repo.file_at("@--", "f.txt"), TWO_HUNK_FIRST_ONLY);
+    assert_eq!(
+        repo.file_at("@-", "g.txt"),
+        "G\n",
+        "the descendant is untouched"
+    );
+}
+
+#[test]
+fn restore_from_into_targets_two_non_working_copy_revisions() {
+    let repo = two_hunk_stack("restore-from-into");
+    repo.write_file("g.txt", "G\n");
+    repo.jj_ok(&["commit", "-m", "tip"]);
+
+    repo.hunk_ok(&["restore", FIRST_HUNK, "--from", "@---", "--into", "@--"]);
+
+    assert_eq!(repo.file_at("@--", "f.txt"), TWO_HUNK_SECOND_ONLY);
+    assert_eq!(
+        repo.file_at("@-", "g.txt"),
+        "G\n",
+        "the descendant is untouched"
+    );
+}
+
+/// Editing a revision in the middle of a stack must not cost the descendants
+/// their own changes: what `@` adds on top has to survive the rebase intact.
+#[test]
+fn diffedit_on_a_mid_stack_revision_leaves_the_descendant_diff_intact() {
+    let repo = two_hunk_stack("diffedit-descendant");
+    // `@` changes L4 and adds a file of its own.
+    repo.write_file("f.txt", "X1\nL2\nL3\nX4\nL5\nL6\nX7\n");
+    repo.write_file("g.txt", "G\n");
+
+    repo.hunk_ok(&["diffedit", FIRST_HUNK, "-r", "@-"]);
+
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_FIRST_ONLY);
+    assert_eq!(
+        repo.file_at("@", "f.txt"),
+        "X1\nL2\nL3\nX4\nL5\nL6\nL7\n",
+        "@ keeps its own L4 change on top of the edited parent"
+    );
+    assert_eq!(repo.file_at("@", "g.txt"), "G\n");
+}
+
+// --- selections that keep nothing -----------------------------------------
+
+#[test]
+fn diffedit_refuses_a_selector_that_matches_nothing() {
+    let repo = two_hunk_stack("diffedit-empty-selection");
+    let err = repo.hunk_fail(&["diffedit", r#"file("nope.txt")"#, "-r", "@-"]);
+    assert!(err.contains("matched no hunks"), "got: {err}");
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_CHANGED,
+        "the revision must be left alone"
+    );
+}
+
+#[test]
+fn restore_refuses_a_selector_that_matches_nothing() {
+    let repo = two_hunk_stack("restore-empty-selection");
+    let err = repo.hunk_fail(&["restore", r#"file("nope.txt")"#, "-c", "@-"]);
+    assert!(err.contains("matched no hunks"), "got: {err}");
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        TWO_HUNK_CHANGED,
+        "the revision must be left alone"
+    );
+}
+
+/// `--allow-empty` is the escape hatch, and for `diffedit` it means what it
+/// says: keep nothing, i.e. throw the whole change away.
+#[test]
+fn diffedit_allow_empty_discards_the_whole_change() {
+    let repo = two_hunk_stack("diffedit-allow-empty");
+    repo.hunk_ok(&[
+        "diffedit",
+        r#"file("nope.txt")"#,
+        "-r",
+        "@-",
+        "--allow-empty",
+    ]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_BASE);
+}
+
+/// The mirror image: undoing nothing is a no-op, not a wipe.
+#[test]
+fn restore_allow_empty_undoes_nothing() {
+    let repo = two_hunk_stack("restore-allow-empty");
+    repo.hunk_ok(&[
+        "restore",
+        r#"file("nope.txt")"#,
+        "-c",
+        "@-",
+        "--allow-empty",
+    ]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_CHANGED);
+}
+
+#[test]
+fn diffedit_keeping_everything_changes_nothing() {
+    let repo = two_hunk_stack("diffedit-keep-all");
+    repo.hunk_ok(&["diffedit", "all()", "-r", "@-"]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_CHANGED);
+}
+
+#[test]
+fn restore_undoing_everything_empties_the_revision() {
+    let repo = two_hunk_stack("restore-all");
+    repo.hunk_ok(&["restore", "all()", "-c", "@-"]);
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_BASE);
+}
+
+// --- flag plumbing ---------------------------------------------------------
+
+#[test]
+fn diffedit_reads_a_spec_file() {
+    let repo = two_hunk_stack("diffedit-spec-file");
+    let ids = two_hunk_ids(&repo, &["-r", "@-"]);
+    // Outside the repo: a spec file dropped inside it is a change of its own.
+    let spec_path = std::env::temp_dir().join(format!(
+        "jj-hunk-diffedit-spec-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&spec_path, one_hunk_spec(&ids[0].1)).unwrap();
+
+    repo.hunk_ok(&["diffedit", "-f", spec_path.to_str().unwrap(), "-r", "@-"]);
+    let _ = std::fs::remove_file(&spec_path);
+
+    assert_eq!(repo.file_at("@-", "f.txt"), TWO_HUNK_FIRST_ONLY);
+}
+
+#[test]
+fn diffedit_rejects_a_revision_together_with_from() {
+    let repo = two_hunk_stack("diffedit-flag-conflict");
+    let err = repo.hunk_fail(&["diffedit", "all()", "-r", "@-", "--from", "@--"]);
+    assert!(
+        err.contains("cannot be used with"),
+        "-r and --from should conflict: {err}"
+    );
+}
+
+#[test]
+fn restore_rejects_changes_in_together_with_into() {
+    let repo = two_hunk_stack("restore-flag-conflict");
+    let err = repo.hunk_fail(&["restore", "all()", "-c", "@-", "--into", "@--"]);
+    assert!(
+        err.contains("cannot be used with"),
+        "-c and --into should conflict: {err}"
+    );
+}
+
+#[test]
+fn list_rejects_a_revision_together_with_from() {
+    let repo = two_hunk_stack("list-flag-conflict");
+    let err = repo.hunk_fail(&["list", "-r", "@-", "--from", "@--"]);
+    assert!(
+        err.contains("cannot be used with"),
+        "-r and --from should conflict: {err}"
+    );
 }
