@@ -452,11 +452,18 @@ fn content_digest(
 ///
 /// Including the context is a deliberate trade, not an oversight:
 ///
-/// - An id survives edits *outside* its three-line context window, and changes
-///   as soon as anything inside that window moves. Editing a line four lines
-///   above a hunk leaves its id alone; editing one line above renames it.
-/// - An id does **not** survive a rebase. The same logical change against a
-///   different parent is a different hunk here.
+/// - An id survives most edits elsewhere in the file, including edits *inside*
+///   its three-line context window. The context is read from the **parent**
+///   side, so changing the working copy does not move it. Verified: with a
+///   hunk at line 10, editing line 8 leaves the id untouched.
+/// - What does change an id is an edit **adjacent** to the hunk, because the
+///   two then merge into a single larger hunk with different text -- a
+///   different hunk, correctly given a different id. The rule is about hunk
+///   merging, not about a window.
+/// - An id does **not** reliably survive a rebase. Rebasing onto a parent that
+///   rewrites the surrounding lines changes the context and so the id;
+///   rebasing onto one that does not touch the file leaves it identical. Treat
+///   any rebase as invalidating rather than reasoning case by case.
 ///
 /// Both are fine for the workflow these ids exist for: `list`, pick, `split`,
 /// all against one working-copy state, where an id only has to stay valid for

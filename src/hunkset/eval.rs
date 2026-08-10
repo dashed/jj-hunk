@@ -475,7 +475,12 @@ fn eval_id(
             .enumerate()
             .filter(|(_, h)| {
                 if exact_only {
-                    h.hunk.id == *id
+                    // `exact:` disables *prefix* matching -- it does not mean
+                    // "the 64-hex form only". The short id is an equally
+                    // canonical name for the same hunk, and the one `list`
+                    // prints, so rejecting it made `id(exact:"hunk-3c6ce1bf")`
+                    // silently select nothing at exit 0.
+                    h.hunk.id == *id || h.hunk.short_id == *id
                 } else {
                     crate::diff::id_matches(&id, &h.hunk.id)
                 }
