@@ -15,6 +15,12 @@ pub enum HunksetError {
         pattern: String,
         source: regex::Error,
     },
+    /// `GlobError` already renders as `invalid glob '<pattern>': <reason>`,
+    /// so it is passed through rather than re-worded here.
+    #[error("{source}")]
+    InvalidGlob { source: crate::glob::GlobError },
+    #[error("hunk id '{id}' matches no hunk in this diff -- ids change when the hunk's content or its file changes, so one copied from an earlier listing may be stale. Run 'list' again for the current ids.")]
+    UnknownId { id: String },
     #[error("hunk id '{prefix}' is ambiguous -- it matches {count} hunks: {candidates}. Use more characters, or exact:\"<full-id>\".")]
     AmbiguousId {
         prefix: String,

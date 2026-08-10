@@ -293,6 +293,8 @@ fn build_plan(options: &AbsorbOptions) -> Result<Plan> {
         }
 
         let path = file.path.clone();
+        let renamed = renamed_reason(&file);
+        let is_added = file.status == "added";
         let hunks = match decision {
             SpecDecision::KeepSelection(selection) => commands::filter_hunks(file.hunks, &selection)
                 .with_context(|| format!("cannot resolve the selection for {path}"))?,
@@ -303,18 +305,14 @@ fn build_plan(options: &AbsorbOptions) -> Result<Plan> {
         }
         considered += hunks.len();
 
-        // The path the parent knows this file by. For a rename the hunks are
-        // filed under the new name but their `-` lines live under the old one.
-        let annotate_path = match &file.rename {
-            Some(rename) => rename.from.clone(),
-            None => path.clone(),
-        };
-        let history = if file.status == "added" {
+        let history = if let Some(reason) = renamed {
+            History::Absent(reason)
+        } else if is_added {
             History::Absent(format!(
                 "{path} is new in this revision, so none of its lines has any history"
             ))
         } else {
-            annotate(parent, &annotate_path)?
+            annotate(parent, &path)?
         };
 
         for group in group_by_fingerprint(&path, &hunks) {
@@ -374,6 +372,31 @@ fn build_plan(options: &AbsorbOptions) -> Result<Plan> {
     })
 }
 
+/// Why every hunk in a renamed (or copied) file stays where it is.
+///
+/// Absorb moves lines; a rename is a whole-file change and no hunk selection
+/// can express it. It does not simply sit still either: `select` is handed the
+/// old path alongside the new one for any file the spec names, so the rename is
+/// performed by the *first* squash that carries any hunk out of the file. That
+/// puts the new name in an ancestor while every commit between it and the
+/// source still refers to the old one, and the rebase that follows conflicts
+/// them -- which is how a run that reported "2 moving, 0 staying" ended with a
+/// conflicted ancestor and nothing moved. Across two destinations it cannot be
+/// made to work at all: a file is renamed once, and the second squash would
+/// find the old path gone.
+///
+/// So the file stays whole, and says so. Committing the rename on its own first
+/// leaves a plain modification behind, which absorb routes normally.
+fn renamed_reason(file: &commands::FileHunks) -> Option<String> {
+    let rename = file.rename.as_ref().filter(|r| r.from != file.path)?;
+    Some(format!(
+        "{} was renamed from {}, and a rename is a whole-file change that would \
+         ride into the ancestor with the first hunk that moved -- commit the \
+         rename on its own first, then absorb",
+        file.path, rename.from
+    ))
+}
+
 /// Why a file that is part of the change contributes no hunks to route.
 fn unroutable_note(file: &commands::FileHunks) -> String {
     if file.is_binary {
@@ -386,6 +409,14 @@ fn unroutable_note(file: &commands::FileHunks) -> String {
             "{} only changes its executable bit, which is not part of any hunk \
              and stays",
             file.path
+        )
+    } else if let Some(rename) = file.rename.as_ref().filter(|r| r.from != file.path) {
+        // A rename with no edits alongside it. Named for what it is rather than
+        // left to the catch-all below, which would report the one change this
+        // file does have as "no hunks".
+        format!(
+            "{} was only renamed from {}, which is not part of any hunk and stays",
+            file.path, rename.from
         )
     } else {
         // A symlink, most likely: `jj file show` yields no content for one, so

@@ -26,23 +26,69 @@ pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, H
                 .filter(|i| !inner_set.contains(i))
                 .collect())
         }
-        Expr::Union(left, right) => {
-            let mut result = evaluate(left, hunks)?;
-            result.extend(evaluate(right, hunks)?);
-            Ok(result)
-        }
-        Expr::Intersection(left, right) => {
-            let left_set = evaluate(left, hunks)?;
-            let right_set = evaluate(right, hunks)?;
-            Ok(left_set.intersection(&right_set).copied().collect())
-        }
-        Expr::Difference(left, right) => {
-            let left_set = evaluate(left, hunks)?;
-            let right_set = evaluate(right, hunks)?;
-            Ok(left_set.difference(&right_set).copied().collect())
+        Expr::Union(..) | Expr::Intersection(..) | Expr::Difference(..) => {
+            evaluate_chain(expr, hunks)
         }
         Expr::Function(name, args) => evaluate_function(name, args, hunks),
     }
+}
+
+/// Evaluate a run of binary operators without recursing down its left spine.
+///
+/// `a | b | c | ...` parses into a left-leaning tree, so its spine is as long
+/// as the chain -- and the parser's nesting guard cannot see that, because it
+/// builds the chain in a loop rather than by recursing. Walking that spine
+/// recursively overflowed the stack and aborted the process (`fatal runtime
+/// error: stack overflow`) at around 40_000 terms, reachable through
+/// `--spec-file` or stdin where no argv limit applies.
+///
+/// Descending iteratively leaves only real nesting on the stack -- parentheses
+/// and stacked `~`, both of which the parser *does* bound -- so evaluation
+/// depth is capped by `MAX_DEPTH` no matter how long the chain is.
+fn evaluate_chain(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
+    enum Op {
+        Union,
+        Intersection,
+        Difference,
+    }
+
+    // Unwind the spine to its leftmost leaf, remembering each operator and the
+    // right operand it applies to.
+    let mut spine: Vec<(Op, &Expr)> = Vec::new();
+    let mut node = expr;
+    loop {
+        match node {
+            Expr::Union(left, right) => {
+                spine.push((Op::Union, right));
+                node = left;
+            }
+            Expr::Intersection(left, right) => {
+                spine.push((Op::Intersection, right));
+                node = left;
+            }
+            Expr::Difference(left, right) => {
+                spine.push((Op::Difference, right));
+                node = left;
+            }
+            _ => break,
+        }
+    }
+
+    // Then fold back up, innermost first, which is the order the recursive
+    // version applied them in.
+    let mut acc = evaluate(node, hunks)?;
+    for (op, right) in spine.into_iter().rev() {
+        let rhs = evaluate(right, hunks)?;
+        acc = match op {
+            Op::Union => {
+                acc.extend(rhs);
+                acc
+            }
+            Op::Intersection => acc.intersection(&rhs).copied().collect(),
+            Op::Difference => acc.difference(&rhs).copied().collect(),
+        };
+    }
+    Ok(acc)
 }
 
 /// Check that the `semantic` feature is enabled. Returns an error if not.
@@ -56,18 +102,48 @@ fn require_semantic(name: &str) -> Result<(), HunksetError> {
     Err(HunksetError::SemanticFeatureRequired { name: name.to_string() })
 }
 
-/// Compile patterns, forcing exact match for enum-like values (type, status, extension).
-fn compile_exact(args: &[Arg]) -> Result<Vec<CompiledPattern>, HunksetError> {
+/// The kind a predicate assumes for an argument whose kind the parser only
+/// inferred.
+///
+/// The parser cannot know: it gives an unquoted word `Exact` and a quoted
+/// string `Substring`, which is right for some predicates and wrong for others.
+/// `extension(rs)` wants whole-value equality; `added(TODO)` wants a substring,
+/// and comparing a whole hunk's added text to the word `TODO` for equality
+/// matched nothing at exit 0 -- and, under `~`, everything.
+///
+/// An explicit `kind:"value"` is never overridden. Silently replacing a kind
+/// the user asked for is how a misunderstood query becomes an empty result.
+fn default_kind(name: &str) -> Option<PatternKind> {
+    match name {
+        "glob" => Some(PatternKind::Glob),
+        // Paths and enum-like values name one thing exactly. Substring
+        // matching here quietly pulled in `CacheManager` for `scope("Cache")`,
+        // contradicting the README.
+        "file" | "extension" | "status" | "type" | "function" | "scope" => Some(PatternKind::Exact),
+        // Text predicates look *inside* a blob, so a bare word is a substring.
+        "content" | "added" | "removed" | "annotation" | "decorator" => {
+            Some(PatternKind::Substring)
+        }
+        // `id()` resolves its own argument; see `eval_id`.
+        _ => None,
+    }
+}
+
+/// Compile a predicate's arguments with its default kind already applied.
+///
+/// The defaulting happens *before* compilation, so every pattern -- whatever
+/// kind it ends up with -- is checked once, up front, where `evaluate_function`
+/// can return the error. Predicates used to re-derive their kind and re-compile
+/// behind an `unwrap()`, which meant the up-front pass validated a `Substring`
+/// that was never used while the `Glob` that was actually matched with had
+/// never been checked at all.
+fn compile_args(name: &str, args: &[Arg]) -> Result<Vec<CompiledPattern>, HunksetError> {
+    let default = default_kind(name);
     let patterns: Vec<StringPattern> = extract_patterns(args)
         .into_iter()
-        .map(|p| {
-            // Only override the kind the parser *inferred*. An explicit
-            // `substring:"..."` means the user asked for substring matching.
-            if p.kind == PatternKind::Substring && !p.explicit {
-                StringPattern::inferred(PatternKind::Exact, p.value)
-            } else {
-                p
-            }
+        .map(|p| match default {
+            Some(kind) if !p.explicit => StringPattern::inferred(kind, p.value),
+            _ => p,
         })
         .collect();
     compile_patterns(patterns)
@@ -213,22 +289,23 @@ fn validate_args(name: &str, args: &[Arg]) -> Result<(), HunksetError> {
 
 fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
     validate_args(name, args)?;
-    // Pre-compile patterns (validates regex upfront)
-    let compiled = compile_patterns(extract_patterns(args))?;
+    // Compile once, up front, with this predicate's default kind applied, so
+    // every malformed regex *and* every malformed glob is reported here rather
+    // than turning into a silent non-match inside a predicate.
+    let compiled = compile_args(name, args)?;
 
     match name.as_ref() {
-        "file" => Ok(eval_file(args, hunks)),
-        "glob" => Ok(eval_glob(args, hunks)),
-        "extension" => { let exact = compile_exact(args)?; Ok(eval_extension(&exact, hunks)) }
+        // `file()` and `glob()` filter the same field and differ only in the
+        // kind they assume for an argument without a prefix.
+        "file" | "glob" => Ok(eval_path(&compiled, hunks)),
+        "extension" => Ok(eval_extension(&compiled, hunks)),
         "status" => {
             validate_enum_args("status", args, VALID_STATUSES)?;
-            let exact = compile_exact(args)?;
-            Ok(eval_status(&exact, hunks))
+            Ok(eval_status(&compiled, hunks))
         }
         "type" => {
             validate_enum_args("type", args, VALID_TYPES)?;
-            let exact = compile_exact(args)?;
-            Ok(eval_type(&exact, hunks))
+            Ok(eval_type(&compiled, hunks))
         }
         "lines" => Ok(eval_lines(args, hunks, LineRangeMode::Either)),
         "before_line" => Ok(eval_lines(args, hunks, LineRangeMode::Before)),
@@ -239,18 +316,13 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "id" => eval_id(&compiled, hunks),
         "function" => {
             require_semantic(name)?;
-            // Identifiers match exactly unless a prefix says otherwise --
-            // substring matching here silently pulled in CacheManager for
-            // scope("Cache"), contradicting the README.
-            let exact = compile_exact(args)?;
-            let r = eval_semantic(&exact, hunks, SemanticField::Function);
+            let r = eval_semantic(&compiled, hunks, SemanticField::Function);
             warn_if_nothing_analyzed(name, &r, hunks);
             Ok(r)
         }
         "scope" => {
             require_semantic(name)?;
-            let exact = compile_exact(args)?;
-            let r = eval_semantic(&exact, hunks, SemanticField::Scope);
+            let r = eval_semantic(&compiled, hunks, SemanticField::Scope);
             warn_if_nothing_analyzed(name, &r, hunks);
             Ok(r)
         }
@@ -330,34 +402,10 @@ fn extract_ranges(args: &[Arg]) -> Vec<(usize, usize)> {
 
 // --- file predicates ---
 
-/// file() defaults to exact matching for paths (not substring).
-/// Users can explicitly use `glob:` or `substring:` prefixes.
-fn eval_file(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    // unwrap: regex patterns were already validated in evaluate_function
-    let patterns = compile_exact(args).unwrap();
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| patterns.iter().any(|p| p.matches(h.file_path)))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-fn eval_glob(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns: Vec<CompiledPattern> = extract_patterns(args)
-        .into_iter()
-        // Default to glob matching, but honour an explicit prefix.
-        .map(|p| {
-            let pattern = if p.explicit { p } else { StringPattern::inferred(PatternKind::Glob, p.value) };
-            CompiledPattern::compile(&pattern).unwrap()
-        })
-        .collect();
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| patterns.iter().any(|p| p.matches(h.file_path)))
-        .map(|(i, _)| i)
-        .collect()
+/// Match a hunk's file path. `file()` and `glob()` are this same filter under
+/// two different defaults, chosen by [`default_kind`].
+fn eval_path(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    filter_by_field(patterns, hunks, |h| h.file_path)
 }
 
 fn eval_extension(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
@@ -456,12 +504,33 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
 /// `exact:"..."` disables prefix matching. Every full id is the same length,
 /// so one can never prefix another and the escape hatch is not needed for
 /// that; it is there for anyone who wants to rule abbreviation out.
+///
+/// An id naming *no* hunk is an error too, for the same reason ambiguity is:
+/// `id()` names a specific hunk, so a name that fits none of them is a mistake
+/// -- a stale id from an earlier listing, or a typo -- not a query that
+/// legitimately came back empty the way `extension(rs)` can in a diff with no
+/// Rust in it. Silently, `~id("hunk-typo")` was the whole diff.
 fn eval_id(
     patterns: &[CompiledPattern],
     hunks: &[EnrichedHunk],
 ) -> Result<HashSet<usize>, HunksetError> {
     let mut selected = HashSet::new();
     for p in patterns {
+        // `id()` reads its argument as an id, not as text to match with, so
+        // any kind but `exact:` would be quietly ignored. `~id(substring:"e2d4")`
+        // asked to drop every hunk whose id *contains* e2d4 and got prefix
+        // matching instead -- keeping hunks it was told to drop.
+        if let Some(kind) = p.explicit_kind() {
+            if kind != "exact" {
+                return Err(HunksetError::InvalidArgument {
+                    func: "id".to_string(),
+                    value: format!("{kind}:\"{}\"", p.value()),
+                    valid: "a plain id, or exact:\"<id>\" to rule out abbreviation -- \
+                            id() resolves ids, it does not pattern-match them"
+                        .to_string(),
+                });
+            }
+        }
         let Some(id) = crate::diff::normalize_hunk_id(p.value()) else {
             return Err(HunksetError::InvalidArgument {
                 func: "id".to_string(),
@@ -469,7 +538,7 @@ fn eval_id(
                 valid: "a hunk id such as hunk-4c1b1b3... (or an unambiguous prefix)".to_string(),
             });
         };
-        let exact_only = p.kind_is_exact();
+        let exact_only = p.is_explicitly_exact();
         let matched: Vec<usize> = hunks
             .iter()
             .enumerate()
@@ -500,6 +569,11 @@ fn eval_id(
                 prefix: p.value().to_string(),
                 count: matched.len(),
                 candidates: which.join(", "),
+            });
+        }
+        if matched.is_empty() {
+            return Err(HunksetError::UnknownId {
+                id: p.value().to_string(),
             });
         }
         selected.extend(matched);
@@ -925,6 +999,399 @@ mod tests {
             EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
         ];
         assert_eq!(evaluate(&parse(r#"added(regex:"fn\s+\w+")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
+    }
+
+    // -- bug: a malformed glob matched nothing, and `~` made that everything --
+
+    /// Two hunks in two files, the second of which a selector would typically
+    /// be written to exclude.
+    fn two_files() -> (Hunk, Hunk) {
+        (
+            make_hunk(0, "insert", "", "src change\n"),
+            make_hunk(1, "insert", "", "vendor change\n"),
+        )
+    }
+
+    fn enrich<'a>(src: &'a Hunk, vendor: &'a Hunk) -> Vec<EnrichedHunk<'a>> {
+        vec![
+            EnrichedHunk { file_path: "src.txt", file_status: "modified", hunk: src },
+            EnrichedHunk { file_path: "vendor/lib.txt", file_status: "modified", hunk: vendor },
+        ]
+    }
+
+    fn eval_err(spec: &str, hunks: &[EnrichedHunk]) -> HunksetError {
+        let expr = parse(spec).unwrap_or_else(|e| panic!("{spec} should parse: {e}"));
+        evaluate(&expr, hunks)
+            .err()
+            .unwrap_or_else(|| panic!("{spec} should not have been accepted"))
+    }
+
+    /// The reported shape: an unterminated character class compiled to a
+    /// pattern that matched nothing, which `~` inverted into the whole diff --
+    /// so `split` committed the very hunk the selector existed to hold back.
+    #[test]
+    fn a_malformed_glob_is_an_error_not_a_selector_that_matches_nothing() {
+        let (src, vendor) = two_files();
+        let enriched = enrich(&src, &vendor);
+
+        let err = eval_err(r#"~glob("vendor/[a-z*.txt")"#, &enriched);
+        assert!(
+            matches!(err, HunksetError::InvalidGlob { .. }),
+            "expected a glob error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("vendor/[a-z*.txt"),
+            "the message should quote the pattern: {err}"
+        );
+    }
+
+    /// Not only under `~`: a malformed glob anywhere is a typo, and silently
+    /// missing is how a typo goes unnoticed.
+    #[test]
+    fn a_malformed_glob_is_an_error_without_a_negation_too() {
+        let (src, vendor) = two_files();
+        let enriched = enrich(&src, &vendor);
+        for spec in [
+            r#"glob("vendor/[a-z*.txt")"#,
+            r#"glob("src/**/[abc")"#,
+            r#"glob("a{b,c")"#,
+            r#"glob("*.{c,h}}")"#,
+            r#"glob("[z-a]")"#,
+            r#"glob("x") | glob("{unclosed")"#,
+            r#"all() ~ glob("vendor/[a-")"#,
+        ] {
+            assert!(
+                matches!(eval_err(spec, &enriched), HunksetError::InvalidGlob { .. }),
+                "{spec} should be a glob error"
+            );
+        }
+    }
+
+    /// An explicit `glob:` prefix reaches the same check, whichever predicate
+    /// it is written on -- those used to compile behind an `unwrap()` on a
+    /// pattern the up-front pass had never looked at.
+    #[test]
+    fn an_explicit_glob_prefix_is_validated_on_every_predicate() {
+        let (src, vendor) = two_files();
+        let enriched = enrich(&src, &vendor);
+        for spec in [
+            r#"file(glob:"vendor/[a-")"#,
+            r#"~file(glob:"vendor/[a-")"#,
+            r#"content(glob:"[a-")"#,
+            r#"extension(glob:"[a-")"#,
+        ] {
+            assert!(
+                matches!(eval_err(spec, &enriched), HunksetError::InvalidGlob { .. }),
+                "{spec} should be a glob error"
+            );
+        }
+    }
+
+    /// The fix must not cost well-formed globs anything.
+    #[test]
+    fn well_formed_globs_still_select() {
+        let (src, vendor) = two_files();
+        let enriched = enrich(&src, &vendor);
+        let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
+        assert_eq!(selects(r#"glob("vendor/**")"#), HashSet::from([1]));
+        assert_eq!(selects(r#"~glob("vendor/**")"#), HashSet::from([0]));
+        assert_eq!(selects(r#"glob("vendor/[a-z]*.txt")"#), HashSet::from([1]));
+        assert_eq!(selects(r#"glob("*.{txt,md}")"#), HashSet::from([0]));
+        assert_eq!(selects(r#"file(glob:"vendor/**")"#), HashSet::from([1]));
+    }
+
+    // -- bug: the `explicit` flag was dropped, so a bare id matched nothing --
+
+    /// A hunk id is a name, and `list` prints an abbreviation of it. Whether
+    /// the user quotes that abbreviation cannot change what it means.
+    #[test]
+    fn an_abbreviated_id_resolves_whether_or_not_it_is_quoted() {
+        let h = make_hunk(0, "insert", "", "x\n");
+        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        // `hunk-00000000...`: any prefix of it names this hunk.
+        let prefix = &h.id[..12];
+        let quoted = format!(r#"id("{prefix}")"#);
+        let bare = format!("id({prefix})");
+
+        let expected = HashSet::from([0]);
+        assert_eq!(evaluate(&parse(&quoted).unwrap(), &enriched).unwrap(), expected);
+        assert_eq!(
+            evaluate(&parse(&bare).unwrap(), &enriched).unwrap(),
+            expected,
+            "an unquoted abbreviation must resolve like a quoted one"
+        );
+        // The full id and the printed short id both work, quoted or not.
+        for spec in [
+            format!(r#"id("{}")"#, h.id),
+            format!("id({})", h.id),
+            format!(r#"id("{}")"#, h.short_id),
+            format!("id({})", h.short_id),
+        ] {
+            assert_eq!(evaluate(&parse(&spec).unwrap(), &enriched).unwrap(), expected, "{spec}");
+        }
+    }
+
+    /// `make_hunk` numbers its ids, so two of them differ only in the last
+    /// digit and no abbreviation tells them apart. Give each one a distinct
+    /// leading digit instead, the way real digests differ.
+    fn make_hunk_with_distinct_id(index: usize, hex: char) -> Hunk {
+        let mut hunk = make_hunk(index, "insert", "", "x\n");
+        hunk.id = format!("hunk-{}", String::from(hex).repeat(64));
+        hunk.short_id = format!("hunk-{}", String::from(hex).repeat(8));
+        hunk
+    }
+
+    /// The negated form is where dropping the flag did damage: an id that
+    /// resolved to nothing left `~` selecting the entire diff.
+    #[test]
+    fn negating_a_bare_abbreviated_id_excludes_exactly_that_hunk() {
+        let h1 = make_hunk_with_distinct_id(0, 'a');
+        let h2 = make_hunk_with_distinct_id(1, 'b');
+        let enriched = vec![
+            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
+            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+        ];
+        assert_eq!(
+            evaluate(&parse("~id(hunk-aaaa)").unwrap(), &enriched).unwrap(),
+            HashSet::from([1])
+        );
+        assert_eq!(
+            evaluate(&parse(r#"~id("hunk-aaaa")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([1]),
+            "quoting must not change which hunks are left"
+        );
+    }
+
+    /// An abbreviation naming two hunks is still an error, not a multi-select.
+    #[test]
+    fn an_ambiguous_bare_abbreviation_is_still_an_error() {
+        let h1 = make_hunk_with_distinct_id(0, 'a');
+        let mut h2 = make_hunk_with_distinct_id(1, 'a');
+        h2.id.replace_range(60.., "bbbb");
+        let enriched = vec![
+            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
+            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+        ];
+        assert!(matches!(
+            eval_err("id(hunk-aaaa)", &enriched),
+            HunksetError::AmbiguousId { .. }
+        ));
+    }
+
+    /// `exact:` still means what it says: the full id or the printed short id,
+    /// and no other abbreviation.
+    #[test]
+    fn explicit_exact_still_rules_out_abbreviation() {
+        let h = make_hunk(0, "insert", "", "x\n");
+        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+
+        for spec in [
+            format!(r#"id(exact:"{}")"#, h.id),
+            format!(r#"id(exact:"{}")"#, h.short_id),
+        ] {
+            assert_eq!(
+                evaluate(&parse(&spec).unwrap(), &enriched).unwrap(),
+                HashSet::from([0]),
+                "{spec}"
+            );
+        }
+
+        // A shorter prefix is not a name `exact:` accepts.
+        let spec = format!(r#"id(exact:"{}")"#, &h.id[..12]);
+        assert!(matches!(
+            eval_err(&spec, &enriched),
+            HunksetError::UnknownId { .. }
+        ));
+    }
+
+    /// An id that names nothing is a mistake -- a typo, or an id copied from a
+    /// listing that has since moved on -- not an empty answer. Under `~` the
+    /// empty answer was the whole diff.
+    #[test]
+    fn an_id_that_names_no_hunk_is_an_error() {
+        let h = make_hunk(0, "insert", "", "x\n");
+        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        for spec in [
+            r#"id("hunk-ffffffff")"#,
+            r#"~id("hunk-ffffffff")"#,
+            "id(hunk-ffffffff)",
+        ] {
+            let err = eval_err(spec, &enriched);
+            assert!(
+                matches!(err, HunksetError::UnknownId { .. }),
+                "{spec} should be an unknown-id error, got: {err}"
+            );
+            assert!(err.to_string().contains("hunk-ffffffff"), "{err}");
+        }
+    }
+
+    /// `id()` resolves ids; it does not match text. Any prefix but `exact:`
+    /// would be quietly ignored, and `~id(substring:"...")` then kept hunks it
+    /// had been told to drop.
+    #[test]
+    fn id_rejects_a_pattern_kind_it_cannot_honour() {
+        let mut h = make_hunk(0, "insert", "", "x\n");
+        h.id = format!("hunk-{}", "abcdef01".repeat(8));
+        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        // A real substring of the id, but not a prefix: substring matching
+        // would have found it and prefix matching cannot, so honouring the
+        // prefix the user wrote is the difference between a hit and a miss.
+        let middle = "ef01abcd";
+        for kind in ["substring", "glob", "regex"] {
+            let spec = format!(r#"id({kind}:"{middle}")"#);
+            let err = eval_err(&spec, &enriched);
+            assert!(
+                matches!(err, HunksetError::InvalidArgument { .. }),
+                "{spec} should be rejected, got: {err}"
+            );
+            assert!(err.to_string().contains(kind), "{err}");
+        }
+    }
+
+    // -- bug: an inferred kind made bare words unmatchable ------------------
+
+    /// A bare word in a text predicate is a substring, not a demand that the
+    /// hunk's whole added text equal it -- which nothing ever does.
+    #[test]
+    fn a_bare_word_in_a_text_predicate_is_a_substring() {
+        let h1 = make_hunk(0, "insert", "", "// TODO: fix this\n");
+        let h2 = make_hunk(1, "replace", "old code\n", "new code\n");
+        let enriched = vec![
+            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
+            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+        ];
+        let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
+        assert_eq!(selects("added(TODO)"), HashSet::from([0]));
+        assert_eq!(selects("content(TODO)"), HashSet::from([0]));
+        assert_eq!(selects("removed(old)"), HashSet::from([1]));
+        // Quoting changes nothing, and `~` still means the complement of a
+        // set that was actually found.
+        assert_eq!(selects(r#"added("TODO")"#), HashSet::from([0]));
+        assert_eq!(selects("~added(TODO)"), HashSet::from([1]));
+    }
+
+    /// Path and enum predicates keep matching whole values: `extension(rs)`
+    /// must not start matching `.rss`.
+    #[test]
+    fn a_bare_word_in_a_path_or_enum_predicate_still_matches_the_whole_value() {
+        let h1 = make_hunk(0, "insert", "", "x\n");
+        let h2 = make_hunk(1, "insert", "", "y\n");
+        let enriched = vec![
+            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
+            EnrichedHunk { file_path: "b.rss", file_status: "modified", hunk: &h2 },
+        ];
+        let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
+        assert_eq!(selects("extension(rs)"), HashSet::from([0]));
+        assert_eq!(selects(r#"file("a.rs")"#), HashSet::from([0]));
+        // An explicit prefix is still honoured over the default.
+        assert_eq!(selects(r#"extension(substring:"rs")"#), HashSet::from([0, 1]));
+    }
+
+    // -- bug: an operator chain overflowed the stack -------------------------
+
+    /// How long a chain the guards must survive. The reported crash was at
+    /// 100_000 terms; 40_000 already aborted a debug build.
+    const LONG_CHAIN: usize = 100_000;
+
+    /// Build, evaluate and free `spec` on a 2 MiB stack -- what a spawned
+    /// thread gets by default, well under the main thread's 8 MiB.
+    ///
+    /// A stack overflow aborts the process rather than failing the test, which
+    /// is the point: it is exactly the crash under test, and it cannot be
+    /// mistaken for a passing run.
+    fn evaluate_on_a_small_stack(spec: String) -> usize {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let h = make_hunk(0, "insert", "", "x\n");
+                let enriched =
+                    vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+                let expr = parse(&spec).expect("chain should parse");
+                let selected = evaluate(&expr, &enriched).expect("chain should evaluate");
+                drop(expr);
+                selected.len()
+            })
+            .expect("spawn")
+            .join()
+            .expect("a long chain overflowed a 2 MiB stack")
+    }
+
+    /// `a | a | a | ...` is a left-leaning tree as long as the chain. The
+    /// parser builds it in a loop, so its nesting guard never fires, and both
+    /// evaluating it and freeing it used to walk that spine recursively.
+    #[test]
+    fn a_long_union_chain_does_not_overflow_the_stack() {
+        let chain = vec!["all()"; LONG_CHAIN].join(" | ");
+        assert_eq!(evaluate_on_a_small_stack(chain), 1);
+    }
+
+    #[test]
+    fn a_long_intersection_chain_does_not_overflow_the_stack() {
+        let chain = vec!["all()"; LONG_CHAIN].join(" & ");
+        assert_eq!(evaluate_on_a_small_stack(chain), 1);
+    }
+
+    /// Mixed operators build the same left spine through two different loops.
+    #[test]
+    fn a_long_mixed_chain_does_not_overflow_the_stack() {
+        let mut chain = String::from("all()");
+        for i in 0..LONG_CHAIN {
+            chain.push_str(if i % 2 == 0 { " | all()" } else { " & all()" });
+        }
+        assert_eq!(evaluate_on_a_small_stack(chain), 1);
+    }
+
+    /// A difference chain needs its parentheses, so it is deep *and* long:
+    /// the parentheses are capped by the parser, and what is left is spine.
+    #[test]
+    fn a_long_chain_under_the_nesting_limit_does_not_overflow_the_stack() {
+        // 100 levels of parentheses -- inside the parser's limit -- wrapped
+        // around a long chain, so both guards are exercised at once.
+        let chain = vec!["all()"; LONG_CHAIN].join(" | ");
+        let nested = format!("{}{chain}{}", "(".repeat(100), ")".repeat(100));
+        assert_eq!(evaluate_on_a_small_stack(nested), 1);
+    }
+
+    /// Freeing the tree is its own recursion: a chain that evaluates fine
+    /// still has to be dismantled, and the derived drop glue walked the spine.
+    #[test]
+    fn freeing_a_long_chain_does_not_overflow_the_stack() {
+        let chain = vec!["none()"; LONG_CHAIN].join(" | ");
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let expr = parse(&chain).expect("chain should parse");
+                drop(expr);
+            })
+            .expect("spawn")
+            .join()
+            .expect("freeing a long chain overflowed a 2 MiB stack");
+    }
+
+    /// The chain still means what it says once it no longer crashes.
+    #[test]
+    fn a_chain_evaluates_left_to_right() {
+        let h1 = make_hunk(0, "insert", "", "x\n");
+        let h2 = make_hunk(1, "delete", "y\n", "");
+        let h3 = make_hunk(2, "replace", "a\n", "b\n");
+        let enriched = vec![
+            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
+            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk { file_path: "c.rs", file_status: "modified", hunk: &h3 },
+        ];
+        let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
+        assert_eq!(
+            selects("type(insert) | type(delete) | type(replace)"),
+            HashSet::from([0, 1, 2])
+        );
+        // `&` binds tighter than `|`, so this is a | (b & c) -- unchanged by
+        // folding the spine iteratively.
+        assert_eq!(
+            selects("type(insert) | type(delete) & type(replace)"),
+            HashSet::from([0])
+        );
+        assert_eq!(selects("all() & ~type(delete) & ~type(replace)"), HashSet::from([0]));
+        assert_eq!(selects("(all() ~ type(delete)) ~ type(replace)"), HashSet::from([0]));
     }
 
     #[test]

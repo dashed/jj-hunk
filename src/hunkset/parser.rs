@@ -668,16 +668,18 @@ mod tests {
     #[test]
     fn parse_precedence() {
         // a | b & c should parse as a | (b & c)
-        match parse("type(insert) | type(replace) & file(\"x\")").unwrap() {
-            Expr::Union(_, right) => assert!(matches!(*right, Expr::Intersection(_, _))),
+        // Matched by reference: `Expr` frees itself iteratively and so cannot
+        // be destructured by value.
+        match &parse("type(insert) | type(replace) & file(\"x\")").unwrap() {
+            Expr::Union(_, right) => assert!(matches!(**right, Expr::Intersection(_, _))),
             other => panic!("expected union, got {:?}", other),
         }
     }
 
     #[test]
     fn parse_parenthesized() {
-        match parse("(type(insert) | type(replace)) & file(\"x\")").unwrap() {
-            Expr::Intersection(left, _) => assert!(matches!(*left, Expr::Union(_, _))),
+        match &parse("(type(insert) | type(replace)) & file(\"x\")").unwrap() {
+            Expr::Intersection(left, _) => assert!(matches!(**left, Expr::Union(_, _))),
             other => panic!("expected intersection, got {:?}", other),
         }
     }
@@ -707,7 +709,7 @@ mod tests {
 
     #[test]
     fn parse_multiple_args() {
-        match parse(r#"id("hunk-aabb", "hunk-ccdd")"#).unwrap() {
+        match &parse(r#"id("hunk-aabb", "hunk-ccdd")"#).unwrap() {
             Expr::Function(name, args) => {
                 assert_eq!(name, "id");
                 assert_eq!(args.len(), 2);
@@ -718,8 +720,8 @@ mod tests {
 
     #[test]
     fn parse_double_negation() {
-        match parse("~~type(delete)").unwrap() {
-            Expr::Negation(inner) => assert!(matches!(*inner, Expr::Negation(_))),
+        match &parse("~~type(delete)").unwrap() {
+            Expr::Negation(inner) => assert!(matches!(**inner, Expr::Negation(_))),
             other => panic!("expected double negation, got {:?}", other),
         }
     }

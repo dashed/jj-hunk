@@ -4889,3 +4889,775 @@ fn diffedit_keeping_every_hunk_keeps_the_exec_bit() {
         "keeping every hunk still discarded the chmod from history:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --format diff under a spec: after-side coordinates
+// ---------------------------------------------------------------------------
+
+/// As [`patch_for`], but the listing is filtered first, so the emitted patch is
+/// a strict subset of the diff. That is the case where the after-side line
+/// numbers stop being readable off the working copy.
+fn patch_for_spec(repo: &TestRepo, name: &str, base: &str, modified: &str, spec: &str) -> String {
+    repo.write_file(name, base);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file(name, modified);
+    let patch = repo.hunk_ok(&["list", "--format", "diff", "--spec", spec]);
+    repo.write_file(name, base); // reset to base for a clean apply
+    patch
+}
+
+/// `n` copies of one 7-line block, all identical.
+///
+/// The repetition is the point. `git apply` anchors its search on the `@@`
+/// after-side start and slides to the nearest match, so against unique context
+/// a wrong start still lands on the right lines and no assertion about the file
+/// could see it. Identical blocks make a wrong start rewrite a *different*
+/// block, which the content does show.
+fn repeated_blocks(n: usize) -> String {
+    "X\nY\nZ\nMARK\nP\nQ\nR\n".repeat(n)
+}
+
+fn lines_of(text: &str) -> Vec<String> {
+    text.lines().map(|l| format!("{l}\n")).collect()
+}
+
+/// Just the ranges of each `@@` header, without the trailing scope and id.
+fn hunk_headers(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter(|l| l.starts_with("@@"))
+        .map(|l| format!("{} @@", l.split(" @@").next().unwrap_or(l)))
+        .collect()
+}
+
+/// A spec that drops an *insertion* sitting before the hunk it keeps.
+///
+/// The after-side start used to be read straight off the working-copy
+/// coordinate, so it still counted the 20 lines this patch does not carry.
+/// `git apply` reported "Hunk #1 succeeded at 36 (offset -13 lines) ... Applied
+/// patch cleanly" and rewrote the sixth block instead of the fifth, at exit 0.
+#[test]
+fn diff_format_spec_filtered_patch_edits_the_hunks_own_lines() {
+    let repo = TestRepo::new("diff-fmt-spec-dropped-insert");
+    let base = repeated_blocks(6);
+
+    let mut body = lines_of(&base);
+    body[31] = "MARK-EDITED\n".to_string(); // the fifth MARK: parent line 32
+    let top: String = (1..=20).map(|i| format!("TOP{i}\n")).collect();
+    let modified = format!("{top}{}", body.concat());
+
+    let patch = patch_for_spec(&repo, "f.txt", &base, &modified, "type(replace)");
+
+    // The file first: a header nobody applies proves nothing, and asserting on
+    // the header alone is how this survived a suite that already checked it.
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "git apply rejected:\n{err}\npatch:\n{patch}");
+
+    let mut expected = lines_of(&base);
+    expected[31] = "MARK-EDITED\n".to_string();
+    let got = std::fs::read_to_string(repo.path().join("f.txt")).unwrap();
+    assert_eq!(
+        got,
+        expected.concat(),
+        "the patch rewrote a different block\npatch:\n{patch}"
+    );
+
+    assert_eq!(
+        hunk_headers(&patch),
+        vec!["@@ -29,7 +29,7 @@"],
+        "the dropped insertion must not be counted on the + side\n{patch}"
+    );
+}
+
+/// The same, with the dropped hunk a *deletion*: that skews the after side the
+/// other way, putting the `+` start 20 lines too early rather than too late.
+#[test]
+fn diff_format_spec_filtered_patch_survives_a_dropped_deletion() {
+    let repo = TestRepo::new("diff-fmt-spec-dropped-delete");
+    let head: String = (1..=20).map(|i| format!("DROPME{i}\n")).collect();
+    let blocks = repeated_blocks(6);
+    let base = format!("{head}{blocks}");
+
+    // Delete the head, and edit the fifth MARK -- parent line 20 + 32 = 52.
+    let mut body = lines_of(&blocks);
+    body[31] = "MARK-EDITED\n".to_string();
+    let modified = body.concat();
+
+    let patch = patch_for_spec(&repo, "f.txt", &base, &modified, "type(replace)");
+
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "git apply rejected:\n{err}\npatch:\n{patch}");
+
+    let mut expected = lines_of(&base);
+    expected[51] = "MARK-EDITED\n".to_string();
+    let got = std::fs::read_to_string(repo.path().join("f.txt")).unwrap();
+    assert_eq!(
+        got,
+        expected.concat(),
+        "the patch rewrote a different block\npatch:\n{patch}"
+    );
+
+    assert_eq!(
+        hunk_headers(&patch),
+        vec!["@@ -49,7 +49,7 @@"],
+        "the dropped deletion must not be counted on the + side\n{patch}"
+    );
+}
+
+/// Several dropped hunks, and two kept ones: the second kept block has to be
+/// offset by what the *first kept block* added and by nothing else. Excluding
+/// the dropped hunks but forgetting the kept ones leaves this one wrong.
+#[test]
+fn diff_format_spec_filtered_patch_accumulates_only_what_it_emits() {
+    let repo = TestRepo::new("diff-fmt-spec-many-dropped");
+    let base = repeated_blocks(12);
+
+    let mut body = lines_of(&base);
+    // Kept: one MARK grows into two lines (block 4, parent line 25).
+    body[24] = "M4a\nM4b\n".to_string();
+    // Kept: another MARK is replaced one for one (block 11, parent line 74).
+    body[73] = "M11\n".to_string();
+    // Dropped: an insertion between the two, and one at the very top.
+    body.insert(49, "MID1\nMID2\nMID3\nMID4\nMID5\nMID6\n".to_string());
+    let top: String = (1..=4).map(|i| format!("TOP{i}\n")).collect();
+    let modified = format!("{top}{}", body.concat());
+
+    let patch = patch_for_spec(&repo, "f.txt", &base, &modified, "type(replace)");
+
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "git apply rejected:\n{err}\npatch:\n{patch}");
+
+    let mut expected = lines_of(&base);
+    expected[24] = "M4a\nM4b\n".to_string();
+    expected[73] = "M11\n".to_string();
+    let got = std::fs::read_to_string(repo.path().join("f.txt")).unwrap();
+    assert_eq!(
+        got,
+        expected.concat(),
+        "the patch rewrote different blocks\npatch:\n{patch}"
+    );
+
+    assert_eq!(
+        hunk_headers(&patch),
+        // The second block starts one line later than its before-side twin:
+        // the one line the first block adds, and none of the 10 dropped.
+        vec!["@@ -22,7 +22,8 @@", "@@ -71,7 +72,7 @@"],
+        "after-side starts must count only the emitted hunks\n{patch}"
+    );
+}
+
+/// Two files in one patch. The running offset belongs to a file, not to the
+/// patch: carrying it across the `---` boundary would skew the second file by
+/// whatever the first one happened to add.
+#[test]
+fn diff_format_spec_filtered_patch_restarts_the_offset_per_file() {
+    let repo = TestRepo::new("diff-fmt-spec-two-files");
+    let base = repeated_blocks(6);
+
+    let mut body = lines_of(&base);
+    // The fifth MARK becomes six lines. The size matters: a carried-over offset
+    // has to be big enough to put the next file's anchor closer to the *next*
+    // identical block than to its own, or `git apply` slides back and the file
+    // comes out right by luck.
+    body[31] = "E1a\nE1b\nE1c\nE1d\nE1e\nE1f\n".to_string();
+    let top: String = (1..=9).map(|i| format!("TOP{i}\n")).collect();
+    let first = format!("{top}{}", body.concat());
+
+    let mut other = lines_of(&base);
+    other[31] = "E2\n".to_string();
+    let second = format!("{top}{}", other.concat());
+
+    repo.write_file("a.txt", &base);
+    repo.write_file("b.txt", &base);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", &first);
+    repo.write_file("b.txt", &second);
+    let patch = repo.hunk_ok(&["list", "--format", "diff", "--spec", "type(replace)"]);
+    repo.write_file("a.txt", &base);
+    repo.write_file("b.txt", &base);
+
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "git apply rejected:\n{err}\npatch:\n{patch}");
+
+    let mut expected_a = lines_of(&base);
+    expected_a[31] = "E1a\nE1b\nE1c\nE1d\nE1e\nE1f\n".to_string();
+    let mut expected_b = lines_of(&base);
+    expected_b[31] = "E2\n".to_string();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        expected_a.concat(),
+        "patch:\n{patch}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+        expected_b.concat(),
+        "patch:\n{patch}"
+    );
+
+    assert_eq!(
+        hunk_headers(&patch),
+        vec!["@@ -29,7 +29,12 @@", "@@ -29,7 +29,7 @@"],
+        "each file's offset starts at zero\n{patch}"
+    );
+}
+
+/// Dropping the *middle* of three hunks close enough to share one `@@` block.
+/// The two survivors still merge, and the lines between them -- including the
+/// ones the dropped hunk would have changed -- have to be emitted as context,
+/// because this patch does not change them.
+#[test]
+fn diff_format_spec_filtered_patch_drops_a_hunk_from_inside_a_block() {
+    let repo = TestRepo::new("diff-fmt-spec-middle-dropped");
+    let base: String = (1..=20).map(|i| format!("L{i}\n")).collect();
+    let modified: String = (1..=20)
+        .map(|i| match i {
+            8 => "R8\n".to_string(),   // kept   (replace)
+            10 => "L10\nINS\n".to_string(), // dropped (insert)
+            12 => "R12\n".to_string(), // kept   (replace)
+            _ => format!("L{i}\n"),
+        })
+        .collect();
+
+    let patch = patch_for_spec(&repo, "f.txt", &base, &modified, "type(replace)");
+    assert_eq!(
+        patch.lines().filter(|l| l.starts_with("@@")).count(),
+        1,
+        "the survivors are 4 lines apart and must stay one block\n{patch}"
+    );
+
+    let (ok, err) = git_apply(repo.path(), &patch);
+    assert!(ok, "git apply rejected:\n{err}\npatch:\n{patch}");
+
+    let expected: String = (1..=20)
+        .map(|i| match i {
+            8 => "R8\n".to_string(),
+            12 => "R12\n".to_string(),
+            _ => format!("L{i}\n"),
+        })
+        .collect();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+        expected,
+        "patch:\n{patch}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// hunksets and binary files
+// ---------------------------------------------------------------------------
+
+/// `all()` used to mean "all except the binaries": the expression was evaluated
+/// over a diff with binary files skipped, so nothing could name one, while the
+/// spec it produced still said `default: reset`. The binary change was then
+/// dropped from whatever the verb went on to do, with no warning.
+#[test]
+fn hunkset_all_selects_a_binary_files_change_too() {
+    let repo = binary_repo("hunkset-binary-all");
+
+    repo.hunk_ok(&["commit", "all()", "commit everything"]);
+
+    let mut committed = repo.changed_files("@-");
+    committed.sort();
+    assert_eq!(
+        committed,
+        vec!["M bin.dat", "M t.txt"],
+        "the commit is missing the binary change"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "all() left something behind: {:?}",
+        repo.changed_files("@")
+    );
+}
+
+/// And what lands in the commit is the bytes, not a lossy re-encoding of them:
+/// `select` rebuilds a text file line by line, which is exactly what a binary
+/// file must not be put through.
+#[test]
+fn hunkset_all_keeps_binary_bytes_intact() {
+    let repo = binary_repo("hunkset-binary-bytes");
+    let expected = std::fs::read(repo.path().join("bin.dat")).unwrap();
+
+    repo.hunk_ok(&["commit", "all()", "commit everything"]);
+
+    let shown = repo.jj(&["file", "show", "-r", "@-", "file:bin.dat"]);
+    assert!(shown.status.success(), "jj file show failed");
+    assert_eq!(
+        shown.stdout, expected,
+        "the committed binary is not byte for byte what was in the working copy"
+    );
+}
+
+/// `list --spec all()` has to show what the unfiltered listing shows. It used
+/// to hide the binary file that plain `list` reports.
+#[test]
+fn hunkset_list_spec_shows_the_binary_file_all_selects() {
+    let repo = binary_repo("hunkset-binary-list");
+
+    let plain = repo.hunk_ok(&["list", "--format", "text"]);
+    let filtered = repo.hunk_ok(&["list", "--format", "text", "--spec", "all()"]);
+
+    assert!(plain.contains("bin.dat"), "{plain}");
+    assert_eq!(filtered, plain, "all() must not hide the binary file");
+}
+
+/// A file-level predicate names a binary file, and only that file.
+#[test]
+fn hunkset_file_predicate_can_name_a_binary_file_on_its_own() {
+    let repo = binary_repo("hunkset-binary-file");
+
+    repo.hunk_ok(&["commit", "file(\"bin.dat\")", "just the blob"]);
+
+    assert_eq!(repo.changed_files("@-"), vec!["M bin.dat"]);
+    assert_eq!(repo.changed_files("@"), vec!["M t.txt"]);
+}
+
+/// A content-level predicate must not reach one: there are no lines in a binary
+/// file for it to have matched, so selecting it would be a guess.
+#[test]
+fn hunkset_content_predicate_does_not_reach_a_binary_file() {
+    let repo = binary_repo("hunkset-binary-content");
+
+    repo.hunk_ok(&["commit", "added(\"A\")", "just the text"]);
+
+    assert_eq!(repo.changed_files("@-"), vec!["M t.txt"]);
+    assert_eq!(repo.changed_files("@"), vec!["M bin.dat"]);
+}
+
+/// Nor a line-range one. A binary file occupies no line the user could have
+/// been asking about, so `lines()` over the whole file still means the text.
+#[test]
+fn hunkset_line_range_predicate_does_not_reach_a_binary_file() {
+    let repo = binary_repo("hunkset-binary-lines");
+
+    repo.hunk_ok(&["commit", "lines(1..10000)", "just the text"]);
+
+    assert_eq!(repo.changed_files("@-"), vec!["M t.txt"]);
+    assert_eq!(repo.changed_files("@"), vec!["M bin.dat"]);
+}
+
+/// Negation reaches it, though: `~file("t.txt")` is a file-level question, and
+/// the binary file is one of the answers.
+#[test]
+fn hunkset_negation_reaches_a_binary_file() {
+    let repo = binary_repo("hunkset-binary-negation");
+
+    repo.hunk_ok(&["commit", "~file(\"t.txt\")", "everything but the text"]);
+
+    assert_eq!(repo.changed_files("@-"), vec!["M bin.dat"]);
+    assert_eq!(repo.changed_files("@"), vec!["M t.txt"]);
+}
+
+/// A binary file that is *added* rather than modified: `status()` and
+/// `extension()` are file-level too, and `type()` reports what happened to the
+/// file as a whole -- an added binary is an insertion.
+#[test]
+fn hunkset_status_and_extension_name_an_added_binary_file() {
+    let repo = TestRepo::new("hunkset-binary-added");
+    repo.write_file("t.txt", "a\nb\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("t.txt", "A\nb\n");
+    std::fs::write(repo.path().join("new.dat"), [0u8, 1, 2, 0, 255]).unwrap();
+
+    let listed = repo.hunk_ok(&["list", "--format", "text", "--spec", "status(\"added\")"]);
+    assert!(listed.contains("new.dat"), "{listed}");
+    assert!(!listed.contains("t.txt"), "{listed}");
+
+    repo.hunk_ok(&["commit", "extension(\"dat\")", "just the blob"]);
+    assert_eq!(repo.changed_files("@-"), vec!["A new.dat"]);
+    assert_eq!(repo.changed_files("@"), vec!["M t.txt"]);
+}
+
+// ---------------------------------------------------------------------------
+// the `select` child is this binary
+// ---------------------------------------------------------------------------
+
+/// The ids in a spec are hashes computed by *this* build over *this* diff, so
+/// the process that computed them has to be the process that applies them.
+///
+/// A user who follows the docs and persists `[merge-tools.jj-hunk] program =
+/// "jj-hunk"` gets back whatever PATH resolves -- an upstream `cargo install`ed
+/// copy, say, which hashes ids differently. The fork's own guard passes (the
+/// ids are real in its view), the child resolves none of them, and jj commits
+/// the empty selection at exit 0 with every edit still in the working copy. The
+/// decoy below stands in for that child.
+#[test]
+fn split_uses_the_running_binary_not_the_program_named_in_the_config() {
+    let repo = TestRepo::new("split-pins-current-exe");
+    repo.write_file("f.txt", "a\nb\nc\nd\ne\nf\ng\nh\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("f.txt", "A\nb\nc\nd\ne\nf\ng\nH\n");
+
+    let decoy = repo.path().join("decoy-jj-hunk.sh");
+    let marker = repo.path().join("decoy-was-run");
+    std::fs::write(
+        &decoy,
+        format!("#!/bin/sh\necho ran >> {:?}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        &repo.config_path,
+        format!(
+            "[merge-tools.jj-hunk]\nprogram = {:?}\nedit-args = [\"select\", \"$left\", \"$right\"]\n",
+            decoy,
+        ),
+    )
+    .unwrap();
+
+    let out = repo.hunk(&["split", "lines(1)", "first"]);
+    assert!(
+        !marker.exists(),
+        "the configured program ran instead of the binary that computed the ids"
+    );
+    assert!(
+        out.status.success(),
+        "split failed: {}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        "A\nb\nc\nd\ne\nf\ng\nh\n",
+        "only the first hunk should have been split off"
+    );
+    assert_eq!(repo.file_at("@", "f.txt"), "A\nb\nc\nd\ne\nf\ng\nH\n");
+}
+
+/// `edit-args` is pinned for the same reason and not merely for tidiness. A
+/// stale pair with `$left` and `$right` the wrong way round would hand `select`
+/// the two directories reversed, which inverts the entire selection without
+/// failing: the "kept" hunks would be the ones the user asked to leave behind.
+#[test]
+fn commit_ignores_reversed_edit_args_in_the_config() {
+    let repo = TestRepo::new("commit-pins-edit-args");
+    repo.write_file("f.txt", "a\nb\nc\nd\ne\nf\ng\nh\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("f.txt", "A\nb\nc\nd\ne\nf\ng\nH\n");
+
+    std::fs::write(
+        &repo.config_path,
+        format!(
+            "[merge-tools.jj-hunk]\nprogram = {:?}\nedit-args = [\"select\", \"$right\", \"$left\"]\n",
+            jj_hunk_bin(),
+        ),
+    )
+    .unwrap();
+
+    repo.hunk_ok(&["commit", "lines(1)", "just the first hunk"]);
+
+    assert_eq!(
+        repo.file_at("@-", "f.txt"),
+        "A\nb\nc\nd\ne\nf\ng\nh\n",
+        "the selection came out inverted"
+    );
+    assert_eq!(repo.file_at("@", "f.txt"), "A\nb\nc\nd\ne\nf\ng\nH\n");
+}
+
+// ---------------------------------------------------------------------------
+// absorb and renames
+// ---------------------------------------------------------------------------
+
+/// Absorb moves lines; a rename is a whole-file change no hunk selection can
+/// express. `select` performs it as part of whichever spec names the file, so
+/// it rode into the ancestor with the *first* squash -- putting the new name in
+/// a commit every later one still refers to by the old one. Absorb reported "2
+/// moving into 2 ancestors, 0 staying", conflicted that first destination on
+/// the rebase, and gave up with "half-moved / moved: nothing".
+#[test]
+fn absorb_leaves_a_renamed_file_alone_instead_of_carrying_the_rename() {
+    let repo = absorb_stack("absorb-rename-two-targets");
+    std::fs::rename(repo.path().join("f.txt"), repo.path().join("g.txt")).unwrap();
+    // One line B owns and one line C owns: two destinations, which a rename
+    // cannot be split across at all.
+    repo.write_file("g.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+
+    let before = repo.jj_ok(&["diff", "--summary"]);
+    assert!(before.contains("g.txt"), "expected a rename: {before}");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("2 hunks: 0 moving into 0 ancestors, 2 staying"),
+        "{plan}"
+    );
+    assert!(plan.contains("g.txt was renamed from f.txt"), "{plan}");
+
+    let out = repo.hunk_ok(&["absorb"]);
+    assert!(out.contains("Nothing to absorb"), "{out}");
+
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        before.trim(),
+        "absorb changed the working copy after saying nothing would move"
+    );
+    assert_eq!(conflicted_changes(&repo), Vec::<String>::new());
+}
+
+/// Routing to a single ancestor is not the safe case it looks like: the rename
+/// still rides along, into a commit every later one names the old way.
+#[test]
+fn absorb_leaves_a_renamed_file_alone_even_with_one_destination() {
+    let repo = absorb_stack("absorb-rename-one-target");
+    std::fs::rename(repo.path().join("f.txt"), repo.path().join("g.txt")).unwrap();
+    repo.write_file("g.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let before = repo.jj_ok(&["diff", "--summary"]);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("1 hunks: 0 moving into 0 ancestors, 1 staying"),
+        "{plan}"
+    );
+    assert!(plan.contains("g.txt was renamed from f.txt"), "{plan}");
+
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), before.trim());
+    assert_eq!(conflicted_changes(&repo), Vec::<String>::new());
+}
+
+/// A renamed file alongside one that does route. This is where the rename used
+/// to do its damage most quietly: the squash is driven by the *other* file, and
+/// the rename attached itself to it on the way through, so nothing in the plan
+/// ever mentioned the file it moved.
+#[test]
+fn absorb_does_not_let_a_rename_ride_on_another_files_squash() {
+    let repo = absorb_stack("absorb-rename-alongside");
+    repo.write_file("other.txt", "p\nq\nr\n");
+    repo.jj_ok(&["commit", "-m", "D: add other"]);
+
+    std::fs::rename(repo.path().join("f.txt"), repo.path().join("g.txt")).unwrap();
+    repo.write_file("g.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.write_file("other.txt", "p\nQ\nr\n");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("2 hunks: 1 moving into 1 ancestor, 1 staying"),
+        "{plan}"
+    );
+
+    repo.hunk_ok(&["absorb"]);
+
+    // The one routable hunk moved; the rename did not go with it.
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        "R {f.txt => g.txt}",
+        "the rename left the working copy"
+    );
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary", "-r", "description(substring:\"D: \")"]).trim(),
+        "A other.txt",
+        "the rename was carried into an ancestor"
+    );
+    assert_eq!(conflicted_changes(&repo), Vec::<String>::new());
+}
+
+/// The very same edits without the rename still absorb: the refusal above is
+/// about the rename, not about the file.
+#[test]
+fn absorb_still_routes_a_file_that_was_not_renamed() {
+    let repo = absorb_stack("absorb-rename-control");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("2 hunks: 2 moving into 2 ancestors, 0 staying"),
+        "{plan}"
+    );
+
+    repo.hunk_ok(&["absorb"]);
+    assert!(repo.jj_ok(&["diff", "--summary"]).trim().is_empty());
+    assert_eq!(conflicted_changes(&repo), Vec::<String>::new());
+}
+
+/// Change ids of every conflicted commit at or below `@`.
+fn conflicted_changes(repo: &TestRepo) -> Vec<String> {
+    repo.jj_ok(&[
+        "log",
+        "--no-graph",
+        "-r",
+        "::@",
+        "-T",
+        r#"if(conflict, change_id.short(8) ++ "\n", "")"#,
+    ])
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Selectors that used to fail *open*: they matched nothing, and `~` turned
+// that into the whole diff -- so the one clause holding a change back was the
+// clause that had silently stopped working.
+// ---------------------------------------------------------------------------
+
+/// A working copy with a change the user wants and a vendored change they do
+/// not, which is the shape every selector below is written to separate.
+fn vendored_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("src.txt", "src line\n");
+    repo.write_file("vendor/lib.txt", "vendor line\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src.txt", "src line\nsrc change\n");
+    repo.write_file("vendor/lib.txt", "vendor line\nvendor change\n");
+    repo
+}
+
+/// The reported crash: an unterminated character class matched nothing, `~`
+/// inverted that into everything, and `split` committed the vendored change
+/// the selector existed to exclude -- at exit 0, with no diagnostic.
+#[test]
+fn a_malformed_glob_stops_the_split_instead_of_committing_everything() {
+    let repo = vendored_repo("glob-malformed-split");
+    let err = repo.hunk_fail(&["split", r#"~glob("vendor/[a-z*.txt")"#, "malformed"]);
+    assert!(
+        err.contains("vendor/[a-z*.txt"),
+        "the error must quote the pattern: {err}"
+    );
+    assert!(
+        err.contains("unclosed '['"),
+        "the error must say what is wrong with it: {err}"
+    );
+    // Nothing was committed, so both changes are still in the working copy.
+    let changed = repo.changed_files("@");
+    assert_eq!(changed.len(), 2, "the split must not have run: {changed:?}");
+}
+
+/// Not only under `~`. A malformed glob is a typo wherever it appears, and
+/// `list` exiting 0 with an empty result is how the typo goes unnoticed.
+#[test]
+fn a_malformed_glob_is_an_error_in_list_too() {
+    let repo = vendored_repo("glob-malformed-list");
+    for spec in [
+        r#"glob("vendor/[a-z*.txt")"#,
+        r#"glob("vendor/{a,b")"#,
+        r#"~glob("vendor/[a-z*.txt")"#,
+        r#"file(glob:"vendor/[a-")"#,
+    ] {
+        let err = repo.hunk_fail(&["list", "--spec", spec, "--format", "text"]);
+        assert!(
+            err.contains("invalid glob"),
+            "{spec} should be rejected: {err}"
+        );
+    }
+    // The well-formed pattern the user meant still works.
+    let out = repo.hunk_ok(&["list", "--spec", r#"~glob("vendor/**")"#, "--format", "text"]);
+    assert!(out.contains("src.txt"), "{out}");
+    assert!(!out.contains("vendor/lib.txt"), "{out}");
+}
+
+/// `--include`/`--exclude` reach the glob matcher by a different route than
+/// the `glob()` predicate, and had the same hole. A dropped `--exclude`
+/// excludes nothing, and `list --spec-template` bakes that listing into a spec
+/// that then drives `split`.
+#[test]
+fn a_malformed_exclude_pattern_stops_the_listing() {
+    let repo = vendored_repo("glob-malformed-exclude");
+
+    let err = repo.hunk_fail(&["list", "--exclude", "vendor/[a-z*.txt", "--format", "text"]);
+    assert!(err.contains("vendor/[a-z*.txt"), "{err}");
+    assert!(err.contains("unclosed '['"), "{err}");
+
+    let err = repo.hunk_fail(&["list", "--include", "src/{a,b", "--format", "text"]);
+    assert!(err.contains("unclosed '{'"), "{err}");
+
+    // The template a split would be built from is refused for the same reason,
+    // rather than being generated from an unfiltered listing.
+    let err = repo.hunk_fail(&["list", "--spec-template", "--exclude", "vendor/[a-"]);
+    assert!(err.contains("invalid glob"), "{err}");
+
+    // Well-formed patterns are unaffected.
+    let out = repo.hunk_ok(&["list", "--exclude", "vendor/**", "--format", "text"]);
+    assert!(out.contains("src.txt"), "{out}");
+    assert!(!out.contains("vendor/lib.txt"), "{out}");
+}
+
+/// The abbreviation `list` prints is a name for the hunk. Quoting it cannot
+/// change what it means -- unquoted, the parser's inferred `Exact` kind was
+/// read as a demand for whole-id equality, so it matched nothing.
+#[test]
+fn an_unquoted_abbreviated_id_selects_the_same_hunk_as_a_quoted_one() {
+    let repo = vendored_repo("id-unquoted");
+    let listing = repo.hunk_ok(&["list", "--format", "text"]);
+    let short = listing
+        .split_whitespace()
+        .find(|word| word.starts_with("hunk-"))
+        .expect("list should print a short id")
+        .to_string();
+    // Shorter than the printed abbreviation, so only prefix resolution finds it.
+    let abbreviated = &short[.."hunk-".len() + 4];
+
+    let quoted = repo.hunk_ok(&[
+        "list",
+        "--spec",
+        &format!(r#"id("{abbreviated}")"#),
+        "--format",
+        "text",
+    ]);
+    let bare = repo.hunk_ok(&["list", "--spec", &format!("id({abbreviated})"), "--format", "text"]);
+    assert!(quoted.contains(&short), "the quoted form should resolve: {quoted}");
+    assert_eq!(
+        bare, quoted,
+        "an unquoted abbreviation must select what the quoted one does"
+    );
+
+    // And the negation excludes exactly that hunk rather than nothing.
+    let negated =
+        repo.hunk_ok(&["list", "--spec", &format!("~id({abbreviated})"), "--format", "text"]);
+    assert!(!negated.contains(&short), "{negated}");
+    assert!(negated.contains("hunk-"), "the other hunk should remain: {negated}");
+}
+
+/// An id naming no hunk is a stale or mistyped name, not an empty answer.
+/// Silently, `~id("hunk-...")` was the entire diff.
+#[test]
+fn an_id_that_names_no_hunk_is_refused() {
+    let repo = vendored_repo("id-unknown");
+    for spec in [
+        r#"id("hunk-ffffffffff")"#,
+        "id(hunk-ffffffffff)",
+        r#"~id("hunk-ffffffffff")"#,
+    ] {
+        let err = repo.hunk_fail(&["list", "--spec", spec, "--format", "text"]);
+        assert!(
+            err.contains("matches no hunk"),
+            "{spec} should be refused: {err}"
+        );
+    }
+}
+
+/// A chain of operators is built in a loop, so the parser's nesting limit
+/// never sees it -- but evaluating it, and freeing it, walked its left spine
+/// recursively and aborted the process with a stack overflow. `--spec-file`
+/// takes an expression far longer than any argv limit.
+#[test]
+fn a_very_long_operator_chain_does_not_crash() {
+    let repo = vendored_repo("chain-long");
+    for (name, joiner) in [("union", " | "), ("intersection", " & ")] {
+        let file = format!("chain-{name}.txt");
+        repo.write_file(&file, &vec!["all()"; 100_000].join(joiner));
+        let path = repo.path().join(&file);
+        let out = repo.hunk(&[
+            "list",
+            "--spec-file",
+            path.to_str().unwrap(),
+            "--format",
+            "text",
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("stack overflow"),
+            "a {name} chain crashed the process: {stderr}"
+        );
+        assert!(out.status.success(), "{name} chain failed: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("src.txt"),
+            "{name} chain selected nothing"
+        );
+    }
+}

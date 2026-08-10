@@ -343,6 +343,11 @@ where
 
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
+    // Check the patterns before any file is looked at, so a typo is reported
+    // the same way whether or not the revision happens to have changes in it.
+    for pattern in include.iter().chain(exclude.iter()) {
+        crate::glob::validate_glob(pattern)?;
+    }
 
     let all_file_hunks = load_file_hunks(&target, options.binary, options.truncation)?;
 
@@ -350,10 +355,10 @@ where
 
     for fh in all_file_hunks {
         let paths_to_check = fh.all_paths();
-        if !include.is_empty() && !paths_to_check.iter().any(|p| matches_any(&include, p)) {
+        if !include.is_empty() && !matches_any(&include, &paths_to_check)? {
             continue;
         }
-        if !exclude.is_empty() && paths_to_check.iter().any(|p| matches_any(&exclude, p)) {
+        if !exclude.is_empty() && matches_any(&exclude, &paths_to_check)? {
             continue;
         }
 
@@ -580,9 +585,21 @@ pub(crate) fn evaluate_hunkset(
     let ast = hunkset::parse(hunkset_expr)
         .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
-    let file_hunks = load_file_hunks(target, BinaryMode::Skip, truncation)?;
+    // `Mark`, not `Skip`. Skipping meant no expression could so much as name a
+    // binary file, while the spec that came back still said `default: reset` --
+    // so `all()` quietly meant "all except the binaries" and their changes were
+    // dropped from whatever the verb went on to do. They are visible here
+    // instead, each standing in for its whole-file change.
+    let file_hunks = load_file_hunks(target, BinaryMode::Mark, truncation)?;
 
-    let enriched: Vec<EnrichedHunk> = file_hunks
+    let stand_ins: Vec<(usize, Hunk)> = file_hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, fh)| fh.is_binary)
+        .map(|(index, fh)| (index, binary_stand_in(fh)))
+        .collect();
+
+    let mut enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
         .flat_map(|fh| {
             fh.hunks.iter().map(move |hunk| EnrichedHunk {
@@ -592,6 +609,11 @@ pub(crate) fn evaluate_hunkset(
             })
         })
         .collect();
+    enriched.extend(stand_ins.iter().map(|(index, hunk)| EnrichedHunk {
+        file_path: &file_hunks[*index].path,
+        file_status: &file_hunks[*index].status,
+        hunk,
+    }));
 
     let selected = hunkset::evaluate(&ast, &enriched)
         .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e.display_with_context()))?;
@@ -605,9 +627,63 @@ pub(crate) fn evaluate_hunkset(
                 .map(|r| (fh.path.as_str(), r.from.as_str()))
         })
         .collect();
-    let spec = hunkset::to_spec(&selected, &enriched, &rename_sources);
+    let mut spec = hunkset::to_spec(&selected, &enriched, &rename_sources);
+
+    // A binary file is kept or reset whole, never hunk-wise: `select` rebuilds
+    // a file from text, and a non-UTF-8 file cannot survive that round trip.
+    // The stand-in exists only so a predicate can name the file, and the id it
+    // carries names nothing `select` could resolve, so a selected binary is
+    // rewritten into the same whole-file action `--spec-template` emits for it.
+    for fh in &file_hunks {
+        if !fh.is_binary {
+            continue;
+        }
+        if let Some(entry) = spec.files.get_mut(&fh.path) {
+            *entry = FileSpec::Action {
+                action: Action::Keep,
+                from: rename_source(&fh.rename, &fh.path),
+            };
+        }
+    }
 
     serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
+}
+
+/// The one hunk a binary file gets to be named by.
+///
+/// A binary change is atomic -- git models it the same way, as "these two files
+/// differ" and nothing finer -- so the stand-in carries exactly what a
+/// *file-level* predicate reads: the path and status come from the enclosing
+/// [`EnrichedHunk`], and `type()` reports what happened to the file as a whole.
+/// Everything a *content-level* predicate reads is deliberately empty, so
+/// `content()`, `added()`, `removed()` and `lines()` cannot match a file whose
+/// bytes they were never able to look at.
+///
+/// The id is not in hunk-id form on purpose. `normalize_hunk_id` only ever
+/// yields `hunk-<hex>`, so no `id()` argument can prefix-match this one, and
+/// the stand-in cannot be selected by an identity it does not really have.
+fn binary_stand_in(file: &FileHunks) -> Hunk {
+    let hunk_type = match file.status.as_str() {
+        "added" | "copied" => "insert",
+        "removed" => "delete",
+        _ => "replace",
+    };
+    let name = format!("binary-file:{}", file.path);
+
+    Hunk {
+        index: 0,
+        short_id: name.clone(),
+        id: name,
+        hunk_type: hunk_type.to_string(),
+        removed: String::new(),
+        added: String::new(),
+        // Line 0 exists in no file, so `lines(..)` and its variants never
+        // report this as touching a line they were asked about.
+        before_range: crate::diff::LineRange { start: 0, length: 0 },
+        after_range: crate::diff::LineRange { start: 0, length: 0 },
+        context: None,
+        semantic: crate::diff::SemanticInfo::default(),
+    }
 }
 
 /// A file's hunks with metadata, loaded from a jj diff.
@@ -1115,8 +1191,22 @@ fn normalize_patterns(patterns: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn matches_any(patterns: &[String], path: &str) -> bool {
-    patterns.iter().any(|pattern| glob_match(pattern, path))
+/// Whether any of `paths` matches any of `patterns`.
+///
+/// A malformed pattern is an error, not a silent non-match. `--exclude` exists
+/// to keep something out of the listing, and a pattern that matches nothing
+/// keeps nothing out -- so a typo in `--exclude 'vendor/[a-z*.txt'` used to
+/// list the vendored tree it was written to hide, and `list --spec-template`
+/// would then bake that listing into a spec that drives `split`.
+fn matches_any(patterns: &[String], paths: &[&str]) -> Result<bool> {
+    for pattern in patterns {
+        for path in paths {
+            if glob_match(pattern, path)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn group_files(files: Vec<FileEntry>, grouping: ListGrouping) -> Vec<ListGroup> {
@@ -1362,8 +1452,15 @@ fn render_diff_output(output: &ListOutput) -> String {
         // single @@ block, otherwise the ranges overlap and the patch is
         // invalid. Anything further apart than two context windows is
         // independent.
+        //
+        // `new_offset` is what turns the after-side line numbers of the *whole*
+        // diff into the after-side line numbers of *this patch*. It is reset
+        // per file because each file's coordinates are its own.
+        let mut new_offset: i64 = 0;
         for block in group_adjacent_hunks(&file.hunks) {
-            result.push_str(&render_diff_block(&file.hunks[block.0..block.1]));
+            let (text, delta) = render_diff_block(&file.hunks[block.0..block.1], new_offset);
+            result.push_str(&text);
+            new_offset += delta;
         }
     }
 
@@ -1465,10 +1562,24 @@ fn gap_lines<'a>(prev: &'a Hunk, next: &'a Hunk, gap: usize) -> Vec<(&'a str, bo
     out
 }
 
-fn render_diff_block(hunks: &[Hunk]) -> String {
+/// Render one `@@` block, and report how far it moves the after-side.
+///
+/// `new_offset` is the running difference between before-side and after-side
+/// line numbers, accumulated over the blocks already emitted for this file.
+/// The returned delta is this block's own contribution to it.
+///
+/// The after-side start cannot be read off `Hunk::after_range`: that coordinate
+/// is in the working-copy file, which includes every hunk, and a `--spec` emits
+/// only some of them. Using it left the `+` start counting hunks this patch
+/// does not carry, and `git apply` anchors its search on exactly that number --
+/// so in a file with repeated text it would find the *next* matching block,
+/// report "succeeded ... (offset -13 lines)", and rewrite the wrong lines at
+/// exit 0. Deriving the start from the before-side plus what this patch has
+/// actually emitted so far keeps the two sides describing the same file.
+fn render_diff_block(hunks: &[Hunk], new_offset: i64) -> (String, i64) {
     let mut result = String::new();
     let Some(first) = hunks.first() else {
-        return result;
+        return (result, 0);
     };
     let last = &hunks[hunks.len() - 1];
 
@@ -1519,11 +1630,11 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
         new_len += 1;
     }
 
-    let old_start = first.before_range.start.saturating_sub(leading.len());
-    let new_start = first.after_range.start.saturating_sub(leading.len());
+    let block_start = first.before_range.start.saturating_sub(leading.len());
+    let new_start = (block_start as i64 + new_offset).max(0) as usize;
     // A zero-length side is written as `-0,0` / `+0,0`; otherwise the start is
     // the first line the block covers.
-    let old_start = if old_len == 0 { 0 } else { old_start.max(1) };
+    let old_start = if old_len == 0 { 0 } else { block_start.max(1) };
     let new_start = if new_len == 0 { 0 } else { new_start.max(1) };
 
     let mut scope = String::new();
@@ -1544,7 +1655,7 @@ fn render_diff_block(hunks: &[Hunk]) -> String {
         old_start, old_len, new_start, new_len, scope, first.short_id
     ));
     result.push_str(&body);
-    result
+    (result, new_len as i64 - old_len as i64)
 }
 
 fn render_text_summary_output(output: &ListSummaryOutput) -> String {
@@ -2597,35 +2708,41 @@ fn random_suffix() -> u64 {
     hasher.finish()
 }
 
+/// The `--config` overrides that make `jj ... --tool=jj-hunk` call **this**
+/// process back as the diff editor.
+///
+/// Both keys are pinned unconditionally, deliberately overriding whatever the
+/// user's `merge-tools.jj-hunk` says. That is not defensiveness about a
+/// mis-set key; it is the only way the command can be correct.
+///
+/// The spec handed to `select` names hunks by id, and an id is a hash this
+/// build computed over this diff -- the fork folds the path and an occurrence
+/// ordinal into it, so ids from here mean nothing to an upstream binary. The
+/// docs tell people to persist `program = "jj-hunk"` in `~/.jjconfig.toml`;
+/// resolving that through PATH, or through a `cargo install`ed copy, hands the
+/// application step to a *different* program than the one that computed the
+/// ids. It then resolves none of them, jj sees an unchanged tree, and the
+/// commit comes out empty at exit 0 with the edits still in the working copy.
+/// `edit-args` is pinned for the same reason and not merely for tidiness: a
+/// stale one that swapped `$left` and `$right` would invert the whole
+/// selection just as silently.
+///
+/// So: the process that computes the ids is always the process that applies
+/// them. Anyone wanting a different tool can register it under a different name
+/// and drive `jj` directly.
 fn jj_hunk_tool_config_args() -> Result<Vec<String>> {
-    let mut args = Vec::new();
+    let program = std::env::current_exe()
+        .context("Failed to determine current jj-hunk executable path")?;
+    let program = program
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("jj-hunk executable path is not valid UTF-8"))?;
 
-    if !jj_config_key_exists(JJ_HUNK_PROGRAM_KEY) {
-        let program = std::env::current_exe()
-            .context("Failed to determine current jj-hunk executable path")?;
-        let program = program
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("jj-hunk executable path is not valid UTF-8"))?;
-        args.push("--config".to_string());
-        args.push(format!("{JJ_HUNK_PROGRAM_KEY}={}", toml_string(program)));
-    }
-
-    if !jj_config_key_exists(JJ_HUNK_EDIT_ARGS_KEY) {
-        args.push("--config".to_string());
-        args.push(format!(
-            r#"{JJ_HUNK_EDIT_ARGS_KEY}=["select", "$left", "$right"]"#
-        ));
-    }
-
-    Ok(args)
-}
-
-fn jj_config_key_exists(key: &str) -> bool {
-    Command::new("jj")
-        .args(["config", "get", key])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    Ok(vec![
+        "--config".to_string(),
+        format!("{JJ_HUNK_PROGRAM_KEY}={}", toml_string(program)),
+        "--config".to_string(),
+        format!(r#"{JJ_HUNK_EDIT_ARGS_KEY}=["select", "$left", "$right"]"#),
+    ])
 }
 
 fn toml_string(value: &str) -> String {

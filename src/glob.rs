@@ -41,8 +41,15 @@
 //! # Errors
 //!
 //! `jj` rejects malformed patterns (an unclosed `[`, an unbalanced `{`) at
-//! parse time. [`glob_match`] has no error channel, so a malformed pattern
-//! matches nothing.
+//! parse time, and so does this module: compiling one is a [`GlobError`]
+//! naming the pattern and what is wrong with it.
+//!
+//! Matching nothing is not an acceptable stand-in for an error here. A glob is
+//! usually written to *carve something out* -- `~glob("vendor/**")` -- and a
+//! pattern that matches nothing turns that into "keep everything", so a typo in
+//! the one clause protecting the vendored tree silently commits it. Compile the
+//! pattern once with [`Glob::compile`] (or [`validate_glob`]) where the user's
+//! input arrives, and report the error there.
 
 use regex::bytes::Regex;
 use std::borrow::Cow;
@@ -53,16 +60,66 @@ use std::collections::HashMap;
 /// Mirrors `globset`'s default, which keys off `std::path::is_separator('\\')`.
 const BACKSLASH_ESCAPE: bool = !cfg!(windows);
 
-/// Match a glob pattern against a path.
+/// A pattern that is not a valid glob, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobError {
+    pattern: String,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for GlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid glob '{}': {}", self.pattern, self.reason)
+    }
+}
+
+impl std::error::Error for GlobError {}
+
+/// A glob that has already been checked.
 ///
-/// See the [module docs](self) for the supported syntax. A malformed pattern
-/// matches nothing.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
+/// Holding one is the proof that the pattern parsed, which is why
+/// [`Glob::is_match`] has no error channel and needs none: the only way to get
+/// a `Glob` is to have handled the [`GlobError`] first.
+#[derive(Clone, Debug)]
+pub struct Glob {
+    regex: Regex,
+}
+
+impl Glob {
+    /// Compile a pattern, or say why it cannot be compiled.
+    pub fn compile(pattern: &str) -> Result<Self, GlobError> {
+        Ok(Self { regex: compile(pattern)? })
+    }
+
+    /// Match this glob against a path.
+    pub fn is_match(&self, path: &str) -> bool {
+        self.regex.is_match(normalize(path).as_bytes())
+    }
+}
+
+/// Match a glob pattern against a path, compiling it (once, cached) on the way.
+///
+/// Prefer [`Glob::compile`] when the same pattern is matched against many
+/// candidates and the error has somewhere to go. This entry point exists for
+/// callers that hold patterns as plain strings.
+pub fn glob_match(pattern: &str, path: &str) -> Result<bool, GlobError> {
     let path = normalize(path);
     let bytes = path.as_bytes();
     with_compiled(pattern, |compiled| match compiled {
-        Some(regex) => regex.is_match(bytes),
-        None => false,
+        Ok(regex) => Ok(regex.is_match(bytes)),
+        Err(error) => Err(error.clone()),
+    })
+}
+
+/// Check that a pattern compiles, without matching anything with it.
+///
+/// For validating user input at the point it arrives, so a later match cannot
+/// be the first thing to notice a typo -- and so the report does not depend on
+/// there happening to be a candidate to match against.
+pub fn validate_glob(pattern: &str) -> Result<(), GlobError> {
+    with_compiled(pattern, |compiled| match compiled {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.clone()),
     })
 }
 
@@ -72,14 +129,17 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 // regex is built once per pattern instead of once per candidate.
 
 thread_local! {
-    static CACHE: RefCell<HashMap<String, Option<Regex>>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<String, Result<Regex, GlobError>>> = RefCell::new(HashMap::new());
 }
 
 /// Patterns come from user input, so the cache is bounded; it is cleared
 /// wholesale rather than evicted, since overflowing it at all is unexpected.
 const CACHE_LIMIT: usize = 1024;
 
-fn with_compiled<T>(pattern: &str, f: impl FnOnce(Option<&Regex>) -> T) -> T {
+/// The failure is cached alongside the success: a malformed pattern is asked
+/// about once per candidate path too, and re-deriving the same error every time
+/// buys nothing.
+fn with_compiled<T>(pattern: &str, f: impl FnOnce(Result<&Regex, &GlobError>) -> T) -> T {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(pattern) {
@@ -89,14 +149,17 @@ fn with_compiled<T>(pattern: &str, f: impl FnOnce(Option<&Regex>) -> T) -> T {
             let compiled = compile(pattern);
             cache.insert(pattern.to_string(), compiled);
         }
-        f(cache.get(pattern).and_then(Option::as_ref))
+        let compiled = cache.get(pattern).expect("just inserted above");
+        f(compiled.as_ref())
     })
 }
 
-fn compile(pattern: &str) -> Option<Regex> {
+fn compile(pattern: &str) -> Result<Regex, GlobError> {
+    let fail = |reason| GlobError { pattern: pattern.to_string(), reason };
     let normalized = normalize(pattern);
-    let tokens = parse(&normalized).ok()?;
-    Regex::new(&tokens_to_anchored_regex(&tokens)).ok()
+    let tokens = parse(&normalized).map_err(|ParseError(reason)| fail(reason))?;
+    Regex::new(&tokens_to_anchored_regex(&tokens))
+        .map_err(|_| fail("the pattern is too large to compile"))
 }
 
 /// Normalise a repo-relative path or pattern: drop `.` components, collapse
@@ -144,11 +207,10 @@ enum Token {
     Alternates(Vec<Vec<Token>>),
 }
 
-/// A malformed pattern. `jj` reports which way it was malformed; [`glob_match`]
-/// has no error channel, so the reason is discarded and the pattern simply
-/// matches nothing.
+/// A malformed pattern, carrying the reason so [`GlobError`] can report which
+/// way it was malformed -- the way `jj` does.
 #[derive(Debug)]
-struct ParseError;
+struct ParseError(&'static str);
 
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
@@ -171,11 +233,15 @@ fn parse(pattern: &str) -> Result<Vec<Token>, ParseError> {
     };
     parser.parse()?;
     if parser.branches.len() > 1 {
-        // An unclosed `{`.
-        return Err(ParseError);
+        return Err(ParseError("unclosed '{' -- an alternation needs a matching '}'"));
     }
-    parser.branches.pop().ok_or(ParseError)
+    parser.branches.pop().ok_or(ParseError(NO_OPEN_BRANCH))
 }
+
+/// The token sink went missing, which only `pop_alternate` can cause and only
+/// by draining past the top level -- an internal inconsistency rather than
+/// anything the user wrote.
+const NO_OPEN_BRANCH: &str = "the pattern could not be parsed";
 
 impl Parser<'_> {
     fn parse(&mut self) -> Result<(), ParseError> {
@@ -210,7 +276,7 @@ impl Parser<'_> {
                 branch.push(token);
                 Ok(())
             }
-            None => Err(ParseError),
+            None => Err(ParseError(NO_OPEN_BRANCH)),
         }
     }
 
@@ -218,13 +284,13 @@ impl Parser<'_> {
         self.branches
             .last_mut()
             .and_then(Vec::pop)
-            .ok_or(ParseError)
+            .ok_or(ParseError(NO_OPEN_BRANCH))
     }
 
     fn have_tokens(&self) -> Result<bool, ParseError> {
         match self.branches.last() {
             Some(branch) => Ok(!branch.is_empty()),
-            None => Err(ParseError),
+            None => Err(ParseError(NO_OPEN_BRANCH)),
         }
     }
 
@@ -234,8 +300,10 @@ impl Parser<'_> {
     }
 
     fn pop_alternate(&mut self) -> Result<(), ParseError> {
-        // A `}` with no matching `{`.
-        let start = self.alternates_stack.pop().ok_or(ParseError)?;
+        let start = self
+            .alternates_stack
+            .pop()
+            .ok_or(ParseError("'}' with no matching '{'"))?;
         let alternates = self.branches.drain(start..).collect();
         self.push_token(Token::Alternates(alternates))
     }
@@ -252,8 +320,7 @@ impl Parser<'_> {
     fn parse_backslash(&mut self) -> Result<(), ParseError> {
         if BACKSLASH_ESCAPE {
             match self.bump() {
-                // A trailing `\` with nothing to escape.
-                None => Err(ParseError),
+                None => Err(ParseError("trailing '\\' with nothing to escape")),
                 Some(c) => self.push_token(Token::Literal(c)),
             }
         } else {
@@ -326,8 +393,9 @@ impl Parser<'_> {
         let mut first = true;
         let mut in_range = false;
         loop {
-            // An unclosed `[`.
-            let c = self.bump().ok_or(ParseError)?;
+            let c = self
+                .bump()
+                .ok_or(ParseError("unclosed '[' -- a character class needs a matching ']'"))?;
             match c {
                 ']' if !first => break,
                 // A `]` immediately after `[` (or `[!`) is a literal.
@@ -335,12 +403,12 @@ impl Parser<'_> {
                 '-' if first => ranges.push(('-', '-')),
                 '-' if in_range => {
                     // A `-` at the end of a range, as in `[a--]`.
-                    extend_range(ranges.last_mut().ok_or(ParseError)?, '-')?;
+                    extend_range(ranges.last_mut().ok_or(ParseError(DANGLING_RANGE))?, '-')?;
                     in_range = false;
                 }
                 '-' => in_range = true,
                 c if in_range => {
-                    extend_range(ranges.last_mut().ok_or(ParseError)?, c)?;
+                    extend_range(ranges.last_mut().ok_or(ParseError(DANGLING_RANGE))?, c)?;
                     in_range = false;
                 }
                 c => {
@@ -358,10 +426,17 @@ impl Parser<'_> {
     }
 }
 
+/// A `-` inside a class with nothing before it to start the range. `'-' if
+/// first` already covers a leading `-`, so reaching this means the class body
+/// was left in an unexpected state.
+const DANGLING_RANGE: &str = "'-' in a character class with no character before it";
+
 fn extend_range(range: &mut (char, char), end: char) -> Result<(), ParseError> {
     range.1 = end;
     if range.1 < range.0 {
-        return Err(ParseError);
+        return Err(ParseError(
+            "a character class range runs backwards, as in [z-a]",
+        ));
     }
     Ok(())
 }
@@ -469,6 +544,11 @@ mod tests {
         "x{a",
     ];
 
+    /// Match a pattern that is expected to be well-formed.
+    fn glob_match(pattern: &str, path: &str) -> bool {
+        super::glob_match(pattern, path).expect("pattern should compile")
+    }
+
     /// Assert the full set of corpus paths a pattern selects, exactly as
     /// `jj file list` reported it.
     fn assert_selects(pattern: &str, expected: &[&str]) {
@@ -478,6 +558,19 @@ mod tests {
             .filter(|path| glob_match(pattern, path))
             .collect();
         assert_eq!(got, expected, "pattern {pattern:?} selected the wrong set");
+    }
+
+    /// The rendered reason a malformed pattern was rejected.
+    fn compile_error(pattern: &str) -> String {
+        let error = Glob::compile(pattern)
+            .err()
+            .unwrap_or_else(|| panic!("pattern {pattern:?} should have been rejected"));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(pattern),
+            "error should quote the pattern the user wrote: {rendered}"
+        );
+        rendered
     }
 
     // --- bug 1: character classes ---
@@ -517,11 +610,17 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_character_class_matches_nothing() {
-        // jj rejects these at parse time; with an infallible API the closest
-        // equivalent is a pattern that selects nothing.
-        assert_selects("[a", &[]);
-        assert_selects("[", &[]);
+    fn unclosed_character_class_is_rejected() {
+        // jj rejects these at parse time, and so does this module: a pattern
+        // that matches nothing is indistinguishable from one that legitimately
+        // found nothing, and under `~` it selects the entire diff.
+        for pattern in ["[a", "[", "vendor/[a-z*.txt"] {
+            assert!(
+                compile_error(pattern).contains("unclosed '['"),
+                "should name the unclosed '[': {}",
+                compile_error(pattern)
+            );
+        }
     }
 
     // --- bug 2: a slash-free glob is anchored at the repo root ---
@@ -770,9 +869,54 @@ mod tests {
     }
 
     #[test]
-    fn unbalanced_braces_match_nothing() {
-        assert_selects("x{a", &[]);
-        assert_selects("}b", &[]);
+    fn unbalanced_braces_are_rejected() {
+        assert!(compile_error("x{a").contains("unclosed '{'"));
+        assert!(compile_error("a{b,c").contains("unclosed '{'"));
+        assert!(compile_error("}b").contains("'}' with no matching '{'"));
+    }
+
+    /// Every shape `jj` rejects is rejected here too, and each says which one
+    /// it was -- a single "invalid glob" would leave the user guessing which
+    /// character to fix.
+    #[test]
+    fn every_malformed_shape_is_rejected_with_its_own_reason() {
+        assert!(compile_error("[z-a]").contains("runs backwards"));
+        assert!(compile_error("src/**/[abc").contains("unclosed '['"));
+        assert!(compile_error("{a,{b}").contains("unclosed '{'"));
+        assert!(compile_error("*.{c,h}}").contains("'}' with no matching '{'"));
+        if BACKSLASH_ESCAPE {
+            assert!(compile_error(r"src\").contains("trailing '\\'"));
+        }
+    }
+
+    /// The message quotes the pattern the user typed, not the normalised form,
+    /// so it can be copied straight back out of the error and edited.
+    #[test]
+    fn the_error_quotes_the_pattern_as_written() {
+        let error = Glob::compile("./vendor//[a-z").unwrap_err();
+        assert!(error.to_string().starts_with("invalid glob './vendor//[a-z':"));
+    }
+
+    /// A malformed pattern is an error from every entry point, so no caller
+    /// can accidentally read it as "matched nothing".
+    #[test]
+    fn every_entry_point_reports_a_malformed_pattern() {
+        assert!(super::glob_match("[a", "a").is_err());
+        assert!(validate_glob("[a").is_err());
+        assert!(Glob::compile("[a").is_err());
+        // And a well-formed one is accepted by all three.
+        assert_eq!(super::glob_match("*.rs", "lib.rs"), Ok(true));
+        assert!(validate_glob("*.rs").is_ok());
+        assert!(Glob::compile("*.rs").unwrap().is_match("lib.rs"));
+    }
+
+    /// The cache stores failures too, so the second ask gets the same answer
+    /// rather than a stale success or a silent miss.
+    #[test]
+    fn a_failure_is_reported_every_time_it_is_asked_about() {
+        for _ in 0..3 {
+            assert!(super::glob_match("{unclosed", "anything").is_err());
+        }
     }
 
     // --- backslash escapes ---
