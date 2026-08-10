@@ -3228,3 +3228,492 @@ fn list_rejects_a_revision_together_with_from() {
         "-r and --from should conflict: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// absorb
+// ---------------------------------------------------------------------------
+
+/// A three-commit stack over one file, where each commit owns known lines:
+/// `A` owns every line except 3 and 8, `B` owns line 3, and `C` owns line 8.
+///
+/// The working copy is left clean, so each test stages exactly the change whose
+/// routing it is about.
+fn absorb_stack(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    build_absorb_stack(&repo);
+    repo
+}
+
+/// The stack itself, so a test that has to configure the repo first (see
+/// [`pin_immutable`]) can do that before anything is committed.
+fn build_absorb_stack(repo: &TestRepo) {
+    repo.write_file("f.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+    repo.jj_ok(&["commit", "-m", "A: create f"]);
+    repo.write_file("f.txt", "a\nb\nCCC\nd\ne\nf\ng\nh\ni\nj\n");
+    repo.jj_ok(&["commit", "-m", "B: line 3"]);
+    repo.write_file("f.txt", "a\nb\nCCC\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.jj_ok(&["commit", "-m", "C: line 8"]);
+}
+
+fn absorb_change_id(repo: &TestRepo, revset: &str) -> String {
+    repo.jj_ok(&["log", "--no-graph", "-r", revset, "-T", "change_id.short(8)"])
+        .trim()
+        .to_string()
+}
+
+fn file_at(repo: &TestRepo, rev: &str, path: &str) -> String {
+    repo.jj_ok(&["file", "show", "-r", rev, path])
+}
+
+/// Everything the stack adds up to, as one diff. Absorb only redistributes a
+/// change between ancestors, so this is invariant under it.
+fn cumulative_diff(repo: &TestRepo) -> String {
+    repo.jj_ok(&["diff", "--from", "root()", "--to", "@", "--git"])
+}
+
+fn pin_immutable(repo: &TestRepo, revset: &str) {
+    let mut config = std::fs::read_to_string(&repo.config_path).unwrap();
+    config.push_str(&format!(
+        "\n[revset-aliases]\n\"immutable_heads()\" = '{revset}'\n"
+    ));
+    std::fs::write(&repo.config_path, config).unwrap();
+}
+
+#[test]
+fn absorb_routes_a_hunk_to_the_ancestor_that_owns_its_lines() {
+    let repo = absorb_stack("absorb-one-owner");
+    // Line 3 belongs to B and to nothing else.
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(plan.contains("f.txt:3  -1 +1"), "{plan}");
+    assert!(!plan.contains("stay in"), "nothing should stay: {plan}");
+
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(file_at(&repo, &b, "f.txt"), "a\nb\nCCC2\nd\ne\nf\ng\nh\ni\nj\n");
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+}
+
+#[test]
+fn absorb_leaves_a_hunk_whose_lines_have_several_owners() {
+    let repo = absorb_stack("absorb-many-owners");
+    // One hunk covering lines 3..8, which span B, A and C.
+    repo.write_file("f.txt", "a\nb\nX\nX\nX\nX\nX\nX\ni\nj\n");
+
+    let a = absorb_change_id(&repo, r#"description(substring:"A: ")"#);
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let c = absorb_change_id(&repo, r#"description(substring:"C: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains("stay in"), "{plan}");
+    assert!(plan.contains("3 commits"), "the reason should count the owners: {plan}");
+    for owner in [&a, &b, &c] {
+        assert!(plan.contains(owner.as_str()), "{owner} should be named: {plan}");
+    }
+    assert!(!plan.contains("move into"), "nothing should move: {plan}");
+
+    // And a real run leaves the revision exactly as it was.
+    let before = repo.jj_ok(&["diff", "--git"]);
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), before);
+}
+
+#[test]
+fn absorb_leaves_a_pure_insertion_unless_asked_to_route_it() {
+    let repo = absorb_stack("absorb-insertion");
+    // Between lines 5 and 6, both of which belong to A.
+    repo.write_file("f.txt", "a\nb\nCCC\nd\ne\nNEW\nf\ng\nHHH\ni\nj\n");
+
+    let a = absorb_change_id(&repo, r#"description(substring:"A: ")"#);
+
+    let default_plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(default_plan.contains("stay in"), "{default_plan}");
+    assert!(default_plan.contains("only adds lines"), "{default_plan}");
+    assert!(
+        default_plan.contains("--insertions=surrounding"),
+        "the default must point at the opt-in: {default_plan}"
+    );
+
+    let opted_in = repo.hunk_ok(&["absorb", "--dry-run", "--insertions", "surrounding"]);
+    assert!(opted_in.contains(&format!("move into {a}")), "{opted_in}");
+    assert!(
+        opted_in.contains("--insertions=surrounding: insertions are routed"),
+        "the opt-in must be labelled in the plan: {opted_in}"
+    );
+
+    repo.hunk_ok(&["absorb", "--insertions", "surrounding"]);
+    assert_eq!(
+        file_at(&repo, &a, "f.txt"),
+        "a\nb\nc\nd\ne\nNEW\nf\ng\nh\ni\nj\n"
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+}
+
+#[test]
+fn absorb_leaves_an_insertion_that_lands_between_two_owners() {
+    let repo = absorb_stack("absorb-insertion-boundary");
+    // Between line 2 (A) and line 3 (B): both have an equal claim on it.
+    repo.write_file("f.txt", "a\nb\nNEW\nCCC\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run", "--insertions", "surrounding"]);
+    assert!(plan.contains("stay in"), "{plan}");
+    assert!(plan.contains("boundary"), "{plan}");
+    assert!(!plan.contains("move into"), "{plan}");
+}
+
+/// Two hunks in one file bound for two different ancestors. The second squash
+/// only finds its hunk because the plan re-matches by fingerprint: the first
+/// squash rewrote the file and moved the second hunk's context out from under
+/// its id.
+#[test]
+fn absorb_moves_hunks_to_several_ancestors_in_one_run() {
+    let repo = absorb_stack("absorb-multi-target");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+
+    let a = absorb_change_id(&repo, r#"description(substring:"A: ")"#);
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let c = absorb_change_id(&repo, r#"description(substring:"C: ")"#);
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(plan.contains("2 moving into 2 ancestors"), "{plan}");
+    // Oldest destination first, so the plan reads in the direction history flows.
+    let b_at = plan.find(&format!("move into {b}")).expect(&plan);
+    let c_at = plan.find(&format!("move into {c}")).expect(&plan);
+    assert!(b_at < c_at, "destinations should be ordered oldest first: {plan}");
+
+    repo.hunk_ok(&["absorb"]);
+
+    // Each ancestor now writes the final text itself, and nothing is left over.
+    assert_eq!(file_at(&repo, &a, "f.txt"), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+    assert_eq!(file_at(&repo, &b, "f.txt"), "a\nb\nCCC2\nd\ne\nf\ng\nh\ni\nj\n");
+    assert_eq!(file_at(&repo, &c, "f.txt"), "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+}
+
+#[test]
+fn absorb_leaves_hunks_in_a_file_the_revision_itself_added() {
+    let repo = absorb_stack("absorb-new-file");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.write_file("new.txt", "one\ntwo\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(
+        plan.contains("new.txt is new in this revision"),
+        "a file with no parent version has no history to blame: {plan}"
+    );
+
+    repo.hunk_ok(&["absorb"]);
+    // The new file is still the revision's own change, whole.
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "A new.txt");
+    assert_eq!(file_at(&repo, "@", "new.txt"), "one\ntwo\n");
+}
+
+#[test]
+fn absorb_refuses_to_route_into_an_immutable_commit() {
+    let repo = TestRepo::new("absorb-immutable");
+    // Before the stack is built: the config file lives in the working copy, so
+    // writing it afterwards would itself be a change for absorb to route.
+    pin_immutable(&repo, r#"description(substring:"A: ")"#);
+    build_absorb_stack(&repo);
+    // Line 5 belongs to A, which is now immutable.
+    repo.write_file("f.txt", "a\nb\nCCC\nd\nEEE\nf\ng\nHHH\ni\nj\n");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(plan.contains("immutable"), "{plan}");
+    assert!(!plan.contains("move into"), "{plan}");
+
+    // The real run is a no-op rather than an error, and says so.
+    let before = repo.jj_ok(&["diff", "--git"]);
+    let out = repo.hunk_ok(&["absorb"]);
+    assert!(out.contains("Nothing to absorb"), "{out}");
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), before);
+}
+
+/// Two byte-identical edits in one file share a fingerprint, so no selection
+/// can name one without naming the other. Sending them to different ancestors
+/// is therefore not expressible, and absorb says so rather than moving one.
+#[test]
+fn absorb_leaves_identical_hunks_bound_for_different_ancestors() {
+    let repo = TestRepo::new("absorb-identical-hunks");
+    repo.write_file("f.txt", "p\nDUP\nq\nr\nOLD\ns\n");
+    repo.jj_ok(&["commit", "-m", "A: create f"]);
+    // Line 5 becomes a second, identical `DUP`, owned by B rather than A.
+    repo.write_file("f.txt", "p\nDUP\nq\nr\nDUP\ns\n");
+    repo.jj_ok(&["commit", "-m", "B: line 5"]);
+
+    // The same one-line edit made to both of them.
+    repo.write_file("f.txt", "p\nEDIT\nq\nr\nEDIT\ns\n");
+
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("identical to another hunk"),
+        "the collision should be the stated reason: {plan}"
+    );
+    assert!(!plan.contains("move into"), "{plan}");
+
+    let before = repo.jj_ok(&["diff", "--git"]);
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), before);
+}
+
+/// The mirror of the test above: identical hunks that agree on where they
+/// belong do move, together.
+#[test]
+fn absorb_moves_identical_hunks_that_agree_together() {
+    let repo = TestRepo::new("absorb-identical-hunks-agree");
+    repo.write_file("f.txt", "p\nq\nr\ns\nt\nu\n");
+    repo.jj_ok(&["commit", "-m", "A: create f"]);
+    repo.write_file("f.txt", "p\nDUP\nr\ns\nDUP\nu\n");
+    repo.jj_ok(&["commit", "-m", "B: both DUP lines"]);
+
+    repo.write_file("f.txt", "p\nEDIT\nr\ns\nEDIT\nu\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(plan.contains("2 hunks: 2 moving into 1 ancestor"), "{plan}");
+
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(file_at(&repo, &b, "f.txt"), "p\nEDIT\nr\ns\nEDIT\nu\n");
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+}
+
+#[test]
+fn absorb_only_considers_the_hunks_the_spec_names() {
+    let repo = absorb_stack("absorb-spec-filter");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let c = absorb_change_id(&repo, r#"description(substring:"C: ")"#);
+
+    // Name only the first hunk. The second is not even considered, so it is
+    // absent from the plan rather than listed as staying.
+    let id = first_hunk_id(&repo, "f.txt");
+    let spec = format!(r#"{{"files": {{"f.txt": {{"ids": ["{id}"]}}}}}}"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run", &spec]);
+
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(!plan.contains(&format!("move into {c}")), "{plan}");
+    assert!(plan.contains("1 hunks: 1 moving"), "{plan}");
+
+    repo.hunk_ok(&["absorb", &spec]);
+    assert_eq!(file_at(&repo, &b, "f.txt"), "a\nb\nCCC2\nd\ne\nf\ng\nh\ni\nj\n");
+    // The unnamed hunk is untouched, still in the working copy.
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "M f.txt");
+}
+
+#[test]
+fn absorb_accepts_a_hunkset_expression() {
+    let repo = absorb_stack("absorb-hunkset");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.write_file("other.txt", "only me\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run", r#"file("f.txt")"#]);
+
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(!plan.contains("other.txt"), "the expression excluded it: {plan}");
+}
+
+/// Same input, same plan, every time -- including the order the destinations
+/// and the hunks under them come out in.
+#[test]
+fn absorb_plans_identically_across_repeated_runs() {
+    let repo = absorb_stack("absorb-deterministic");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\nEEE\nf\ng\nHHH2\ni\nj\n");
+    repo.write_file("new.txt", "one\n");
+
+    let first = repo.hunk_ok(&["absorb", "--dry-run"]);
+    for run in 1..5 {
+        assert_eq!(
+            repo.hunk_ok(&["absorb", "--dry-run"]),
+            first,
+            "run {run} produced a different plan"
+        );
+    }
+    // More than one destination, or the ordering this guards is untested.
+    assert_eq!(first.matches("move into ").count(), 3, "{first}");
+}
+
+#[test]
+fn absorb_dry_run_changes_nothing() {
+    let repo = absorb_stack("absorb-dry-run-is-inert");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH2\ni\nj\n");
+
+    let commits_before = repo.jj_ok(&["log", "--no-graph", "-T", r#"commit_id ++ "\n""#]);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains("--dry-run: nothing was changed"), "{plan}");
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-T", r#"commit_id ++ "\n""#]),
+        commits_before
+    );
+}
+
+/// What moved plus what stayed is what there was: absorb redistributes a change
+/// across the stack, and must neither drop nor invent a line doing it.
+#[test]
+fn absorb_moves_nothing_out_of_the_overall_change() {
+    let repo = absorb_stack("absorb-lossless");
+    // A mix on purpose: two hunks that route, one insertion that does not, and
+    // a whole file that cannot.
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nNEW\nf\ng\nHHH2\ni\nj\n");
+    repo.write_file("new.txt", "fresh\n");
+
+    let before = cumulative_diff(&repo);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+    assert!(
+        plan.contains("4 hunks: 2 moving into 2 ancestors, 2 staying"),
+        "{plan}"
+    );
+
+    repo.hunk_ok(&["absorb"]);
+
+    assert_eq!(
+        cumulative_diff(&repo),
+        before,
+        "the stack must still add up to exactly the same thing"
+    );
+    // ... and the part that could not move is still the revision's own change.
+    assert_eq!(
+        repo.jj_ok(&["diff", "--summary"]).trim(),
+        "M f.txt\nA new.txt"
+    );
+}
+
+#[test]
+fn absorb_reports_the_operation_to_undo_with() {
+    let repo = absorb_stack("absorb-undo-hint");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let before = cumulative_diff(&repo);
+    let out = repo.hunk_ok(&["absorb"]);
+
+    let op = out
+        .lines()
+        .find_map(|line| line.strip_prefix("Undo all of it with: jj op restore "))
+        .unwrap_or_else(|| panic!("absorb should print an operation to restore: {out}"))
+        .trim()
+        .to_string();
+
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+    repo.jj_ok(&["op", "restore", &op]);
+
+    // Back to one revision holding the whole change, and the stack unchanged.
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "M f.txt");
+    assert_eq!(cumulative_diff(&repo), before);
+}
+
+#[test]
+fn absorb_refuses_a_revision_with_nothing_in_it() {
+    let repo = absorb_stack("absorb-empty-revision");
+    let err = repo.hunk_fail(&["absorb"]);
+    assert!(err.contains("nothing to absorb"), "{err}");
+}
+
+#[test]
+fn absorb_refuses_a_selection_that_names_nothing() {
+    let repo = absorb_stack("absorb-empty-selection");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let err = repo.hunk_fail(&["absorb", r#"file("nope.txt")"#]);
+    assert!(err.contains("matched no hunks"), "{err}");
+}
+
+#[test]
+fn absorb_refuses_a_revset_naming_several_revisions() {
+    let repo = absorb_stack("absorb-many-revisions");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+
+    let err = repo.hunk_fail(&["absorb", "-r", "all()"]);
+    assert!(err.contains("exactly one"), "{err}");
+}
+
+#[test]
+fn absorb_can_run_on_a_revision_other_than_the_working_copy() {
+    let repo = absorb_stack("absorb-other-revision");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.jj_ok(&["commit", "-m", "D: fixups"]);
+    // `@` is now an empty commit on top of D, and D is what gets absorbed.
+    repo.write_file("later.txt", "unrelated\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let d = absorb_change_id(&repo, r#"description(substring:"D: ")"#);
+    let before = cumulative_diff(&repo);
+
+    repo.hunk_ok(&["absorb", "-r", &d]);
+
+    assert_eq!(file_at(&repo, &b, "f.txt"), "a\nb\nCCC2\nd\ne\nf\ng\nh\ni\nj\n");
+    assert_eq!(repo.changed_files(&d), Vec::<String>::new(), "D should be emptied");
+    // The working copy, which was never the source, is untouched.
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "A later.txt");
+    assert_eq!(cumulative_diff(&repo), before);
+}
+
+/// Annotation is read one line per line of the parent, and a file whose last
+/// line has no terminator is where an off-by-one would first show up.
+#[test]
+fn absorb_lines_up_with_annotation_without_a_trailing_newline() {
+    let repo = TestRepo::new("absorb-no-trailing-newline");
+    repo.write_file("f.txt", "one\ntwo\nthree");
+    repo.jj_ok(&["commit", "-m", "A: create f"]);
+    repo.write_file("f.txt", "one\nTWO\nthree");
+    repo.jj_ok(&["commit", "-m", "B: line 2"]);
+    repo.write_file("f.txt", "one\nTWO\nTHREE");
+    repo.jj_ok(&["commit", "-m", "C: line 3"]);
+
+    // The last line, unterminated, and owned by C alone.
+    repo.write_file("f.txt", "one\nTWO\nTHREE4");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let c = absorb_change_id(&repo, r#"description(substring:"C: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains(&format!("move into {c}")), "{plan}");
+    assert!(!plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(plan.contains("f.txt:3  -1 +1"), "{plan}");
+
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(file_at(&repo, &c, "f.txt"), "one\nTWO\nTHREE4");
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "");
+}
+
+/// Absorb rewrites history, so every file in the revision has to be accounted
+/// for in the plan -- including the ones no hunk selection can touch.
+#[test]
+fn absorb_accounts_for_a_binary_file_it_cannot_split() {
+    let repo = absorb_stack("absorb-binary-note");
+    repo.write_file("f.txt", "a\nb\nCCC2\nd\ne\nf\ng\nHHH\ni\nj\n");
+    repo.write_file("blob.dat", "bin\u{0}ary\n");
+
+    let b = absorb_change_id(&repo, r#"description(substring:"B: ")"#);
+    let plan = repo.hunk_ok(&["absorb", "--dry-run"]);
+
+    assert!(plan.contains(&format!("move into {b}")), "{plan}");
+    assert!(
+        plan.contains("note: blob.dat is binary"),
+        "a binary change must still be reported: {plan}"
+    );
+
+    repo.hunk_ok(&["absorb"]);
+    assert_eq!(repo.jj_ok(&["diff", "--summary"]).trim(), "A blob.dat");
+}
+
+#[test]
+fn absorb_says_what_it_could_not_route_when_there_is_nothing_else() {
+    let repo = absorb_stack("absorb-binary-only");
+    repo.write_file("blob.dat", "bin\u{0}ary\n");
+
+    let err = repo.hunk_fail(&["absorb"]);
+    assert!(err.contains("nothing to absorb"), "{err}");
+    assert!(
+        err.contains("blob.dat is binary"),
+        "the refusal must not read as 'nothing is there': {err}"
+    );
+}

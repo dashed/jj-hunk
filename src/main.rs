@@ -1,12 +1,14 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+mod absorb;
 mod diff;
 mod glob;
 mod hunkset;
 mod spec;
 mod commands;
 
+use absorb::{AbsorbOptions, InsertionPolicy};
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
 
 #[derive(Parser)]
@@ -118,6 +120,25 @@ enum Commands {
         /// Allow a selection that undoes nothing
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+    },
+
+    /// Move hunks into the mutable ancestors that last touched their lines
+    Absorb {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
+        /// (default: every hunk in the revision)
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Revision to absorb from (default: @)
+        #[arg(short, long)]
+        rev: Option<String>,
+        /// Print the routing plan without changing anything
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// What to do with hunks that only add lines
+        #[arg(long, value_enum, default_value_t = InsertionPolicy::Skip)]
+        insertions: InsertionPolicy,
     },
 }
 
@@ -259,6 +280,26 @@ fn main() -> Result<()> {
                 into.as_deref(),
                 allow_empty,
             )
+        }
+        Commands::Absorb {
+            spec,
+            spec_file,
+            rev,
+            dry_run,
+            insertions,
+        } => {
+            // Unlike the other commands, the spec is optional: absorb with no
+            // selector considers every hunk, which is the usual way to run it.
+            if spec.is_some() && spec_file.is_some() {
+                anyhow::bail!("absorb: omit <spec> when using --spec-file");
+            }
+            absorb::absorb(AbsorbOptions {
+                spec,
+                spec_file,
+                rev,
+                dry_run,
+                insertions,
+            })
         }
     }
 }

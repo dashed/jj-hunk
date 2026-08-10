@@ -215,9 +215,9 @@ struct FileEntry {
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct RenameInfo {
-    from: String,
-    to: String,
+pub(crate) struct RenameInfo {
+    pub(crate) from: String,
+    pub(crate) to: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,7 +294,7 @@ struct DiffSummaryEntry {
 /// never *selectable*, and `select` always restores it from the left side (see
 /// `restore_exec_bit`), which leaves it in the working copy.
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
-struct ModeChange {
+pub(crate) struct ModeChange {
     from: &'static str,
     to: &'static str,
 }
@@ -476,7 +476,7 @@ struct FilePaths {
     after: Option<String>,
 }
 
-enum SpecDecision {
+pub(crate) enum SpecDecision {
     Skip,
     KeepAll,
     KeepSelection(HunkSelection),
@@ -549,7 +549,10 @@ fn enrich_hunks_with_semantics(
 ) {
 }
 
-fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn resolve_optional_spec(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+) -> Result<Option<String>> {
     if spec.is_none() && spec_file.is_none() {
         return Ok(None);
     }
@@ -565,7 +568,7 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 /// relative to the text it was computed from -- evaluating against the whole
 /// file and then filtering a truncated listing with the result silently drops
 /// any hunk the cut reshaped.
-fn evaluate_hunkset(
+pub(crate) fn evaluate_hunkset(
     hunkset_expr: &str,
     target: &DiffTarget,
     truncation: Truncation,
@@ -604,20 +607,20 @@ fn evaluate_hunkset(
 }
 
 /// A file's hunks with metadata, loaded from a jj diff.
-struct FileHunks {
-    path: String,
-    status: String,
-    hunks: Vec<Hunk>,
-    rename: Option<RenameInfo>,
-    is_binary: bool,
-    mode: Option<ModeChange>,
+pub(crate) struct FileHunks {
+    pub(crate) path: String,
+    pub(crate) status: String,
+    pub(crate) hunks: Vec<Hunk>,
+    pub(crate) rename: Option<RenameInfo>,
+    pub(crate) is_binary: bool,
+    pub(crate) mode: Option<ModeChange>,
     /// Whether either side of this file was cut short before diffing.
-    truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 impl FileHunks {
     /// All paths associated with this file entry (primary + rename source).
-    fn all_paths(&self) -> Vec<&str> {
+    pub(crate) fn all_paths(&self) -> Vec<&str> {
         let mut paths = vec![self.path.as_str()];
         if let Some(rename) = &self.rename {
             if rename.from != self.path {
@@ -630,7 +633,7 @@ impl FileHunks {
 
 /// Load all file hunks for a revision, applying semantic enrichment.
 /// This is the shared core used by both `list` and `evaluate_hunkset`.
-fn load_file_hunks(
+pub(crate) fn load_file_hunks(
     target: &DiffTarget,
     binary: BinaryMode,
     truncation: Truncation,
@@ -702,19 +705,19 @@ fn load_file_hunks(
 }
 
 /// The two sides a diff is computed between.
-struct DiffRevisions {
+pub(crate) struct DiffRevisions {
     /// Revision the "before" text is read from. `None` means the target has no
     /// parent (the root commit), so the before side is empty.
-    before: Option<String>,
+    pub(crate) before: Option<String>,
     /// Revision the "after" text is read from. `None` means the working copy
     /// on disk.
-    after: Option<String>,
+    pub(crate) after: Option<String>,
 }
 
 /// One resolved revision and the ids of its parents.
-struct ResolvedRevision {
-    id: String,
-    parents: Vec<String>,
+pub(crate) struct ResolvedRevision {
+    pub(crate) id: String,
+    pub(crate) parents: Vec<String>,
 }
 
 /// Emits `<commit id>\t<parent id> <parent id> ...` per revision, so one
@@ -723,7 +726,7 @@ const REVISION_TEMPLATE: &str =
     r#"commit_id.short() ++ "\t" ++ parents.map(|c| c.commit_id().short()).join(" ") ++ "\n""#;
 
 /// Revisions a revset resolves to, in `jj log` order.
-fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
+pub(crate) fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
     let output = Command::new("jj")
         .args(["log", "--no-graph", "-r", revset, "-T", REVISION_TEMPLATE])
         .output()
@@ -792,7 +795,7 @@ fn preview_ids<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> String {
 ///
 /// A `FromTo` target names both sides itself, so neither failure applies to it:
 /// each side only has to resolve to exactly one revision.
-fn resolve_revisions(target: &DiffTarget) -> Result<DiffRevisions> {
+pub(crate) fn resolve_revisions(target: &DiffTarget) -> Result<DiffRevisions> {
     let revset = match target {
         DiffTarget::Rev(revset) => revset.as_deref(),
         DiffTarget::FromTo { from, to } => {
@@ -1053,7 +1056,7 @@ fn truncate_text(content: &str, truncation: Truncation) -> (String, bool) {
     (result, truncated)
 }
 
-fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
+pub(crate) fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
     let Some(spec) = spec else {
         return SpecDecision::KeepAll;
     };
@@ -1084,7 +1087,7 @@ fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
     }
 }
 
-fn filter_hunks(hunks: Vec<Hunk>, selection: &HunkSelection) -> Result<Vec<Hunk>> {
+pub(crate) fn filter_hunks(hunks: Vec<Hunk>, selection: &HunkSelection) -> Result<Vec<Hunk>> {
     let keep = selection.resolve(&hunks)?;
     Ok(hunks
         .into_iter()
@@ -2065,7 +2068,7 @@ fn fill_rename_sources(spec: &mut Spec, file_hunks: &[FileHunks]) -> bool {
     filled
 }
 
-fn run_jj_with_selection(
+pub(crate) fn run_jj_with_selection(
     args: &[&str],
     spec: Option<&str>,
     spec_file: Option<&str>,
