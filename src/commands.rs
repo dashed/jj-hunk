@@ -351,6 +351,16 @@ where
 
     let all_file_hunks = load_file_hunks(&target, options.binary, options.truncation)?;
 
+    // `list --spec` is how a spec is checked before it is run, so it has to
+    // agree with the writing verbs about which paths that spec names. Without
+    // this it answered a root-generated spec from a subdirectory with an empty
+    // listing and exit 0 -- the same spec `split` refuses outright.
+    let spec = spec.map(|mut spec| {
+        let frame = PathFrame::discover();
+        adopt_spec_frame(&mut spec, &frame_pairs(&all_file_hunks, &frame));
+        spec
+    });
+
     let mut files = Vec::new();
 
     for fh in all_file_hunks {
@@ -723,12 +733,19 @@ pub(crate) fn load_file_hunks(
     let revisions = resolve_revisions(target)?;
     let summary_entries = read_diff_summary(target)?;
     let mut result = Vec::new();
+    // Every path below is cwd-relative, because that is how jj prints them and
+    // that is what `list` has to keep showing. Ids are hashed from the
+    // root-relative spelling instead, so that the id for a hunk is the same one
+    // `select` computes and the same one it had when the command was run a
+    // directory up.
+    let frame = PathFrame::discover();
 
     for entry in &summary_entries {
         let path = primary_path(entry);
         if path.is_empty() {
             continue;
         }
+        let hashed_path = frame.to_root(&path).unwrap_or_else(|| path.clone());
 
         let file_paths = file_paths_for_entry(entry, &path);
         let before_bytes = match (revisions.before.as_deref(), file_paths.before.as_deref()) {
@@ -757,7 +774,7 @@ pub(crate) fn load_file_hunks(
         };
 
         let mut hunks = if should_diff {
-            get_hunks(&path, &before_text, &after_text)
+            get_hunks(&hashed_path, &before_text, &after_text)
         } else {
             Vec::new()
         };
@@ -1786,7 +1803,7 @@ fn status_char(status: &str) -> &'static str {
 pub fn select(left: &str, right: &str) -> Result<()> {
     let spec_path = std::env::var("JJ_HUNK_SELECTION").ok();
 
-    let spec = if let Some(path) = spec_path {
+    let mut spec = if let Some(path) = spec_path {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read spec from {}", path))?;
         Spec::from_str(&content)?
@@ -1811,6 +1828,16 @@ pub fn select(left: &str, right: &str) -> Result<()> {
         .iter()
         .map(|file| (file.display.as_str(), file))
         .collect();
+
+    // `select` normally reads a spec the driving verb already re-keyed, but on
+    // the raw `jj --tool=jj-hunk` path there is no driving verb and the spec is
+    // whatever the user wrote. `fs` is exactly the root-relative spelling, so
+    // the same rule applies here with no frame conversion needed.
+    let frame_pairs: Vec<(String, String)> = files
+        .iter()
+        .map(|file| (file.display.clone(), file.fs.clone()))
+        .collect();
+    adopt_spec_frame(&mut spec, &frame_pairs);
 
     // jj hands a rename to the tool as two unrelated paths: the old one in
     // `left`, the new one in `right`. Only the new one is named in the spec,
@@ -1906,11 +1933,26 @@ pub fn select(left: &str, right: &str) -> Result<()> {
 /// producer wrote, and the hunk ids hash the path, so even a key that matched
 /// would have resolved against ids computed over a different string.
 struct SelectPath {
-    /// The path under `left`/`right`: repo-relative, for filesystem access.
+    /// The path under `left`/`right`: repo-relative, for filesystem access --
+    /// and the string the file's hunk ids are hashed with, because that is the
+    /// one spelling every invocation agrees on wherever it was run from.
     fs: String,
-    /// The path as jj prints it: cwd-relative. The spec key, and the string
-    /// the file's hunk ids were hashed with.
+    /// The path as jj prints it: cwd-relative. The spec key.
     display: String,
+}
+
+/// The characters that separate path components here.
+///
+/// `\` is a separator on Windows and an ordinary filename character everywhere
+/// else, so it cannot be one of these unconditionally: a Unix file really named
+/// `back\slash.txt` would be read as two components, and both its spec key and
+/// its hunk ids would come out naming a file that does not exist.
+fn path_separators() -> &'static [char] {
+    if cfg!(windows) {
+        &['/', '\\']
+    } else {
+        &['/']
+    }
 }
 
 /// Translates jj's materialised paths into the frame every producer speaks.
@@ -1962,6 +2004,39 @@ impl PathFrame {
             display.push(part.as_os_str());
         }
         display.to_string_lossy().into_owned()
+    }
+
+    /// The inverse of [`PathFrame::to_display`]: the workspace-root-relative
+    /// path a cwd-relative one names, always `/`-separated.
+    ///
+    /// jj prints paths relative to the cwd, so from `sub/deep/` a diff reads
+    /// `low.txt`, `../mid.txt` and `../../top.txt` -- three spellings of paths
+    /// that are `sub/deep/low.txt`, `sub/mid.txt` and `top.txt` in the only
+    /// frame two invocations can both agree on. Resolving the `..` components
+    /// is the whole job, and it is why this is not simply `prefix + path`.
+    ///
+    /// `None` when the path climbs above the workspace root. Nothing jj emits
+    /// can -- every file it names lives under the root -- so this answers a
+    /// hand-written spec, and the honest answer is that such a path names no
+    /// file in the workspace. Clamping at the root instead would silently make
+    /// `../../top.txt` from `sub/` mean `top.txt`, quietly resolving a
+    /// malformed entry onto a real file.
+    fn to_root(&self, display_path: &str) -> Option<String> {
+        if self.prefix.is_empty() {
+            return Some(display_path.replace(std::path::MAIN_SEPARATOR, "/"));
+        }
+
+        let mut parts: Vec<&str> = self.prefix.iter().map(String::as_str).collect();
+        for component in display_path.split(path_separators()) {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                name => parts.push(name),
+            }
+        }
+        Some(parts.join("/"))
     }
 }
 
@@ -2109,9 +2184,12 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
 /// both sides instead recomputes the change as one whole-file insertion under a
 /// different id, so nothing matches and the file is written out empty.
 ///
-/// Every id here is recomputed from `file.display`, not from the path the
-/// directories are laid out under: the id hashes the path, so the two have to
-/// be the same string the producer used or no selection can ever resolve.
+/// Every id here is recomputed from `file.fs` -- the workspace-root-relative
+/// spelling, which is also the frame `list` hashes in. The id hashes the path,
+/// so the two sides have to agree on which string that is; recomputing from
+/// `file.display` instead tied the id to the cwd, and since jj runs this tool
+/// with the cwd it was invoked from, a spec produced at the root stopped
+/// resolving the moment it was applied one directory down.
 fn apply_hunk_selection(
     left: &Path,
     right: &Path,
@@ -2155,7 +2233,7 @@ fn apply_hunk_selection(
         // the safe direction and the only one available.
         let deleted = locate(left, &file.fs);
         let before = side_text(as_side(&deleted), &file.display).unwrap_or_default();
-        let hunks = get_hunks(&file.display, &before, "");
+        let hunks = get_hunks(&file.fs, &before, "");
         let keeps_deletion = !selection.resolve(&hunks)?.is_empty();
         if !keeps_deletion {
             reset_file(left, right, &file.fs)?;
@@ -2166,7 +2244,7 @@ fn apply_hunk_selection(
     let before = side_text(as_side(&left_entry), &file.display)?;
     let after = side_text(Some((right_file.as_path(), &right_meta)), &file.display)?;
 
-    let result = apply_selected_hunks(&file.display, &before, &after, selection)?;
+    let result = apply_selected_hunks(&file.fs, &before, &after, selection)?;
 
     if result == before {
         // Nothing of this file's change survived the selection. Restoring it
@@ -2510,6 +2588,96 @@ fn fill_rename_sources(spec: &mut Spec, file_hunks: &[FileHunks]) -> bool {
     filled
 }
 
+/// Every path a spec could name in this diff, paired with the
+/// workspace-root-relative spelling of the same file.
+fn frame_pairs(file_hunks: &[FileHunks], frame: &PathFrame) -> Vec<(String, String)> {
+    file_hunks
+        .iter()
+        .flat_map(FileHunks::all_paths)
+        .filter_map(|display| {
+            frame
+                .to_root(display)
+                .map(|root| (display.to_string(), root))
+        })
+        .collect()
+}
+
+/// Re-key a spec written in some other directory's frame into this one.
+///
+/// A spec key is whatever its producer printed, and every producer here prints
+/// cwd-relative paths. So a spec generated at the repo root keys a file
+/// `sub/mid.txt`, and one directory down that same file is called `mid.txt`:
+/// the keys match nothing, and the whole spec fails *before* a single hunk id
+/// is consulted -- `sub/mid.txt: no such path in the diff`, said of a path
+/// plainly in the diff. Fixing the ids alone would not have made a
+/// root-generated spec usable from a subdirectory, because resolution never
+/// got as far as an id.
+///
+/// The workspace-root-relative spelling is the one that means the same file
+/// from every directory, so a key that names no local path but does name a
+/// real file in that frame is rewritten to the local spelling. Everything
+/// downstream -- `spec_decision`, `validate_spec_resolves`, `select` -- goes on
+/// looking paths up exactly as it did.
+///
+/// Two orderings are deliberate:
+///
+/// - A key that already names a diff path is never rewritten. It means today
+///   what it meant before this function existed, and only that precedence
+///   guarantees no spec that resolves now starts resolving to something else.
+/// - A rewrite that would land on a key the spec already holds is dropped.
+///   Merging two entries into one would silently discard whichever lost.
+///
+/// At the repo root a path *is* its own root-relative spelling, so this is the
+/// identity there and no root-generated spec changes meaning. The reverse
+/// direction stays broken on purpose: a spec written in `sub/` can key a file
+/// `../top.txt`, which names nothing from anywhere else, so such a spec is
+/// simply not portable and says so by failing to resolve.
+fn adopt_spec_frame(spec: &mut Spec, paths: &[(String, String)]) -> bool {
+    let local: HashSet<&str> = paths.iter().map(|(display, _)| display.as_str()).collect();
+    let by_root: HashMap<&str, &str> = paths
+        .iter()
+        .map(|(display, root)| (root.as_str(), display.as_str()))
+        .collect();
+
+    let translate = |path: &str| -> Option<String> {
+        if local.contains(path) {
+            return None;
+        }
+        by_root.get(path).map(|display| (*display).to_string())
+    };
+
+    let mut changed = false;
+
+    // A rename's `from` is a path in the spec's frame like any other, so it
+    // travels with the key. Left behind, it would name nothing on the left and
+    // `select` would recompute the rename as a whole-file insertion.
+    for file_spec in spec.files.values_mut() {
+        let Some(from) = file_spec.source_path().map(str::to_string) else {
+            continue;
+        };
+        let Some(local_from) = translate(&from) else {
+            continue;
+        };
+        file_spec.set_source_path(local_from);
+        changed = true;
+    }
+
+    let rewrites: Vec<(String, String)> = spec
+        .files
+        .keys()
+        .filter_map(|key| translate(key).map(|local| (key.clone(), local)))
+        .filter(|(_, local)| !spec.files.contains_key(local))
+        .collect();
+    for (foreign, local) in rewrites {
+        if let Some(file_spec) = spec.files.remove(&foreign) {
+            spec.files.insert(local, file_spec);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 pub(crate) fn run_jj_with_selection(
     args: &[&str],
     spec: Option<&str>,
@@ -2569,6 +2737,11 @@ fn run_jj_with_selection_on(
             // `Mark`, not `Skip`: a binary file has no hunks but is still a
             // legitimate spec target via `{"action": "keep"}`.
             let file_hunks = load_file_hunks(target, BinaryMode::Mark, Truncation::NONE)?;
+            // Before validating, not after: a spec generated one directory up
+            // is not wrong, it is written in another frame, and reporting every
+            // one of its paths as absent would be the wrong complaint.
+            let frame = PathFrame::discover();
+            let mut rewritten = adopt_spec_frame(&mut parsed, &frame_pairs(&file_hunks, &frame));
             // Not gated on `allow_empty`. That flag says an empty *result* is
             // acceptable; it never meant "do not check whether what I wrote
             // refers to anything". Gating this too meant that passing it once
@@ -2577,9 +2750,10 @@ fn run_jj_with_selection_on(
             // mistyped path or stale id then produced an empty commit at exit
             // 0, which is precisely what this check exists to make loud.
             validate_spec_resolves(&parsed, &file_hunks, target)?;
-            if fill_rename_sources(&mut parsed, &file_hunks) {
+            rewritten |= fill_rename_sources(&mut parsed, &file_hunks);
+            if rewritten {
                 spec_content = serde_json::to_string(&parsed)
-                    .context("failed to re-serialize spec with rename sources")?;
+                    .context("failed to re-serialize spec for the tool")?;
             }
         }
     }
@@ -3170,5 +3344,106 @@ mod tests {
         assert_eq!(message_arg("plain"), "--message=plain");
         // An `=` in the message belongs to the value, not the split.
         assert_eq!(message_arg("a=b"), "--message=a=b");
+    }
+
+    fn frame_at(prefix: &[&str]) -> PathFrame {
+        PathFrame {
+            prefix: prefix.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The four spellings jj really prints from `sub/deep/`, taken from a diff
+    /// of `top.txt`, `sub/mid.txt`, `sub/deep/low.txt` and `other/side.txt`
+    /// under jj 0.44. Every one of them has to name the same file the root
+    /// invocation named, or ids and spec keys diverge by directory.
+    #[test]
+    fn a_cwd_relative_path_maps_back_to_the_workspace_root() {
+        let frame = frame_at(&["sub", "deep"]);
+        for (printed, expected) in [
+            ("low.txt", "sub/deep/low.txt"),
+            ("../mid.txt", "sub/mid.txt"),
+            ("../../top.txt", "top.txt"),
+            ("../../other/side.txt", "other/side.txt"),
+        ] {
+            assert_eq!(
+                frame.to_root(printed).as_deref(),
+                Some(expected),
+                "{printed}"
+            );
+        }
+    }
+
+    /// `to_root` is the inverse of `to_display`, so composing them anywhere in
+    /// the tree has to land back on the path that went in. This is the property
+    /// `list` and `select` each rely on from their own side.
+    #[test]
+    fn to_display_and_to_root_are_inverses() {
+        let frame = frame_at(&["sub", "deep"]);
+        for root_path in [
+            "sub/deep/low.txt",
+            "sub/mid.txt",
+            "top.txt",
+            "other/side.txt",
+            "sub/deep/nested/deeper.txt",
+        ] {
+            let displayed = frame.to_display(root_path);
+            assert_eq!(
+                frame.to_root(&displayed).as_deref(),
+                Some(root_path),
+                "{root_path} printed as {displayed}"
+            );
+        }
+    }
+
+    /// Climbing exactly to the root is ordinary -- `../top.txt` from `sub/` is
+    /// how jj spells a root-level file -- and must not be mistaken for the
+    /// over-climb below.
+    #[test]
+    fn climbing_exactly_to_the_workspace_root_is_allowed() {
+        assert_eq!(
+            frame_at(&["sub"]).to_root("../top.txt").as_deref(),
+            Some("top.txt")
+        );
+    }
+
+    /// A path that climbs *past* the root names no file in the workspace, so it
+    /// resolves to nothing. Clamping instead would quietly turn a malformed
+    /// `../../top.txt` written from `sub/` into the real file `top.txt`, and a
+    /// spec entry nobody wrote would start selecting hunks.
+    #[test]
+    fn climbing_above_the_workspace_root_resolves_to_nothing() {
+        assert_eq!(frame_at(&["sub"]).to_root("../../top.txt"), None);
+        assert_eq!(frame_at(&["sub", "deep"]).to_root("../../../x.txt"), None);
+    }
+
+    /// At the root every path already is its own root-relative spelling. This
+    /// is the property that keeps every id and every spec key ever generated
+    /// there byte-identical across this change.
+    #[test]
+    fn at_the_repo_root_the_mapping_is_the_identity() {
+        let frame = frame_at(&[]);
+        for path in ["top.txt", "sub/deep/low.txt", "a/b/c/d.txt"] {
+            assert_eq!(frame.to_root(path).as_deref(), Some(path));
+            assert_eq!(frame.to_display(path), path);
+        }
+    }
+
+    /// Off Windows a backslash is an ordinary character in a filename, and
+    /// splitting on it turns one file into two components. Normalising `\` to
+    /// `/` unconditionally -- which is tempting, because on Windows it really
+    /// is the separator -- rewrites `back\slash.txt` into a path naming no
+    /// file, and moves the id of every such file at the repo root.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_is_a_filename_character_not_a_separator() {
+        let frame = frame_at(&["sub"]);
+        assert_eq!(
+            frame.to_root(r"back\slash.txt").as_deref(),
+            Some(r"sub/back\slash.txt")
+        );
+        assert_eq!(
+            frame_at(&[]).to_root(r"sub/back\slash.txt").as_deref(),
+            Some(r"sub/back\slash.txt")
+        );
     }
 }

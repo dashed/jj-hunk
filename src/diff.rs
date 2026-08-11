@@ -168,6 +168,14 @@ pub fn id_matches(selector: &str, full: &str) -> bool {
 /// `path` is the file's path on the right-hand side of the diff. It is part of
 /// every id, so the same edit made to two files does not produce one id shared
 /// between them -- see [`compute_hunk_id`].
+///
+/// It must be **workspace-root-relative**. Callers reach this function holding
+/// a path in whichever frame their caller spoke, and the frames differ: `list`
+/// is handed cwd-relative paths by jj, `select` repo-relative ones by the
+/// merge-tool protocol. Hashing whichever one arrived made a hunk's id a
+/// function of the directory the command ran from -- the same hunk answered to
+/// a different id from `sub/` than from the root, so a spec produced at the
+/// root resolved against nothing one level down.
 pub fn get_hunks(path: &str, before: &str, after: &str) -> Vec<Hunk> {
     let diff = TextDiff::from_lines(before, after);
     let before_lines = split_lines_with_endings(before);
@@ -257,7 +265,7 @@ pub fn get_hunks(path: &str, before: &str, after: &str) -> Vec<Hunk> {
 
 fn finalize_hunk(
     hunks: &mut Vec<Hunk>,
-    ids: &mut HunkIds<'_>,
+    ids: &mut HunkIds,
     current_removed: &mut String,
     current_added: &mut String,
     before_lines: &[&str],
@@ -300,8 +308,20 @@ fn finalize_hunk(
 /// `select` must arrive at the same id for the same hunk or a spec stops
 /// resolving, and the disambiguation below only works if both walk the file's
 /// hunks in the same order with the same counter.
-struct HunkIds<'a> {
-    path: &'a str,
+struct HunkIds {
+    /// The path as it is hashed: this platform's separator rewritten to `/`.
+    ///
+    /// `list` reads its paths from jj, which prints `/` on every platform;
+    /// `select` reads its from a `WalkDir` over the directories jj
+    /// materialised, which yields the platform separator. On Windows the two
+    /// therefore hand the *same* file two different strings, and an id agreed
+    /// on by neither side is an id no spec can carry between them.
+    ///
+    /// Only `MAIN_SEPARATOR` is rewritten, never `\` unconditionally. On Unix
+    /// a backslash is an ordinary character in a filename, so a file really
+    /// named `back\slash.txt` would otherwise hash as `back/slash.txt` and
+    /// every id in the repo root that anyone has written down would move.
+    path: String,
     /// How many hunks with each content digest have already been handed an id.
     ///
     /// Two hunks in one file can be byte-identical *and* sit in identical
@@ -311,10 +331,10 @@ struct HunkIds<'a> {
     seen: HashMap<[u8; 32], u32>,
 }
 
-impl<'a> HunkIds<'a> {
-    fn new(path: &'a str) -> Self {
+impl HunkIds {
+    fn new(path: &str) -> Self {
         Self {
-            path,
+            path: path.replace(std::path::MAIN_SEPARATOR, "/"),
             seen: HashMap::new(),
         }
     }
@@ -326,7 +346,7 @@ impl<'a> HunkIds<'a> {
         added: &str,
         context: Option<&HunkContext>,
     ) -> String {
-        let digest = content_digest(self.path, hunk_type, removed, added, context);
+        let digest = content_digest(&self.path, hunk_type, removed, added, context);
         let occurrence = self.seen.entry(digest).or_insert(0);
         let id = compute_hunk_id(&digest, *occurrence);
         *occurrence += 1;
@@ -447,6 +467,13 @@ fn content_digest(
 /// The path is in there so that the same edit applied to five files yields
 /// five ids rather than one; `id()` is the identity predicate, so an id must
 /// name exactly one hunk in the diff, not a set of them.
+///
+/// It is the **workspace-root-relative** path, not the one the command
+/// printed. Which file a hunk is in is a property of the hunk; which directory
+/// you were standing in when you asked is not, and hashing the latter made
+/// `hunk-bff4817d` at the root and `hunk-228ac8df` from `sub/` two names for
+/// one hunk. `list` and `select` convert into this frame before hashing, and
+/// they must keep agreeing about it -- see [`HunkIds`].
 ///
 /// # Durability, and what it costs
 ///

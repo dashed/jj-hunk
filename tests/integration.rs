@@ -4673,9 +4673,15 @@ fn a_selection_against_an_unreadable_parent_names_the_file() {
 
 // ---------------------------------------------------------------------------
 // Path frames. jj materialises the diff directories with repo-relative paths,
-// but every path jj *prints* -- and so every spec key, and the string every
-// hunk id is hashed with -- is relative to the cwd. From a subdirectory the two
-// disagree, and `select` matched nothing: an empty commit at exit 0.
+// but every path jj *prints* -- and so every spec key -- is relative to the
+// cwd. From a subdirectory the two disagree, and `select` matched nothing: an
+// empty commit at exit 0.
+//
+// Hunk ids are hashed in the repo-relative frame instead, which is the only one
+// that reads the same from every directory. Hashing the printed path made an id
+// a property of where the question was asked from, so a spec produced at the
+// root named nothing one level down -- and its keys, still cwd-relative, failed
+// first. Both halves are exercised below.
 // ---------------------------------------------------------------------------
 
 /// Two edited files under `pkg/`, to be split from inside `pkg/`.
@@ -4763,26 +4769,221 @@ fn a_split_two_directories_down_reaches_files_above_the_cwd() {
     assert_eq!(repo.changed_files("@"), vec!["M root.txt".to_string()]);
 }
 
-/// The other half of agreeing on one frame: the spelling that does *not* work
-/// has to be refused rather than silently selecting nothing.
+/// A root-relative key used to be refused from a subdirectory, on the reasoning
+/// that there was one frame and every other spelling was a mistake. That made
+/// every spec bound to the directory it was written in: the keys `list`
+/// prints at the repo root are root-relative, so a root-generated spec named
+/// nothing one level down and `split` reported `pkg/a.txt: no such path in the
+/// diff` for a path plainly in the diff.
+///
+/// Root-relative is now accepted as well, because it is the one spelling that
+/// means the same file from every directory. The cwd-relative spelling still
+/// wins where both would match, so nothing that resolved before resolves
+/// differently now.
 #[test]
-fn a_repo_relative_key_from_a_subdirectory_is_refused() {
-    let repo = subdir_repo("subdir-wrong-frame");
+fn a_root_relative_key_resolves_from_a_subdirectory() {
+    let repo = subdir_repo("subdir-root-frame-key");
     let ids = listed_ids_in(&repo, "pkg", &[]);
     let spec = format!(
         r#"{{"files": {{"pkg/a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
         ids["a.txt"][0]
     );
 
-    let err = hunk_in_fail(&repo, "pkg", &["split", &spec, "wrong frame"]);
+    hunk_in_ok(&repo, "pkg", &["split", &spec, "root frame"]);
+
+    assert_eq!(
+        repo.changed_files("@-"),
+        vec!["M pkg/a.txt".to_string()],
+        "the root-relative key did not reach the file it named"
+    );
+}
+
+/// Accepting a second frame must not turn a typo into a silent no-op. A key
+/// that names no file in *either* spelling is still refused, and still refused
+/// loudly enough that no empty commit is made.
+#[test]
+fn a_key_in_no_frame_at_all_is_still_refused() {
+    let repo = subdir_repo("subdir-no-frame");
+    let ids = listed_ids_in(&repo, "pkg", &[]);
+    let spec = format!(
+        r#"{{"files": {{"nowhere/a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        ids["a.txt"][0]
+    );
+
+    let err = hunk_in_fail(&repo, "pkg", &["split", &spec, "no frame"]);
     assert!(
-        err.contains("pkg/a.txt"),
+        err.contains("nowhere/a.txt"),
         "the refusal must name the key that did not resolve: {err}"
     );
     let log = repo.log_descriptions();
     assert!(
-        !log.iter().any(|d| d == "wrong frame"),
+        !log.iter().any(|d| d == "no frame"),
         "an empty commit was made anyway: {log:?}"
+    );
+}
+
+/// A hunk's id is a property of the hunk. It used to be a property of the
+/// directory the question was asked from: the path is hashed into the id, and
+/// the path that arrived was the cwd-relative one jj prints, so `sub/f.txt`
+/// listed at the root and `f.txt` listed from `sub/` -- one hunk, one file --
+/// were given two different ids. Every id below is listed from a different
+/// directory and every one of them has to be the same string.
+#[test]
+fn a_hunk_id_is_the_same_from_every_directory_it_is_listed_from() {
+    let repo = TestRepo::new("id-frame-independent");
+    repo.write_file("top.txt", "t1\n");
+    repo.write_file("sub/mid.txt", "m1\n");
+    repo.write_file("sub/deep/low.txt", "l1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+    repo.write_file("sub/mid.txt", "m1\nm2\n");
+    repo.write_file("sub/deep/low.txt", "l1\nl2\n");
+
+    let at_root = listed_ids_in(&repo, "", &[]);
+    let at_sub = listed_ids_in(&repo, "sub", &[]);
+    let at_deep = listed_ids_in(&repo, "sub/deep", &[]);
+
+    // Each file under the spelling that directory prints for it -- including
+    // the `..` forms, which are the ones that used to differ most.
+    for (root_key, sub_key, deep_key) in [
+        ("top.txt", "../top.txt", "../../top.txt"),
+        ("sub/mid.txt", "mid.txt", "../mid.txt"),
+        ("sub/deep/low.txt", "deep/low.txt", "low.txt"),
+    ] {
+        assert_eq!(
+            at_root[root_key], at_sub[sub_key],
+            "{root_key} changed id between the root and sub/"
+        );
+        assert_eq!(
+            at_root[root_key], at_deep[deep_key],
+            "{root_key} changed id between the root and sub/deep/"
+        );
+    }
+}
+
+/// The workflow the id bug actually broke, end to end: generate a spec where
+/// the docs generate one -- at the repo root -- and run it from somewhere else.
+///
+/// Both halves of the bug are in the way of this. The keys are cwd-relative, so
+/// `sub/mid.txt` matched nothing from `sub/` and the spec was rejected before
+/// any id was looked at; and had it resolved, the ids were hashed per-directory
+/// and would have matched nothing either. Fixing only one of the two leaves
+/// this test failing, which is why it is the one that speaks for the fix.
+#[test]
+fn a_spec_generated_at_the_root_applies_from_a_subdirectory() {
+    let repo = TestRepo::new("root-spec-from-sub");
+    repo.write_file("top.txt", "t1\n");
+    repo.write_file("sub/mid.txt", "m1\n");
+    repo.write_file("sub/other.txt", "o1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+    repo.write_file("sub/mid.txt", "m1\nm2\n");
+    repo.write_file("sub/other.txt", "o1\no2\n");
+
+    // Keys and ids exactly as a user reads them at the root.
+    let at_root = listed_ids_in(&repo, "", &[]);
+    let spec = format!(
+        r#"{{"files": {{"top.txt": {{"ids": ["{}"]}}, "sub/mid.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        at_root["top.txt"][0], at_root["sub/mid.txt"][0]
+    );
+
+    hunk_in_ok(&repo, "sub", &["split", &spec, "from the root spec"]);
+
+    let mut committed = repo.changed_files("@-");
+    committed.sort();
+    assert_eq!(
+        committed,
+        vec!["M sub/mid.txt".to_string(), "M top.txt".to_string()],
+        "the root-generated spec selected the wrong files from sub/: {committed:?}"
+    );
+    assert_eq!(
+        repo.changed_files("@"),
+        vec!["M sub/other.txt".to_string()],
+        "the unselected file did not stay behind"
+    );
+}
+
+/// `list` and `select` have to agree on a hunk's id, and this is the case that
+/// tells whether they agree on the *frame* rather than merely on the string.
+/// Both running in one directory agreed even while both were wrong, because
+/// they were wrong identically. Here the ids come from the root and `select`
+/// runs from `sub/`, so nothing but a directory-independent id resolves.
+#[test]
+fn select_resolves_an_id_that_list_printed_from_another_directory() {
+    let repo = subdir_repo("subdir-cross-frame-ids");
+
+    let at_root = listed_ids_in(&repo, "", &[]);
+    let at_sub = listed_ids_in(&repo, "pkg", &[]);
+    assert_eq!(
+        at_root["pkg/a.txt"], at_sub["a.txt"],
+        "precondition: the id is the same from both directories"
+    );
+
+    // Keyed the way `list` printed it in `pkg/`, but carrying the id the root
+    // invocation handed out.
+    let spec = format!(
+        r#"{{"files": {{"a.txt": {{"ids": ["{}"]}}}}, "default": "reset"}}"#,
+        at_root["pkg/a.txt"][0]
+    );
+
+    hunk_in_ok(&repo, "pkg", &["split", &spec, "cross frame"]);
+
+    assert_eq!(
+        repo.changed_files("@-"),
+        vec!["M pkg/a.txt".to_string()],
+        "an id printed at the root did not resolve for a select run from pkg/"
+    );
+}
+
+/// A backslash is an ordinary character in a Unix filename. Rewriting `\` to
+/// `/` on the way into the hash -- which Windows genuinely needs, because there
+/// it is the separator `select` reads out of the filesystem -- silently moved
+/// the id of every such file at the repo root, which is exactly what this
+/// change must never do. The id has to be both stable and frame-independent.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_filename_does_not_disturb_the_id() {
+    let repo = TestRepo::new("backslash-filename");
+    repo.write_file(r"sub/back\slash.txt", "one\ntwo\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file(r"sub/back\slash.txt", "one\nTWO\n");
+
+    let at_root = listed_ids_in(&repo, "", &[]);
+    let at_sub = listed_ids_in(&repo, "sub", &[]);
+
+    // Pinned to the value this hunk had before hashing moved frames. Equality
+    // between the two directories is not enough on its own: rewriting `\` to
+    // `/` moves both of them *together*, so they agree on an id that no
+    // previously written spec, and no earlier release, would recognise.
+    assert_eq!(
+        at_root[r"sub/back\slash.txt"][0],
+        "hunk-36879bfd49553dfc70108ab2a551692acc3f4e9781c5ac5edcfb1441e8dc1e42",
+        "the id of a backslash-named file at the root moved"
+    );
+    assert_eq!(
+        at_root[r"sub/back\slash.txt"],
+        at_sub[r"back\slash.txt"],
+        "the backslash was read as a directory separator: {at_root:?} vs {at_sub:?}"
+    );
+}
+
+/// The counter-guard, and the only test here that is meant to pass both before
+/// and after the change: ids generated at the repo root must not move at all.
+/// They are the ones README.md and SKILL.md quote, and a fix that made a hunk's
+/// id independent of the cwd by changing the id everyone already has would be
+/// no fix. This pins one to its literal value so that any future reworking of
+/// the hash has to be a deliberate act.
+#[test]
+fn a_root_generated_id_keeps_its_documented_value() {
+    let repo = TestRepo::new("root-id-is-pinned");
+    repo.write_file("sub/f.txt", "one\ntwo\nthree\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("sub/f.txt", "one\nTWO\nthree\n");
+
+    let at_root = listed_ids_in(&repo, "", &[]);
+    assert_eq!(
+        at_root["sub/f.txt"][0],
+        "hunk-335a56dd88e461360387e7cb456cad6cfa27797cdb07c91b66ad8a380728136f"
     );
 }
 
