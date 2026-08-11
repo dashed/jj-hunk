@@ -21,12 +21,21 @@ Use `jj-hunk` for non-interactive hunk selection in jj. Essential for AI agents 
 cargo install jj-hunk
 ```
 
-Add to `~/.jjconfig.toml`:
+**No jj config is required.** Every `jj-hunk` verb pins `merge-tools.jj-hunk.program` to the
+executable that is running and passes it to `jj` on the command line, so a `[merge-tools.jj-hunk]`
+block in `~/.jjconfig.toml` is ignored by them — a stale or wrong one cannot break them either.
+
+That config is load-bearing only on the raw `jj --tool=jj-hunk` path (see
+[Direct jj --tool Usage](#direct-jj---tool-usage)), where `jj` resolves the tool itself:
+
 ```toml
 [merge-tools.jj-hunk]
-program = "jj-hunk"
+program = "jj-hunk"                          # on PATH, or an absolute path
 edit-args = ["select", "$left", "$right"]
 ```
+
+Registering a *different* tool that wraps jj-hunk therefore has to use a name other than
+`jj-hunk`, and be driven through `jj` directly.
 
 ### Semantic predicates need the `semantic` build feature
 
@@ -42,6 +51,111 @@ Error: hunkset evaluation error: function() requires the 'semantic' feature (bui
 If you see that, rebuild with `cargo install jj-hunk --features semantic`. Every other predicate
 (`file`, `glob`, `extension`, `status`, `type`, `lines`, `content`, `added`, `removed`, `id`,
 `all`, `none`) works in any build.
+
+## Commands
+
+Eight subcommands. `list` is read-only, `select` is plumbing that `jj` invokes, and the other six
+rewrite history.
+
+| Command | What it does |
+|---------|--------------|
+| `list` | Show the hunks in a diff. Read-only — the only one safe to run speculatively |
+| `split <spec> <msg>` | Move the selected hunks into a new commit |
+| `commit <spec> <msg>` | Commit the selected hunks |
+| `squash <spec>` | Move the selected hunks into the parent |
+| `diffedit <spec>` | Rewrite a revision to contain **only** the selected hunks |
+| `restore <spec>` | **Undo** the selected hunks, taking their content from another revision |
+| `absorb [<spec>]` | Route each hunk into the mutable ancestor that last touched its lines |
+| `select <left> <right>` | Called by `jj --tool=jj-hunk`; not for direct use |
+
+### The trap: the verbs disagree about what a named hunk MEANS
+
+Read this before writing a selector. The same expression means different things per verb:
+
+| Verb | The hunks you name are... | The hunks you do NOT name... |
+|------|---------------------------|------------------------------|
+| `split` | the ones that **leave**, into the new commit | stay in the original revision |
+| `commit` | the ones that **are committed** | stay in the working copy |
+| `squash` | the ones that **move** to the destination | stay where they are |
+| `restore` | the ones that are **UNDONE** | are left alone |
+| `diffedit` | the ones that are **KEPT** | are **discarded** |
+
+`diffedit` and `restore` are near-inverses. Against the same diff, `diffedit 'id(X)'` throws away
+everything *except* X; `restore 'id(X)'` throws away *only* X. Confusing the two destroys the
+wrong half of the diff.
+
+### `restore` reads its ids from a REVERSED listing
+
+`jj restore` hands its editor the destination on the left and the source on the right, so
+`restore` builds its spec against `destination -> source` — the reverse of `jj diff -r`. A hunk id
+copied from a plain `jj-hunk list` **does not resolve there**: the removed and added lines are
+swapped, and the id is a hash over them.
+
+```bash
+$ jj-hunk list --format text                    # the forward diff
+M f.txt
+  hunk 0 replace hunk-8ece5680 (before 2+1 after 2+1)
+    - AAA
+    + AAA-changed
+
+$ jj-hunk restore 'id(hunk-8ece5680)'
+Error: hunkset evaluation error: hunk id 'hunk-8ece5680' matches no hunk in this diff -- ids change when the hunk's content or its file changes, so one copied from an earlier listing may be stale. Run 'list' again for the current ids.
+```
+
+List the diff the way `restore` sees it instead. For a default `restore` (which is
+`--changes-in @`) that is `--from @ --to @-`:
+
+```bash
+$ jj-hunk list --from @ --to @- --format text
+M f.txt
+  hunk 0 replace hunk-2bbf2ed8 (before 2+1 after 2+1)
+    - AAA-changed
+    + AAA
+
+$ jj-hunk restore 'id(hunk-2bbf2ed8)'           # undoes that hunk, leaves the rest
+```
+
+In general `restore -c REV` reads from `jj-hunk list --from REV --to REV-`, and
+`restore --from A --into B` reads from `jj-hunk list --from B --to A`. Content selectors need the
+same care, because `added()` and `removed()` are swapped along with everything else.
+
+### `absorb`
+
+Routes each hunk into the mutable ancestor that last touched its lines, using `jj file annotate` to
+find it. With no spec it considers every hunk in the revision.
+
+```bash
+$ jj-hunk absorb --dry-run
+absorb from ztlvxwwl (no description)
+  2 hunks: 2 moving into 2 ancestors, 0 staying
+
+move into zsyysozv c2: touch line 2
+  f.txt:2  -1 +1  hunk-fba1c241
+
+move into ykzysqmq c3: touch line 7
+  f.txt:7  -1 +1  hunk-5157c417
+
+line numbers are in the parent of ztlvxwwl; an insertion is listed at the line it goes before
+--dry-run: nothing was changed
+```
+
+**Run `--dry-run` first.** The plan names every destination commit, and it is the only preview
+there is.
+
+- **Pure insertions stay put by default.** No line of an insertion blames to an ancestor, so
+  `--insertions=skip` (the default) leaves it behind, printing `it only adds lines, so no line of
+  it blames to an ancestor`. `--insertions=surrounding` opts into jj's own rule: route it only
+  when the lines above and below agree on a destination.
+- **Renamed and copied files are refused**, with the reason printed beside the hunk — a rename is
+  a whole-file change that would ride into whichever ancestor took its first hunk. Commit the
+  rename on its own first, then absorb.
+- **The source revision is left empty, not abandoned.**
+- **The undo is `jj op restore <id>`, not `jj undo`** — absorb performs several operations and
+  `jj undo` reverses only the last. The id is printed on the final line.
+
+An absorb that can route nothing is **not an error**. It prints `Nothing to absorb: every hunk
+stays in <rev>.` and exits **0**, so an agent checking only the exit code will read a refused
+rename as success. Check the summary line, not the status.
 
 ## Hunkset Query Language
 
@@ -109,12 +223,26 @@ includes line 20, and `lines(7..7)` selects the hunk on line 7. The same applies
 
 | Function | Description |
 |----------|-------------|
-| `id("hunk-b6548253")` | Select by hunk ID — full, short, or any unambiguous prefix |
-| `id("hunk-b6548253", "hunk-397f491f")` | Multiple IDs in one call; the forms may be mixed |
+| `id("hunk-399b086c")` | Select by hunk ID — full, short, or any unambiguous prefix |
+| `id(hunk-399b086c)` | The quotes are optional on an id |
+| `id("hunk-399b086c", "hunk-3274da35")` | Multiple IDs in one call; the forms may be mixed |
 | `all()` / `none()` | Everything / nothing |
 
-A prefix that matches more than one hunk — or the bare `hunk-` — is rejected rather than guessed at,
-with the candidates named. See [Hunk IDs](#hunk-ids) for the two forms and their shelf life.
+**`id()` is the one predicate that errors instead of returning nothing.** Every other predicate
+narrows a set, so matching nothing is a legitimate empty result; `id()` resolves a name, so a name
+that resolves to nothing is a mistake:
+
+```
+Error: hunkset evaluation error: hunk id 'hunk-deadbeef' matches no hunk in this diff -- ids change when the hunk's content or its file changes, so one copied from an earlier listing may be stale. Run 'list' again for the current ids.
+```
+
+This fires on `list --spec` too, unlike the spec validator described under
+[When an ID does not resolve](#when-an-id-does-not-resolve). A prefix that matches more than one
+hunk — or the bare `hunk-` — is likewise rejected with the candidates named, never guessed at.
+
+`id()` resolves ids, it does not pattern-match them: `substring:`, `glob:` and `regex:` on `id()`
+are rejected. Only `exact:` is meaningful, and it means "do not treat this as an abbreviation".
+See [Hunk IDs](#hunk-ids) for the two forms and their shelf life.
 
 **Semantic (tree-sitter powered, requires the `semantic` feature):**
 
@@ -171,6 +299,48 @@ jj-hunk list --spec 'function(substring:"test")'   # test_a, my_test, test_b ...
 jj-hunk list --spec 'function(glob:"test_*")'
 jj-hunk list --spec 'function(regex:"^handle_")'
 ```
+
+The quotes may be dropped around a single bare word, which then follows the same table —
+`content(let)` is the substring `let`. Anything containing a space or a dot needs the quotes, so
+`content("let v")` and `file("wide.rs")` are the safe forms; `file(wide.rs)` is a parse error.
+
+**A malformed glob is an error, everywhere.** `glob()`, `file(glob:)`, `--include` and `--exclude`
+all reject one outright rather than matching nothing — which matters most under `~`, where
+"matches nothing" would have inverted into "matches everything":
+
+```
+Error: hunkset evaluation error: invalid glob 'src/[': unclosed '[' -- a character class needs a matching ']'
+```
+
+### Binary files: half the predicates cannot see them
+
+A binary file has no hunks to match, so it is selected **whole** or not at all. Which predicates
+can reach it is a hard split:
+
+| Reach binaries (select them whole) | Never reach binaries |
+|------------------------------------|----------------------|
+| `all()`, `file()`, `glob()`, `extension()`, `status()`, and any negation `~x` | `content()`, `added()`, `removed()`, `lines()`, `id()` |
+
+**This is the trap: a `content()`-only selector silently leaves a binary change behind.** It is not
+an error and nothing warns you — the binary just stays in the revision you were emptying:
+
+```bash
+$ jj-hunk list --format text
+M blob.bin [binary]
+M text.rs
+  hunk 0 replace hunk-789d8071 (before 2+1 after 2+1)
+    - two
+    + TWO
+
+$ jj-hunk split 'content("TWO")' "text only"     # succeeds, exit 0
+$ jj-hunk list --format text                     # ... but this is left over
+M blob.bin [binary]
+```
+
+When a selection is meant to cover everything, reach for a predicate from the left column —
+`all() ~ content("...")`, `glob("**")`, or an explicit `{"action": "keep"}` entry. To include a
+binary in a JSON spec use `{"action": "keep"}`; `{"ids": []}` resets it, restoring the parent
+byte-for-byte, and works on symlinks and non-UTF-8 paths too.
 
 ### Decorator-only changes attribute differently per language
 
@@ -229,17 +399,27 @@ which hunks belong to which logical change:
 
 ```
 M src/svc.rs
-  hunk 0 insert hunk-b6548253 (before 2+0 after 2+1)
+  hunk 0 insert hunk-399b086c (before 2+0 after 2+1)
     + use std::io;
-  hunk 1 insert hunk-f2c7f434 (before 5+0 after 6+1) in UserService
+  hunk 1 insert hunk-e338f6bc (before 5+0 after 6+1) in UserService
     +     hits: u64,
-  hunk 2 replace hunk-397f491f (before 9+1 after 11+1) in UserService::handle_request
+  hunk 2 replace hunk-3274da35 (before 9+1 after 11+1) in UserService::handle_request
     -         let a = 1;
     +         let a = 111;
 ```
 
-`--format diff` produces a unified patch whose `@@` headers carry the enclosing function name and
-the hunk's short ID:
+The trailing `in UserService` / `in UserService::handle_request` come from the semantic analyzer;
+a binary built without the `semantic` feature prints the same lines without them. A file with no
+text hunks — a binary, a pure rename — is listed with its status and no hunk lines at all:
+
+```
+M blob.bin [binary]
+A empty-add.txt
+R moved.txt (tomove.txt -> moved.txt)
+```
+
+`--format diff` produces a unified patch whose `@@` headers carry the enclosing function name (with
+the `semantic` feature; without it, the ID alone) and the hunk's short ID:
 
 ```diff
 --- a/wide.rs
@@ -258,7 +438,24 @@ the hunk's short ID:
 The ID in the header is written plain, with no trailing `...`, and can be pasted straight into
 `id()` or a spec.
 
-Combine it with `--spec` to export just the hunks a query selects.
+Combine it with `--spec` to export just the hunks a query selects. The filtered patch is
+re-anchored to its own context, so it applies at the right line rather than at the unfiltered
+offset:
+
+```bash
+$ jj-hunk list --spec 'id(hunk-25117ece)' --format diff
+--- a/f.txt
++++ b/f.txt
+@@ -14,7 +14,7 @@ [hunk-25117ece]
+ L14
+ L15
+ L16
+-L17
++L17-changed
+ L18
+ L19
+ L20
+```
 
 **Applying a `--format diff` patch: use `git apply`, not `git am`.** The output is a bare unified
 diff with no mail headers, so `git am` rejects it outright (`Patch format detection failed`).
@@ -282,7 +479,10 @@ The short form is the shortest prefix that is unique across the diff, never unde
 Everywhere an ID is *accepted* — `ids` and `hunks` in a spec, and `id()` — the full form, the short
 form, and any unambiguous prefix all work, and the forms may be mixed in one call. A trailing `...`
 is tolerated for IDs copied out of older diff headers. An ambiguous prefix is an error naming the
-candidates, never a guess. (`id(exact:"...")` is the one form that demands the full 64 hex.)
+candidates, never a guess. `exact:` does **not** demand the full 64 hex —
+`id(exact:"hunk-f5696093")` resolves the short form fine. All `exact:` does is switch off
+abbreviation: it accepts the full id or the exact short id, and rejects every other prefix,
+`hunk-f569` and `hunk-f5696093a5ac` alike.
 
 ### How long an ID stays valid
 
@@ -290,35 +490,59 @@ Long enough to carry it from one command to the next against the same working-co
 the workflow — `list`, choose, `split` — and within it IDs are solid.
 
 **Survives:** other hunks appearing or disappearing elsewhere in the same file (concurrent agent
-work), edits to other files, and line numbers shifting — positions are not hashed.
+work), edits to other files, and line numbers shifting — positions are not hashed. It survives an
+edit *inside* its own three-line context window too, because the context is read from the parent
+side and the parent side did not change.
 
 **Does not survive:**
 
 - **renaming or moving the file** — the path is hashed;
+- **listing from a different working directory** — paths are relative to the CWD, so the same hunk
+  is `hunk-f224b4a3` listed from the repo root as `sub/deep.txt` and `hunk-ed3f9ec2` listed from
+  `sub/` as `deep.txt`. Collect and use IDs from one directory;
 - **an edit touching a line immediately adjacent to the hunk**, which merges the two into one larger
   hunk with different text. A line of untouched code in between keeps them separate;
 - **a rebase, or a squash into the parent**, when it rewrites the lines around the hunk. Context is
-  read from the parent side. Treat any rebase as invalidating.
+  read from the parent side. Treat any rebase as invalidating;
+- **reversing the diff.** `--from A --to B` and `--from B --to A` swap the removed and added lines,
+  so every id differs. This is what makes `restore` ids distinct — see
+  [`restore` reads its ids from a REVERSED listing](#restore-reads-its-ids-from-a-reversed-listing).
 
 **So: re-run `list` after editing, and use the IDs from that run.** Do not cache IDs across an
-editing session, a rebase, or a rename.
+editing session, a rebase, a rename, or a change of directory.
 
 ### When an ID does not resolve
 
-`split`, `commit`, and `squash` validate every spec entry before touching anything and refuse the
-whole operation if one does not name exactly what it meant to:
+Every mutating verb — `split`, `commit`, `squash`, `diffedit`, `restore` — validates each entry of
+a **JSON/YAML spec** before touching anything, and refuses the whole operation if one does not name
+exactly what it meant to:
 
 ```
 Error: spec does not resolve against the diff:
   wide.rs: no hunk with id hunk-deadbeef
-Those entries do not name exactly what they meant to. Check them against `jj-hunk list --spec-template`, or pass --allow-empty if that is intended.
+Those entries do not name exactly what they meant to. Check them against `jj-hunk list --spec-template`.
 ```
 
 The middle line names the specific problem — `no hunk with id ...` (usually a stale ID), `id hunk-3
-is ambiguous, it names 3 hunks -- use a longer prefix`, or `no hunk with index 99 (file has 10)`.
+is ambiguous, it names 3 hunks -- use a longer prefix`, `no hunk with index 99 (file has 10)`,
+`no such path in the diff`, or, for a spec keyed by a rename's old name,
+`old.txt: renamed to new.txt in this diff -- file the entry under new.txt instead`.
 
-`jj-hunk list --spec` does not run this check: an ID matching nothing simply selects nothing, which
-is what makes `list --spec` safe to iterate with.
+**`--allow-empty` does not silence this.** That flag says an empty *result* is acceptable; it never
+meant "do not check whether what I wrote refers to anything". A typo'd path or a stale ID is still
+reported with the flag set. The listing named in the message is the one matching the verb's own
+diff, so `restore` points at its reversed listing with the revisions already resolved — `jj-hunk
+list --from 395f21b77162 --to 8f3be992928c --spec-template` — rather than sending you back to the
+plain listing that produced the bad id.
+
+A spec **may** name paths that are absent from the diff — a reusable allowlist stays usable as
+files come and go — as long as it still keeps at least one path that *is* present. Only a spec that
+keeps nothing real is rejected.
+
+`jj-hunk list --spec` does not run this check, so a JSON spec naming a stale ID or a missing path
+simply selects nothing there, which is what makes `list --spec` safe to iterate with. A **hunkset**
+is different: `id()` resolves ids as it evaluates, so `list --spec 'id(hunk-deadbeef)'` errors even
+on `list`. So do a malformed glob and a semantic predicate in a non-`semantic` build.
 
 ## Core Workflow
 
@@ -332,23 +556,36 @@ jj-hunk list --format text
 jj-hunk list --spec 'scope("UserService")' --format text
 
 # Verify a selection covers everything you expect
-jj-hunk list --spec 'scope("UserService") ~ id("hunk-f2c7f434", "hunk-397f491f")' --format text
+jj-hunk list --spec 'scope("UserService") ~ id("hunk-e338f6bc", "hunk-3274da35")' --format text
 # Empty output = those ids cover everything in that scope
 ```
 
 Other `list` options:
 
 - `--rev <revset>` — diff the revision against its parent (must resolve to a single revision)
-- `--include <glob>` / `--exclude <glob>` — filter paths; one pattern per flag, repeatable
+- `--from <rev> --to <rev>` — diff two revisions explicitly; mutually exclusive with `--rev`. This
+  is how you list the diff `restore` works against
+- `--include <glob>` / `--exclude <glob>` — filter paths; one pattern per flag, repeatable. A
+  malformed glob is an error, not a pattern that matches nothing
 - `--group none|directory|extension|status` — group output as `groups: [{name, files}]`
 - `--binary skip|mark|include` — binary handling (default: `mark`, which lists the file with 0 hunks)
+- `--max-bytes <n>` / `--max-lines <n>` — truncate file contents before diffing
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit an ID-based starting spec (JSON/YAML only; `text` and `diff` are rejected)
 
+`list` shows changes that have no hunks at all — binaries, pure renames and copies, mode-only
+changes, and empty-file adds and removes. `--spec-template` emits `{"action": "keep"}` for them
+(plus `"from"` for a rename or copy), so the template always covers the whole diff.
+
+Paths — in output, in spec keys, and in `file()`/`glob()` — are **relative to the current
+directory**, not the repo root. Running from a subdirectory works, but the paths and therefore the
+hunk IDs differ from a run at the root.
+
 ### 2. Select and split
 
-Use hunkset expressions directly with split/commit/squash — the format is auto-detected, so
-anything that isn't JSON/YAML is parsed as a hunkset:
+Use hunkset expressions directly with any of the mutating verbs — the format is auto-detected, so
+anything that isn't JSON/YAML is parsed as a hunkset. Remember that the same expression means
+different things per verb; see [the trap](#the-trap-the-verbs-disagree-about-what-a-named-hunk-means):
 
 ```bash
 # Split by semantic scope
@@ -361,16 +598,19 @@ jj-hunk split 'glob("src/api/**")' "feat: add API endpoints"
 jj-hunk split 'added("TODO") | added("FIXME")' "chore: add TODOs"
 ```
 
-A selection that matches nothing is a hard error, not an empty commit:
+A selection that matches nothing is a hard error, from every mutating verb:
 
 ```
-Error: selection matched no hunks: function("a")
-Nothing would be kept, so this would create an empty commit.
-Check the selector with `jj-hunk list --spec ...`, or pass --allow-empty if that is intended.
+Error: selection matched no hunks: content("zzzznomatch")
+An empty selection is nearly always a mistyped selector rather than an intent, so it is refused.
+Check it against `jj-hunk list --spec ...`, or pass --allow-empty if that is what you meant.
 ```
 
-This is the main guard against a typo'd selector silently producing a no-op commit. Pass
-`--allow-empty` only when an empty commit is genuinely what you want.
+This is the main guard against a typo'd selector silently producing a no-op. What it would
+otherwise have carried out differs per verb — an empty commit for `split`, a **discarded diff** for
+`diffedit`, nothing at all for `restore`. Pass `--allow-empty` only when that outcome is genuinely
+what you want; it does not excuse a spec that names things which do not exist (see
+[When an ID does not resolve](#when-an-id-does-not-resolve)).
 
 ### 3. Use stable IDs for safety
 
@@ -381,7 +621,7 @@ When other changes may arrive concurrently, **always resolve your hunkset query 
 jj-hunk list --spec 'function("handle_request") & glob("src/api/**")' --format text
 
 # Step 2: Note the hunk IDs from the output, then split using IDs
-jj-hunk split 'id("hunk-b6548253", "hunk-397f491f")' "feat: handle_request implementation"
+jj-hunk split 'id("hunk-399b086c", "hunk-3274da35")' "feat: handle_request implementation"
 ```
 
 `--format text` and `--format diff` print the short ID directly, so you can copy it out of either
@@ -399,7 +639,7 @@ For complex selections or when building specs programmatically:
 ```json
 {
   "files": {
-    "src/foo.rs": {"ids": ["hunk-b6548253", "hunk-397f491f"]},
+    "src/svc.rs": {"ids": ["hunk-399b086c", "hunk-3274da35"]},
     "src/bar.rs": {"action": "keep"},
     "src/qux.rs": {"action": "reset"}
   },
@@ -407,10 +647,14 @@ For complex selections or when building specs programmatically:
 }
 ```
 
+Keys are paths **relative to the current directory**, and an ID belongs to the path it was listed
+under — the path is part of the hash, so these two IDs are only valid under `src/svc.rs`, listed
+from the repo root.
+
 | Spec | Effect |
 |------|--------|
 | `{"hunks": [0, 2]}` | Include only hunks 0 and 2 (indices or ID strings) |
-| `{"ids": ["hunk-b6548253"]}` | Include hunks by ID (full, short, or unambiguous prefix) |
+| `{"ids": ["hunk-399b086c"]}` | Include hunks by ID (full, short, or unambiguous prefix) |
 | `{"action": "keep"}` | Include all changes in the file |
 | `{"action": "reset"}` | Discard all changes in the file |
 | `"default": "reset"` | Unlisted files are discarded |
@@ -423,12 +667,19 @@ or loaded with `--spec-file`. `jj-hunk list --spec-template` generates an ID-bas
 cannot tell that `right/new_name` used to be `left/old_name`; `from` supplies that link:
 
 ```json
-{"files": {"new_name.txt": {"ids": ["hunk-ca38eba7"], "from": "old_name.txt"}}, "default": "reset"}
+{"files": {"new_name.txt": {"ids": ["hunk-111b8dea"], "from": "old_name.txt"}}, "default": "reset"}
 ```
 
-`split`/`commit`/`squash` fill this in for you from jj's rename detection, so a hand-written spec
-that omits it still works. It is load-bearing only on the raw `jj --tool=jj-hunk` path below, where
+The mutating verbs fill this in for you from jj's rename detection, so a hand-written spec that
+omits it still works. It is load-bearing only on the raw `jj --tool=jj-hunk` path below, where
 omitting it drops the file from the commit entirely.
+
+Key the entry under the **new** name. Using the old one is an error that names the replacement:
+
+```
+Error: spec does not resolve against the diff:
+  old.txt: renamed to new.txt in this diff -- file the entry under new.txt instead
+```
 
 ## Direct jj --tool Usage
 
@@ -475,7 +726,7 @@ jj-hunk list --spec 'function("handle_request") & file("src/api/handler.rs")' --
 # 5. Split your changes into a clean commit
 #    Do this from the same working-copy state you listed — do not reuse IDs
 #    collected before an edit or a rebase.
-jj-hunk split 'id("hunk-b6548253", "hunk-397f491f")' "feat: add request handler"
+jj-hunk split 'id("hunk-399b086c", "hunk-3274da35")' "feat: add request handler"
 
 # 6. Rebase the clean commit to its proper place in the graph
 jj rebase -r <new_change> -d main
@@ -530,3 +781,6 @@ main
 - **Use `--spec` on `list` to verify**: Preview what a split would select before executing it. An empty result means your query matches nothing; refine it.
 - **`"default": "reset"` is safer**: Explicitly include what you want rather than excluding what you don't.
 - **Watch the matching mode**: `function("x")` is exact. If a query unexpectedly returns nothing, try `substring:"x"` before assuming the hunk isn't there.
+- **Check which verb you are holding**: `diffedit` keeps what you name, `restore` undoes what you name. Re-read [the trap](#the-trap-the-verbs-disagree-about-what-a-named-hunk-means) before either.
+- **`--dry-run` before every `absorb`**, and read the summary line rather than the exit code — a refused rename exits 0.
+- **Do not trust exit 0 to mean "everything moved"**: a `content()`-only selector leaves binary changes behind, silently. Run `list` again afterwards to see what is left.
