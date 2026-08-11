@@ -67,7 +67,7 @@ main (upstream v0.4.1, 3643ee8)
 ├── alberto/test-ci
 │   └── .github/workflows/ci.yml
 │
-└── alberto/my-jj-hunk (5-way merge)
+└── alberto/my-jj-hunk (4-way merge)
     └── Integration branch combining all features + customizations
 ```
 
@@ -97,16 +97,20 @@ compiles as part of the merge, it is not a feature branch, it is a fragment.
 │   │  - FORK_WORKFLOW.md
 │
 ├── ○ alberto/tree-sitter-semantic
-│   │  - src/semantic.rs (1253 lines, 30 tests)
+│   │  - src/semantic.rs (2179 lines, 86 tests)
 │   │  - 20 tree-sitter grammars behind the `semantic` feature
 │   │  - enclosing function/scope, annotations, doc/import flags, depth
 │
 ├── ○ alberto/hunkset-lang
 │   │  - src/hunkset/{ast,error,eval,parser,pattern}.rs
-│   │  - src/glob.rs
+│   │  - src/glob.rs, src/absorb.rs
 │   │  - Declares the `semantic` feature *contract*
+│   │  - The command surface: 8 verbs
 │
-└── ○ alberto/my-jj-hunk (merge of all above)
+├── ○ alberto/test-ci
+│   │  - .github/workflows/ci.yml
+│
+└── ○ alberto/my-jj-hunk (merge of all four)
        - Includes all features + fork customizations
 ```
 
@@ -279,7 +283,7 @@ cargo build && cargo test
 
 # 4. Fold into the integration branch
 jj new alberto/tree-sitter-semantic alberto/hunkset-lang \
-       alberto/fork-customizations alberto/new-feature \
+       alberto/fork-customizations alberto/test-ci alberto/new-feature \
   -m "integration: combine all feature branches"
 jj bookmark set alberto/my-jj-hunk --allow-backwards
 ```
@@ -457,51 +461,205 @@ with a leading `./`, and GNU and BSD tar disagree about whether `jj` matches
 `./jj`. The workflow extracts the whole archive and moves the binary out rather
 than naming a member.
 
+### Two identical blocks shared one hunk id
+
+Shipped on `alberto/hunkset-lang` as `fix(diff)`; the `alberto/short-ids` branch
+the roadmap called for was never needed as a separate branch.
+
+A hunk id hashed the change and its context, so a file with two identical
+blocks — easy to produce in JSON or in repetitive code — had two hunks and one
+id between them. That id was the only handle anything downstream had.
+`--spec-template` printed it twice, so one of the two hunks could not be named
+at all; and because `hunkset::to_spec` turns matched hunks into ids, *every*
+hunkset expression over such a file over-selected — `before_line(1..8)` matched
+the first block and quietly took its twin fifty lines later.
+
+An id is now `H(path, type, -lines, +lines, context, occurrence)`. `path` keeps
+the same edit in five files from collapsing onto one id, since `id()` is the
+identity predicate and has to name exactly one hunk. `occurrence` counts earlier
+hunks in the file with the same digest; it is 0 for everything but the
+repeated-identical case, where it is the only thing left to tell the copies
+apart. `get_hunks` and `apply_selected_hunks` had held separate copies of the id
+expression — which is how they would have drifted — so application now resolves
+through `get_hunks` and applies by index.
+
+Full ids stay 64 hex digits in JSON and YAML as the stable contract. Text, diff
+and `--spec-template` output show a `short_id` beside them, abbreviated the way
+jj abbreviates change ids: the shortest prefix at which every id in the *whole
+diff* is distinct, floored at 8 hex digits to match jj's `format_short_id`, and
+widened rather than truncated when that is not enough. Any unambiguous prefix of
+either form is accepted on input, and an ambiguous one is an error rather than a
+multi-select on all four paths that can see it.
+
+The lasting part is the durability decision, because the roadmap entry that
+asked for this work posed it as an either/or — context-bearing *or*
+context-free, "pick one" — and the answer is both, for different jobs. It also
+had the mechanics wrong, which `fix(id)` corrected in the code comment: the
+context is read from the **parent** side, so editing inside a hunk's context
+window does not move its id. What moves an id is an edit *adjacent* to the
+hunk, because the two then merge into one larger hunk — a different hunk, and
+correctly a different id. Nor does a rebase reliably invalidate an id: onto a
+parent that rewrites the surrounding lines it does, onto one that leaves the
+file alone it does not. Treat any rebase as invalidating rather than reasoning
+case by case.
+
+So hashing the context still *looks* like the defect, and it is not. It is why
+two identical one-line edits in one file are told apart by where they sit
+instead of falling back on the occurrence ordinal. These ids exist for
+list-pick-split against a single working-copy state, where an id only has to
+stay valid long enough to be copied out of one command and into the next, and
+within that window folding the context in makes them markedly *more* distinct.
+**The context stays.** What absorb needs is a second, context-free identity
+beside this one — not a weakening of it.
+
+### The verbs upstream lacks, and the second identity absorb needed
+
+Shipped on `alberto/hunkset-lang` as `feat: add the diffedit and restore verbs`
+and `feat(absorb)`, closing the `alberto/jj-verbs` roadmap entry. The command
+surface is now eight verbs: `list`, `select`, `split`, `commit`, `squash`,
+`diffedit`, `restore`, `absorb`.
+
+**A named hunk does not mean the same thing in every verb.**
+
+```
+split     the named hunks go into the split-off commit
+squash    the named hunks move to the destination
+diffedit  the named hunks are KEPT
+restore   the named hunks are UNDONE
+```
+
+That inversion is not a local choice; it is what jj shows the diff editor. `jj
+restore` presents *destination → source*, the reverse of `jj diff -r`, and its
+right side starts out fully restored — so keeping a hunk is exactly what lets
+the restoration stand. The trap underneath it is quieter: a hunk id is a hash of
+the text it was computed from, so a spec built against the forward diff names
+nothing at all in restore's view. It would not misfire loudly, it would select
+nothing. Each command therefore states the diff it builds its spec from as an
+explicit `DiffTarget`, and `list` grew the matching `--from`/`--to` so that
+restore's ids are visible from some command at all.
+
+**Absorb proved the prediction above.** It routes each hunk into the mutable
+ancestor whose lines it changes — `jj file annotate` on the parent gives
+per-line ownership, and a hunk whose `-` lines blame to exactly one mutable
+ancestor moves there — and it executes as a sequence of `jj squash` calls. Every
+squash rewrites history, so after the first one the remaining hunks' context has
+moved and their context-bearing ids no longer match. Routing therefore uses the
+context-free fingerprint the id entry predicted, path plus the `+`/`-` lines and
+nothing else, and re-derives the diff before every squash. Hunks in one file
+that share a fingerprint are indivisible: moved together when they agree on a
+destination, left where they are when they do not, because no id-based selection
+can name one without the other.
+
+Renamed and copied files stay put, with the reason printed. A rename is a
+whole-file change that no hunk selection can express, and carrying it along with
+the first squash conflicts every ancestor still using the old name — commit the
+rename on its own first, then absorb.
+
+Three things in `jj-hunk-tool`'s absorb were deliberately **not** copied, and
+each is a rule worth carrying into the next command:
+
+- It falls back to "the most recent mutable ancestor that touched this file",
+  refusing on *ambiguity* while guessing on *absence* of evidence. Here pure
+  insertions stay put by default, and `--insertions=surrounding` is an opt-in
+  that routes only when the lines above and below agree — jj's own rule, and
+  evidence rather than recency.
+- Its interactive retarget menu iterates a `HashSet`, so the numbered ancestor
+  list is ordered differently on every run. Determinism here is enforced rather
+  than hoped for — ordered collections throughout, destinations oldest-first,
+  owners sorted before dedup — and a test runs the plan five times and compares.
+- It prints hunk-relative line numbers in one place and absolute ones in
+  another, while its `:1-3` selectors mean the former. Pick one frame and print
+  it everywhere.
+
+### A fix verified only against its own bug
+
+Shipped as three commits on `alberto/hunkset-lang` — `fix(spec)`,
+`fix(select)`, and `fix: rendering, binaries, tool pinning, absorb renames, and
+fail-open selectors` — plus `fix(semantic)` on `alberto/tree-sitter-semantic`.
+
+An independent multi-agent code review over the whole branch produced **15
+confirmed correctness findings**. All are fixed and verified. What earns them a
+section rather than a changelog line is where several of them came from: they
+were opened *by* the fixes recorded above.
+
+- The symlink fix (`fix: symlink corruption`) routed every existence check
+  through `symlink_metadata` and left the read and the write on
+  `fs::read_to_string` and `fs::write`, which traverse links. A committed
+  `link.txt -> ../outside/victim.txt` then sent `select`'s write to a path in
+  neither directory jj materialised. Exit 0.
+- The mode fix (`fix: stop silently losing files, merges, and mode changes`)
+  restored the file mode from the left side unconditionally — including for a
+  file whose hunks were *kept*, so a chmod that should have ridden along with
+  them was stripped instead. Under `diffedit`, which keeps no remainder commit,
+  that discarded it from history outright.
+- The spec validator (`fix(select): carry rename sources, reset empty
+  selections, validate specs`) had three separate holes. A spec keyed by a
+  rename's **old** path validated and then reverted the rename, because `known`
+  was indexed by every entry of `all_paths()` while `select` looks the entry up
+  under the new path. `--allow-empty` gated `validate_spec_resolves`, so one
+  blanked entry switched off typo detection for every other entry in the same
+  spec — it says an empty *result* is acceptable, not that the names need not
+  exist. And a change that produces no hunks — a pure rename, a pure copy, an
+  empty file added or removed — was invisible to both `list` and
+  `--spec-template`, so feeding `diffedit` its own template deleted the rename.
+
+The lesson is the one this document keeps arriving at from new directions. **A
+fix verified only against its own reproduction closes that case and can open the
+one beside it.** The evidence here is blunt: a regression sweep of the 16 earlier
+fixes on these branches passed 16/16 while these 15 bugs sat next to them,
+because the sweep re-ran the scenarios those fixes were written for. Coverage of
+a fix is not coverage of the code the fix touched. Review the neighbourhood
+rather than the reproduction, and put a reader on it who did not write the fix.
+
+Two findings also turned out to be larger than their reports.
+`~glob("vendor/[a-z*.txt")` committed the vendored change it was written to
+exclude — a malformed glob matched nothing and `~` inverted that into
+everything — but the root cause was not glob syntax: `evaluate_function`
+validated the parsed pattern while `eval_glob`/`eval_file` re-derived its kind
+and recompiled behind `unwrap()`, so the validated pattern was never the one
+matched with. And a stack overflow on long `|`/`&` chains had a twin in
+`src/semantic.rs`, where `find_enclosing` recursed once per syntax node. Both
+walks are now iterative.
+
 ## Roadmap
 
 A systematic bug hunt across the diff core, the query language, the semantic
 configs and the jj integration produced 38 findings; fixing them surfaced 6
 more. All but three are now fixed and on the feature branches — see **Fixed**
 above for the ones with lasting lessons, and the PR descriptions for the full
-inventory.
+inventory. A later independent review of the whole branch found 15 more, also
+fixed; that round is the reason the feature roadmap below is empty and the
+lesson section above has grown.
 
 ### Still open
 
-**`alberto/short-ids`** — hunk ids are full 64-hex sha256, unusable by hand.
-`id()` already supports unambiguous prefixes (and now errors on ambiguous
-ones), so the remaining work is emitting an abbreviated form in `list` output
-with collision-aware widening, the way jj does for change ids.
+Nothing on the feature roadmap. `alberto/short-ids` and `alberto/jj-verbs` were
+the last two entries here and both shipped — see **Fixed** above. What is left
+is hygiene.
 
-While doing it, decide deliberately what an id should survive. Ids hash the
-surrounding context, so they are stable under distant edits but change when
-anything within the context window moves, and they **do not survive a rebase** —
-the opposite of the durability an agent wants while editing around its own
-pending changes. A context-free id is durable but collides between identical
-edits in one file, so it needs a disambiguator. Pick one rather than inheriting
-the current behaviour by default.
+**Clippy is still advisory.** `cargo clippy --locked --all-targets` reports 11
+warnings on the integration merge: one `too many arguments`, four derivable
+`impl`s, two collapsible `if`s, a manual `Iterator::find`, a no-op `as_ref`, a
+field assignment outside a `Default::default()` initializer, and a `vec!` in a
+test. None is a correctness claim, and the CI job's own comment promises to
+promote it to a gate once the backlog is cleared. Clear it and promote it, or
+drop the promise — a comment that has been about to happen for a while is worth
+less than either.
 
-**`alberto/jj-verbs`** — port the commands upstream lacks: `diffedit`,
-`restore`, and `absorb`. Absorb is the valuable one — blame-based routing of
-hunks into the mutable ancestor that introduced the code, via
-`jj file annotate`.
+**Agent worktrees accumulate.** At last count 18 directories under
+`.claude/worktrees/` and 11 `worktree-agent-*` branches were still on disk, and
+that accumulation filled the disk mid-session once already. Nothing removes them
+on its own, and the branch outlives the worktree:
 
-Watch the argument-semantics inversion: for `split` the named hunks become the
-split-off commit and for `restore` they are the ones undone, but for `diffedit`
-they are the ones **kept**.
+```bash
+git worktree list                  # what actually exists
+git worktree remove <path>         # while the directory is still there
+git worktree prune                 # after directories were deleted by hand
+git branch -D worktree-agent-<id>  # the branch is a separate cleanup
+```
 
-**Absorb needs a second, context-free notion of hunk identity.** It executes as
-a sequence of `jj squash` calls, and every squash rewrites history — shifting
-the remaining hunks' context and therefore their ids underneath it.
-`jj-hunk-tool` hit this and solved it with a fingerprint of path plus the
-`+`/`-` lines only, deliberately excluding context, re-matched after each
-squash. That is not an optimization; it is what makes absorb correct.
-
-Three things in `jj-hunk-tool`'s absorb are worth **not** copying: routing lets
-only `-` lines vote, and resolves *ambiguity* by refusing while letting
-*absence* of evidence fall through to a much weaker recency heuristic; its
-interactive retarget menu iterates a `HashSet`, so the numbered ancestor list is
-ordered differently on every run; and it prints hunk-relative line numbers in
-one place and absolute ones in another while `:1-3` selectors mean the former.
+Sweep them between sessions rather than when the disk fills, which is the point
+at which everything else in flight fails at once and for confusing reasons.
 
 ### Deliberately not fixed
 
@@ -587,7 +745,7 @@ jj-hunk list --spec 'added("regex:TODO")'           # WRONG — matches the lite
 Inside the quotes the prefix is just characters to search for. Regex compilation
 itself is properly validated — `added(regex:"[")` exits 1 with
 `invalid regex '[': unclosed character class` — so the only trap is prefix
-placement. See `alberto/strict-selectors` below.
+placement. See **Selectors that matched nothing failed silently** above.
 
 ## Common jj Commands
 
@@ -701,6 +859,7 @@ new upstream release, update the `X.Y.Z` prefix to match.
 | `src/spec.rs` | JSON/YAML spec parsing |
 | `src/commands.rs` | jj invocation, `list`/`split`/`commit`/`squash`, `--tool` callback |
 | `src/hunkset/` | Query language: ast, parser, eval, pattern, error |
+| `src/absorb.rs` | Blame-based routing, context-free fingerprints, squash plan |
 | `src/semantic.rs` | tree-sitter analyzer, 20 language configs |
 | `src/glob.rs` | Glob matching for path predicates |
 | `FORK_WORKFLOW.md` | This documentation (on `fork-customizations`) |
@@ -720,8 +879,10 @@ publish it to crates.io under that scheme.
 |------|---------------|:-----------:|-----------|-------|
 | 2026-08-08 | — → 3643ee8 | — | — | Fork created at upstream v0.4.1; imported sigma's hunkset + semantic work as two independent branches |
 | 2026-08-09 | (no upstream move) | 17 | — | Bug hunt across four areas: 38 findings, 6 more surfaced while fixing. All but three fixed. Test count 17 → 314 |
+| 2026-08-10 | (no upstream move) | 10 | — | Short ids and the `diffedit`/`restore`/`absorb` verbs shipped, closing the roadmap; independent multi-agent review then found 15 correctness bugs, all fixed. Test count 314 → 478 |
 
 ---
 
-*Last updated: 2026-08-09*
-*Bug hunt complete: 314 tests, glob now verified identical to jj across 1650 differential comparisons*
+*Last updated: 2026-08-11*
+*478 tests green on the integration merge (`cargo test --all-features`, jj 0.44.0)*
+*Command surface complete at 8 verbs; feature roadmap empty, hygiene backlog open*
