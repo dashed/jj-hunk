@@ -537,7 +537,10 @@ plain listing that produced the bad id.
 
 A spec **may** name paths that are absent from the diff — a reusable allowlist stays usable as
 files come and go — as long as it still keeps at least one path that *is* present. Only a spec that
-keeps nothing real is rejected.
+keeps nothing real is rejected. That applies to bare `{"action": "keep"}` entries. An entry that
+names `ids` or `hunks` under an absent path is **always** rejected, however much else resolved:
+those ids were read off a real diff, so the path is a typo. Tolerating it committed a subset of
+what the spec asked for, at exit 0, with nothing on stderr.
 
 `jj-hunk list --spec` does not run this check, so a JSON spec naming a stale ID or a missing path
 simply selects nothing there, which is what makes `list --spec` safe to iterate with. A **hunkset**

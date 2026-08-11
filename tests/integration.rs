@@ -4210,6 +4210,73 @@ fn a_spec_that_names_nothing_in_the_diff_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// The forgiveness above was keyed on the wrong thing: whether an absent path
+// was reported depended on what ELSE the spec resolved, so a single entry that
+// still matched silenced every entry that no longer did. The two tests below
+// are the same absent path under the two entry shapes, and they must disagree:
+// ids came off a real diff and cannot go missing innocently, a bare `keep`
+// can.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_absent_path_that_names_hunks_is_reported_beside_a_live_entry() {
+    // The silent subset: a spec asking for two files committed one, at exit 0,
+    // with nothing on stderr. `a.py` resolved, and that alone was enough to
+    // drop the report for the path carrying `a.rs`'s ids.
+    let repo = strict_repo("stale-ids-beside-live");
+    let py = first_hunk_id(&repo, "a.py");
+    let rs = first_hunk_id(&repo, "a.rs");
+    let spec = format!(
+        r#"{{"files": {{"a.py": {{"ids": ["{py}"]}}, "typo-not-a-real-file.rs": {{"ids": ["{rs}"]}}}}, "default": "reset"}}"#
+    );
+
+    let err = repo.hunk_fail(&["commit", &spec, "half a spec"]);
+    assert!(
+        err.contains("typo-not-a-real-file.rs"),
+        "the error must name the path whose ids resolved to nothing: {err}"
+    );
+    // Exit status alone would have missed this bug: the old code exited 0 AND
+    // wrote a commit holding half of what was asked for, so what the commit
+    // contains has to be asserted separately.
+    assert!(
+        !repo
+            .log_descriptions()
+            .iter()
+            .any(|d| d.contains("half a spec")),
+        "a commit was created from a spec half of which named nothing"
+    );
+    let left = repo.changed_files("@");
+    assert!(
+        left.iter().any(|l| l.contains("a.py")) && left.iter().any(|l| l.contains("a.rs")),
+        "both edits must be left in the working copy untouched: {left:?}"
+    );
+}
+
+#[test]
+fn the_same_absent_path_is_forgiven_when_it_names_no_hunks() {
+    // Why the leniency cannot just be deleted: the path that is an error above
+    // is fine here. A bare `keep` claims nothing about this diff's contents, so
+    // a reusable allowlist may carry any number of them beside one live entry
+    // -- which is the shape a checked-in spec actually has.
+    let repo = strict_repo("allowlist-absent-without-ids");
+    let py = first_hunk_id(&repo, "a.py");
+    let spec = format!(
+        r#"{{"files": {{"a.py": {{"ids": ["{py}"]}}, "typo-not-a-real-file.rs": {{"action": "keep"}}, "also-absent.rs": {{"action": "keep"}}}}, "default": "reset"}}"#
+    );
+
+    repo.hunk_ok(&["commit", &spec, "allowlist beside a live id"]);
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.contains("a.py")),
+        "the live entry was not committed: {committed:?}"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("a.rs")),
+        "an unlisted path rode along: {committed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The `select` path: what jj hands the tool, and what the tool may touch.
 //
 // `select` is the only verb that writes to a filesystem, and jj gives it two

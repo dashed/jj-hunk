@@ -374,6 +374,10 @@ Error: spec does not resolve against the diff:
 Those entries do not name exactly what they meant to. Check them against `jj-hunk list --spec-template`.
 ```
 
+That forgiveness covers bare `{"action": "keep"}` entries. An entry carrying `ids` or
+`hunks` under an absent path is **always** rejected, whatever else resolved — those ids
+were read off a real diff, so the path is a typo rather than an idle allowlist entry.
+
 ### Changes with no hunks
 
 Some changes have nothing to select *within*: binary files, symlinks, mode-only
@@ -558,7 +562,7 @@ The middle line names the specific problem, one per bad entry:
 | `no hunk with id hunk-deadbeef` | The id matches nothing in this diff — usually stale, see above |
 | `id hunk-3 is ambiguous, it names 3 hunks -- use a longer prefix` | The prefix is too short *within that file* |
 | `no hunk with index 99 (file has 6)` | An out-of-range `hunks` index |
-| `no such path in the diff` | The path is absent, and no other entry named a path that is present |
+| `no such path in the diff` | The path is absent. Always reported for an entry naming `ids`/`hunks`; for a bare `{"action": "keep"}`, only when no other entry named a path that is present |
 | `renamed to new_name.txt in this diff -- file the entry under new_name.txt instead` | The entry is keyed by a rename's old path |
 
 **`--allow-empty` does not skip this check.** It permits an empty *result*; every message above is

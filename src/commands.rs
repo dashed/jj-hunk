@@ -2411,16 +2411,19 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
 /// a path that is in the diff refers to something real and is fine; a name that
 /// matches nothing in the diff is a different thing entirely.
 ///
-/// Two kinds of mismatch, treated differently:
+/// Three kinds of mismatch, treated differently:
 ///
 /// - A bad id, a bad index, or a key that is only the left-hand side of a
 ///   rename: the file is right there, so the entry meant a specific thing and
 ///   got it wrong. Always reported.
-/// - A path the diff does not contain at all: reported only when the spec names
-///   nothing that IS in the diff. A checked-in or script-generated spec lists a
-///   stable allowlist, and most of it is legitimately absent from any one diff;
-///   but a spec none of whose paths appear was written against some other diff,
-///   and would quietly select nothing.
+/// - An absent path under an entry that names hunks: those ids came off a real
+///   diff, so this is not an allowlist entry that is merely idle -- it asked
+///   for hunks that are not here. Always reported.
+/// - An absent path under a bare `{"action": "keep"}`: reported only when the
+///   spec names nothing that IS in the diff. A checked-in or script-generated
+///   spec lists a stable allowlist, and most of it is legitimately absent from
+///   any one diff; but a spec none of whose paths appear was written against
+///   some other diff, and would quietly select nothing.
 fn validate_spec_resolves(
     spec: &Spec,
     file_hunks: &[FileHunks],
@@ -2478,9 +2481,21 @@ fn validate_spec_resolves(
                     "{path}: renamed to {new_path} in this diff -- \
                      file the entry under {new_path} instead"
                 )),
-                None if intends_to_keep => {
-                    unresolved.push(format!("{path}: no such path in the diff"))
-                }
+                None if intends_to_keep => match file_spec {
+                    // Ids and indices are read off a real diff, so an entry
+                    // carrying them is not a stable allowlist that has gone
+                    // stale: it names hunks that were somewhere once and are
+                    // not here now. Reported no matter what else resolved --
+                    // pooling it with the allowlist case let one entry that
+                    // still matches mask every entry that no longer does, and
+                    // the commit then held a subset of what the spec asked for.
+                    FileSpec::Selection(_) => {
+                        problems.push(format!("{path}: no such path in the diff"))
+                    }
+                    FileSpec::Action { .. } => {
+                        unresolved.push(format!("{path}: no such path in the diff"))
+                    }
+                },
                 None => {}
             }
             continue;
@@ -2529,10 +2544,10 @@ fn validate_spec_resolves(
 
     // An allowlist that names a stable set of paths is a legitimate reusable
     // spec, and most of it is legitimately absent from any one diff -- so an
-    // absent path is only worth reporting when nothing else in the spec keeps
-    // anything real. A spec in that state selects nothing at all, which is the
-    // silent empty commit this whole check exists to catch; a spec that keeps
-    // something has simply outlived a few of its entries.
+    // absent allowlist path is only worth reporting when nothing else in the
+    // spec keeps anything real. A spec in that state selects nothing at all,
+    // which is the silent empty commit this whole check exists to catch; a spec
+    // that keeps something has simply outlived a few of its entries.
     if !keeps_a_real_path && spec.default != DefaultAction::Keep {
         problems.append(&mut unresolved);
     }
