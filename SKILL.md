@@ -494,12 +494,14 @@ work), edits to other files, and line numbers shifting — positions are not has
 edit *inside* its own three-line context window too, because the context is read from the parent
 side and the parent side did not change.
 
+It also survives **being listed from a different working directory**. The path folded into the
+hash is the one relative to the workspace root, so the same hunk is `hunk-64640aa9` whether it is
+listed from the repo root as `sub/deep.txt` or from `sub/` as `deep.txt`. Note that what `list`
+*prints* is still relative to your current directory — only the identity is frame-independent.
+
 **Does not survive:**
 
 - **renaming or moving the file** — the path is hashed;
-- **listing from a different working directory** — paths are relative to the CWD, so the same hunk
-  is `hunk-f224b4a3` listed from the repo root as `sub/deep.txt` and `hunk-ed3f9ec2` listed from
-  `sub/` as `deep.txt`. Collect and use IDs from one directory;
 - **an edit touching a line immediately adjacent to the hunk**, which merges the two into one larger
   hunk with different text. A line of untouched code in between keeps them separate;
 - **a rebase, or a squash into the parent**, when it rewrites the lines around the hunk. Context is
@@ -509,7 +511,7 @@ side and the parent side did not change.
   [`restore` reads its ids from a REVERSED listing](#restore-reads-its-ids-from-a-reversed-listing).
 
 **So: re-run `list` after editing, and use the IDs from that run.** Do not cache IDs across an
-editing session, a rebase, a rename, or a change of directory.
+editing session, a rebase, or a rename.
 
 ### When an ID does not resolve
 

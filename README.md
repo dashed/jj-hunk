@@ -354,8 +354,13 @@ Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `-
 
 `ids` and `hunks` are merged if both are provided. Use `jj-hunk list --spec-template` to generate an id-based starting spec.
 
-File keys are **relative to the current directory**, not to the repo root, and match
-what `list` prints from that same directory. Running from a subdirectory works:
+File keys are matched in two spellings: the one `list` prints from your current
+directory, and the **workspace-root-relative** one. So a spec generated at the repo
+root applies from anywhere in the repo. The reverse does not hold — a spec generated
+in a subdirectory can key a file as `../top.txt`, which names nothing from any other
+directory, so prefer generating specs at the root when they need to travel.
+
+Running from a subdirectory works:
 
 ```bash
 $ cd src && jj-hunk list --format text
