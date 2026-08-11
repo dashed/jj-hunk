@@ -410,10 +410,11 @@ M src/svc.rs
 
 The trailing `in UserService` / `in UserService::handle_request` come from the semantic analyzer;
 a binary built without the `semantic` feature prints the same lines without them. A file with no
-text hunks — a binary, a pure rename — is listed with its status and no hunk lines at all:
+text hunks — a binary, a symlink, a pure rename — is listed with its status and no hunk lines at all:
 
 ```
 M blob.bin [binary]
+M config [symlink, whole-file only]
 A empty-add.txt
 R moved.txt (tomove.txt -> moved.txt)
 ```
@@ -578,9 +579,14 @@ Other `list` options:
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit an ID-based starting spec (JSON/YAML only; `text` and `diff` are rejected)
 
-`list` shows changes that have no hunks at all — binaries, pure renames and copies, mode-only
-changes, and empty-file adds and removes. `--spec-template` emits `{"action": "keep"}` for them
-(plus `"from"` for a rename or copy), so the template always covers the whole diff.
+`list` shows changes that have no hunks at all — binaries, symlinks, pure renames and copies,
+mode-only changes, and empty-file adds and removes. `--spec-template` emits `{"action": "keep"}`
+for them (plus `"from"` for a rename or copy), so the template always covers the whole diff.
+
+A **hunkset expression reaches none of those except a binary**, which is the only one given a
+stand-in hunk for predicates to match. `jj-hunk split 'all()'` therefore leaves a symlink, a
+rename, a mode-only flip and an empty add behind, at exit 0. Drive the whole diff from
+`--spec-template` instead.
 
 Paths — in output, in spec keys, and in `file()`/`glob()` — are **relative to the current
 directory**, not the repo root. Running from a subdirectory works, but the paths and therefore the

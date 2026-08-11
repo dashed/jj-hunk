@@ -208,6 +208,10 @@ struct FileEntry {
     binary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ModeChange>,
+    /// Set when either side of this entry is a symlink, so a reader can see
+    /// why a change that jj calls modified carries no hunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symlink: Option<bool>,
     /// Set when `--max-bytes`/`--max-lines` actually cut this file, so the
     /// listed hunks describe only its opening slice.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,6 +249,8 @@ struct FileSummary {
     binary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ModeChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symlink: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     truncated: Option<bool>,
 }
@@ -284,6 +290,12 @@ struct DiffSummaryEntry {
     source_executable: bool,
     #[serde(default)]
     target_executable: bool,
+    /// jj's `file_type()`: `"file"`, `"symlink"`, `"tree"`, `"git-submodule"`,
+    /// `"conflict"`, or `""` when that side has no entry at all.
+    #[serde(default)]
+    source_file_type: String,
+    #[serde(default)]
+    target_file_type: String,
 }
 
 /// A change to a file's executable bit.
@@ -305,6 +317,18 @@ fn git_mode(executable: bool) -> &'static str {
     } else {
         "100644"
     }
+}
+
+/// Whether either side of this entry is a symlink.
+///
+/// A link's target is not text: `jj file show` refuses to print one, so both
+/// sides of a retargeted link diff as the empty string and `get_hunks` yields
+/// nothing. The change is real -- jj calls it modified -- but nothing in the
+/// hunk machinery can see it, so it has to be recognised from the summary
+/// instead. Either side counts, because a link that becomes an empty file, or
+/// an empty file that becomes a link, diffs to nothing just as thoroughly.
+fn involves_symlink(entry: &DiffSummaryEntry) -> bool {
+    entry.source_file_type == "symlink" || entry.target_file_type == "symlink"
 }
 
 fn mode_change_for_entry(entry: &DiffSummaryEntry) -> Option<ModeChange> {
@@ -391,6 +415,7 @@ where
             hunks,
             binary: if fh.is_binary { Some(true) } else { None },
             mode: fh.mode,
+            symlink: if fh.is_symlink { Some(true) } else { None },
             truncated: if fh.truncated { Some(true) } else { None },
         };
 
@@ -488,7 +513,7 @@ fn list_target(options: &ListOptions) -> Result<DiffTarget> {
     ))
 }
 
-const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_executable\":" ++ if(self.source().executable(), "true", "false") ++ ",\"target_executable\":" ++ if(self.target().executable(), "true", "false") ++ "}\n""#;
+const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_executable\":" ++ if(self.source().executable(), "true", "false") ++ ",\"target_executable\":" ++ if(self.target().executable(), "true", "false") ++ ",\"source_file_type\":" ++ self.source().file_type().escape_json() ++ ",\"target_file_type\":" ++ self.target().file_type().escape_json() ++ "}\n""#;
 
 struct FilePaths {
     before: Option<String>,
@@ -703,6 +728,9 @@ pub(crate) struct FileHunks {
     pub(crate) hunks: Vec<Hunk>,
     pub(crate) rename: Option<RenameInfo>,
     pub(crate) is_binary: bool,
+    /// Either side is a symlink, so this entry can carry a change no hunk
+    /// expresses (see `involves_symlink`).
+    pub(crate) is_symlink: bool,
     pub(crate) mode: Option<ModeChange>,
     /// Whether either side of this file was cut short before diffing.
     pub(crate) truncated: bool,
@@ -787,6 +815,7 @@ pub(crate) fn load_file_hunks(
             hunks,
             rename: rename_info(entry),
             is_binary,
+            is_symlink: involves_symlink(entry),
             mode: mode_change_for_entry(entry),
             truncated: before_cut || after_cut,
         });
@@ -1262,6 +1291,7 @@ fn build_summary_output(files: Vec<FileEntry>, grouping: ListGrouping) -> ListSu
             hunk_count: file.hunks.len(),
             binary: file.binary,
             mode: file.mode,
+            symlink: file.symlink,
             truncated: file.truncated,
         })
         .collect();
@@ -1320,17 +1350,23 @@ impl FileEntry {
     /// Whether this file carries a change that no hunk can express, so an
     /// empty hunk list does not mean "nothing happened here".
     ///
-    /// Four shapes reach this: binary contents (never split hunk-wise), a
+    /// Five shapes reach this: binary contents (never split hunk-wise), a
     /// mode-only flip (jj's exec bit is not part of any hunk), a rename or copy
-    /// of a file whose text did not move (both sides diff identical), and an
-    /// empty file added or removed (nothing on either side to diff). All four
+    /// of a file whose text did not move (both sides diff identical), an
+    /// empty file added or removed (nothing on either side to diff), and a
+    /// symlink, whose target `jj file show` will not print -- so a link
+    /// retargeted from one path to another diffs empty against empty. All five
     /// have to stay visible in `list` and be named by `--spec-template`,
     /// because a file the template does not name takes `default: reset` --
     /// which for a rename restores the old path and deletes the new one, and
     /// for an added empty file deletes it outright.
+    ///
+    /// The `added | removed` arm already covered a link that appeared or
+    /// vanished, which is why only the retargeted one was ever invisible.
     fn changes_without_hunks(&self) -> bool {
         self.binary == Some(true)
             || self.mode.is_some()
+            || self.symlink == Some(true)
             || rename_source(&self.rename, &self.path).is_some()
             || matches!(self.status.as_str(), "added" | "removed")
     }
@@ -1756,6 +1792,9 @@ fn format_summary_text(lines: &mut Vec<String>, files: &[FileSummary]) {
         if file.binary == Some(true) {
             line.push_str(" [binary]");
         }
+        if file.symlink == Some(true) {
+            line.push_str(SYMLINK_MARKER);
+        }
         if file.truncated == Some(true) {
             line.push_str(" [truncated]");
         }
@@ -1774,6 +1813,9 @@ fn format_file_header(file: &FileEntry) -> String {
     if file.binary == Some(true) {
         header.push_str(" [binary]");
     }
+    if file.symlink == Some(true) {
+        header.push_str(SYMLINK_MARKER);
+    }
     if file.truncated == Some(true) {
         header.push_str(" [truncated]");
     }
@@ -1782,6 +1824,12 @@ fn format_file_header(file: &FileEntry) -> String {
     }
     header
 }
+
+/// A retargeted link shows up as a modified file with no hunks, which on its
+/// own reads as a bug in this tool. Every other hunkless change here announces
+/// itself -- `[binary]`, `[mode ...]`, `(src -> dst)` -- so this one does too,
+/// and says in the same breath that there is no half of it to pick.
+const SYMLINK_MARKER: &str = " [symlink, whole-file only]";
 
 /// A mode change cannot be selected, so say so where it is reported.
 fn format_mode_change(mode: &ModeChange) -> String {

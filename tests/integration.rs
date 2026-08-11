@@ -3989,6 +3989,327 @@ fn a_removed_empty_file_is_visible_and_survives_the_spec_template_workflow() {
 }
 
 // ---------------------------------------------------------------------------
+// The fifth hunkless shape: a symlink.
+//
+// `jj file show` refuses to print a link ("exists but is not a file"), so both
+// sides of a *retargeted* link read as the empty string and `get_hunks` yields
+// nothing. `changes_without_hunks` kept a link that was added or removed --
+// its `added | removed` arm covers those -- but a modified one matched none of
+// its arms and was dropped, so `list` never showed it and `--spec-template`
+// never named it. An unnamed file takes `default: reset`: `split` quietly left
+// the retarget behind at exit 0, and `diffedit`, which keeps no remainder,
+// undid it outright.
+//
+// A link's target is one atomic value, so there is no half of it to select.
+// It is carried the way a binary is: visible with zero hunks, and named by an
+// action rather than by ids nothing could resolve.
+// ---------------------------------------------------------------------------
+
+/// A working copy that points `link` at a different file without touching a
+/// byte of anything else it owns, alongside an ordinary edit so the diff is
+/// not made entirely of things this bug hid.
+#[cfg(unix)]
+fn retargeted_symlink_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("old-target.txt", "OLD\n");
+    repo.write_file("new-target.txt", "NEW\n");
+    repo.write_file("other.txt", "other-line-1\n");
+    std::os::unix::fs::symlink("old-target.txt", repo.path().join("link")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("new-target.txt", repo.path().join("link")).unwrap();
+    repo.write_file("other.txt", "other-line-1\nother-line-2\n");
+
+    // Guard against a vacuous test: if jj called this anything but a
+    // modification, the shape under test is not the one that was broken.
+    let summary = repo.changed_files("@");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with('M') && l.ends_with("link")),
+        "jj did not report the link as modified, the test would be vacuous: {summary:?}"
+    );
+    repo
+}
+
+/// The link a `SelectPath` names, as the path it points at. Panics if what is
+/// there is no longer a link at all, which is the failure worth naming loudly:
+/// `select` writes files, and a link rebuilt as a regular file holding its
+/// target's *bytes* is the shape that quietly corrupts a tree.
+#[cfg(unix)]
+fn link_target(repo: &TestRepo, name: &str) -> String {
+    let path = repo.path().join(name);
+    let meta = std::fs::symlink_metadata(&path)
+        .unwrap_or_else(|e| panic!("{name} is not there at all: {e}"));
+    assert!(
+        meta.file_type().is_symlink(),
+        "{name} is no longer a symlink -- it was rebuilt as a regular file"
+    );
+    std::fs::read_link(&path)
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_is_visible_in_list() {
+    let repo = retargeted_symlink_repo("symlink-retarget-list");
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("link"),
+        "a link pointed at a new target was invisible in `list`:\n{text}"
+    );
+    // Zero hunks with no explanation reads as a bug in this tool, so the
+    // listing has to say why there is nothing to pick.
+    assert!(
+        text.contains("[symlink"),
+        "`list` should say the entry is a link, not just show it with no hunks:\n{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_is_named_by_the_spec_template() {
+    let repo = retargeted_symlink_repo("symlink-retarget-template");
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("\"link\""),
+        "--spec-template emitted no entry for a retargeted link:\n{template}"
+    );
+    // An action, not ids: there are no ids for a link, and a template that
+    // invented some would be one `split` is bound to reject.
+    let entry = template
+        .split("\"link\"")
+        .nth(1)
+        .expect("the template names the link");
+    assert!(
+        entry.contains("action") && !entry.split('}').next().unwrap().contains("ids"),
+        "the link should be named by an action, not by hunk ids:\n{template}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_survives_the_spec_template_workflow() {
+    // The documented flow, and the one that lost the retarget: template out,
+    // feed it straight back in.
+    let repo = retargeted_symlink_repo("symlink-retarget-roundtrip");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    repo.hunk_ok(&["split", &template, "everything the template names"]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("120000") && committed.contains("+new-target.txt"),
+        "the retarget did not reach the commit as a link:\n{committed}"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template should have moved the whole diff: {:?}",
+        repo.changed_files("@")
+    );
+    assert_eq!(
+        link_target(&repo, "link"),
+        "new-target.txt",
+        "the working copy's link was not left pointing at the new target"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_is_not_discarded_by_diffedit() {
+    // The destructive shape. `diffedit` applies `default: reset` in place and
+    // keeps no remainder, so a link its own template failed to name was not
+    // merely left behind -- it was undone.
+    let repo = retargeted_symlink_repo("symlink-retarget-diffedit");
+    repo.jj_ok(&["commit", "-m", "retarget plus edit"]);
+
+    let template = repo.hunk_ok(&["list", "-r", "@-", "--spec-template"]);
+    repo.hunk_ok(&["diffedit", &template, "-r", "@-"]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed.iter().any(|l| l.ends_with("link")),
+        "diffedit discarded a retarget its own template did not name: {committed:?}"
+    );
+    assert_eq!(
+        link_target(&repo, "link"),
+        "new-target.txt",
+        "diffedit put the link back on its old target"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_a_retargeted_symlink_from_the_template_commits_the_new_target() {
+    // The selective case: the template now names the link, so a user can
+    // delete every other entry from it and commit the retarget on its own.
+    // Before the link reached the template there was no entry to keep, and the
+    // spec that came back kept nothing at all.
+    let repo = retargeted_symlink_repo("symlink-retarget-keep");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("\"link\""),
+        "the template must name the link for this test to mean anything:\n{template}"
+    );
+    repo.hunk_ok(&[
+        "split",
+        r#"{"files": {"link": {"action": "keep"}}, "default": "reset"}"#,
+        "just the retarget",
+    ]);
+
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("120000") && committed.contains("+new-target.txt"),
+        "the kept retarget did not land in the commit as a link:\n{committed}"
+    );
+    assert!(
+        !committed.contains("other.txt"),
+        "the unselected edit rode along:\n{committed}"
+    );
+    assert_eq!(
+        link_target(&repo, "link"),
+        "new-target.txt",
+        "keeping the link left something other than a link on the new target"
+    );
+}
+
+/// Resetting is the other half of the same decision, and it is the half that
+/// writes: `reset_file` has to rebuild the link from the left side rather than
+/// copy the bytes its old target happened to hold.
+///
+/// This one is a preservation guard, not a reproduction: `select` never
+/// consulted `list`, so a hand-written reset already behaved before the
+/// visibility fix. What is new is that a user can now *reach* this decision,
+/// by editing an entry the template finally emits.
+#[cfg(unix)]
+#[test]
+fn resetting_a_retargeted_symlink_restores_the_old_target() {
+    let repo = retargeted_symlink_repo("symlink-retarget-reset");
+    repo.jj_ok(&["commit", "-m", "retarget plus edit"]);
+
+    // `diffedit`, because it applies the reset in place: the old target has to
+    // really come back, not merely stay behind in a remainder commit.
+    repo.hunk_ok(&[
+        "diffedit",
+        r#"{"files": {"other.txt": {"action": "keep"}, "link": {"action": "reset"}}, "default": "reset"}"#,
+        "-r",
+        "@-",
+    ]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        !committed.iter().any(|l| l.ends_with("link")),
+        "the reset link stayed in the commit: {committed:?}"
+    );
+    assert!(
+        committed.iter().any(|l| l.contains("other.txt")),
+        "the kept edit was reset too: {committed:?}"
+    );
+    assert_eq!(
+        link_target(&repo, "link"),
+        "old-target.txt",
+        "reset did not put the link back on its old target"
+    );
+}
+
+/// The `added | removed` arm always covered these two, which is why only the
+/// retargeted link was ever invisible. A preservation guard: it could not fail
+/// before the fix, and exists so that widening `changes_without_hunks` cannot
+/// quietly change what already worked.
+#[cfg(unix)]
+#[test]
+fn added_and_removed_symlinks_still_survive_the_spec_template_workflow() {
+    let repo = TestRepo::new("symlink-added-removed");
+    repo.write_file("a.txt", "AAA\n");
+    repo.write_file("other.txt", "other-line-1\n");
+    std::os::unix::fs::symlink("a.txt", repo.path().join("gone")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("gone")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("fresh")).unwrap();
+    repo.write_file("other.txt", "other-line-1\nother-line-2\n");
+
+    let text = repo.hunk_ok(&["list", "--format", "text"]);
+    assert!(
+        text.contains("fresh") && text.contains("gone"),
+        "an added or removed link went missing from `list`:\n{text}"
+    );
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    assert!(
+        template.contains("\"fresh\"") && template.contains("\"gone\""),
+        "--spec-template dropped an added or removed link:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "everything the template names"]);
+    let committed = repo.changed_files("@-");
+    assert!(
+        committed
+            .iter()
+            .any(|l| l.starts_with('A') && l.ends_with("fresh")),
+        "the new link did not survive the round trip: {committed:?}"
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|l| l.starts_with('D') && l.ends_with("gone")),
+        "the deletion did not survive the round trip: {committed:?}"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template should have moved the whole diff: {:?}",
+        repo.changed_files("@")
+    );
+    assert_eq!(
+        link_target(&repo, "fresh"),
+        "a.txt",
+        "the added link was rebuilt as something other than a link"
+    );
+}
+
+/// A file that *becomes* a link, or a link that becomes a file, still carries
+/// the old side's text as a real hunk -- so it must stay hunk-selectable
+/// rather than collapse into a whole-file action. Naming the symlink-ness on
+/// the entry must not take that away.
+#[cfg(unix)]
+#[test]
+fn a_file_that_becomes_a_symlink_is_still_named_by_its_hunk_ids() {
+    let repo = TestRepo::new("symlink-becomes-ids");
+    repo.write_file("a.txt", "AAA\n");
+    repo.write_file("f.txt", "FFF\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("f.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", repo.path().join("f.txt")).unwrap();
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    let entry = template
+        .split("\"f.txt\"")
+        .nth(1)
+        .expect("the template names the file");
+    assert!(
+        entry.contains("ids"),
+        "a file that became a link lost the hunk it really has:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "f.txt becomes a link"]);
+    assert_eq!(
+        link_target(&repo, "f.txt"),
+        "a.txt",
+        "the change did not land as a link"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template should have moved the whole diff: {:?}",
+        repo.changed_files("@")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A spec keyed by a rename's OLD path.
 //
 // `validate_spec_resolves` indexed every entry of `all_paths()`, so the old

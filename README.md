@@ -395,6 +395,7 @@ covers the whole diff. They are all-or-nothing — address them with `action` (o
 $ jj-hunk list --format text
 M blob.bin [binary]
 A brand_new_empty.txt
+M config [symlink, whole-file only]
 R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
 M script.sh [mode 100644 -> 100755, not selectable]
 M text.txt
@@ -404,19 +405,27 @@ M text.txt
 ```
 
 `--spec-template` covers that whole diff: `text.txt` gets its `ids`, and each of the
-other four gets `action: keep` — plus `from: moved.txt` on the rename. (`list` sorts its
+other five gets `action: keep` — plus `from: moved.txt` on the rename. (`list` sorts its
 files by path; `--spec-template` does not order its keys, so do not diff two templates
 expecting a stable order.)
 
-Three details worth knowing:
+Four details worth knowing:
 
 - `{"ids": []}` — keep nothing from this file — works on binaries, on symlinks, and on
   files whose parent is not valid UTF-8. The parent is restored byte for byte.
 - A **mode change rides along with the file**: keep any of a file's hunks and its
   chmod comes too; reset the file and the chmod resets with it. It is never selectable
   on its own, hence `not selectable` in the listing above.
-- A **symlink** is written as a link, never through one. A retargeted symlink carries
-  no hunks at all, so `action`/`default` is the only way to select it.
+- A **symlink** is written as a link, never through one. `jj file show` prints nothing
+  for a link, so a link pointed at a new target diffs empty against empty and carries no
+  hunks at all — `list` marks it `[symlink, whole-file only]`, and `action`/`default` is
+  the only way to select it.
+- **A hunkset expression cannot name most of these.** `all()`, `file()` and `glob()`
+  match hunks, and a binary is the only hunkless shape given a stand-in hunk to be
+  matched by. A symlink, a rename, a mode-only flip and an empty add or remove are
+  reachable from a JSON spec but not from a hunkset, so a hunkset-driven verb leaves
+  them behind. Use `--spec-template`, which names every one of them, when a selection is
+  meant to cover the whole diff.
 
 ### Renamed files: the `from` field
 
