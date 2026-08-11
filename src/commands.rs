@@ -7,7 +7,7 @@ use crate::spec::{Action, DefaultAction, FileSpec, HunkSelector, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -251,7 +251,7 @@ struct FileSummary {
 
 #[derive(Debug, Serialize)]
 struct SpecTemplateOutput {
-    files: HashMap<String, SpecTemplateEntry>,
+    files: BTreeMap<String, SpecTemplateEntry>,
     default: String,
 }
 
@@ -1339,7 +1339,7 @@ fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
         );
     }
 
-    let mut output = HashMap::new();
+    let mut output = BTreeMap::new();
 
     for file in files {
         let from = rename_source(&file.rename, &file.path);

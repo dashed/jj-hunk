@@ -1,6 +1,6 @@
 use crate::diff::Hunk;
 use crate::spec::{DefaultAction, FileSpec, HunkSpec, Spec};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ast::{Arg, Expr, PatternKind, StringPattern};
 use super::error::HunksetError;
@@ -702,7 +702,7 @@ pub fn to_spec(
             .push(h.hunk.id.clone());
     }
 
-    let spec_files: HashMap<String, FileSpec> = files
+    let spec_files: BTreeMap<String, FileSpec> = files
         .into_iter()
         .map(|(path, ids)| {
             let hunk_spec = HunkSpec {

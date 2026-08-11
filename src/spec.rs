@@ -1,12 +1,12 @@
 use crate::diff::{normalize_hunk_id, HunkSelection};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Spec {
     #[serde(default)]
-    pub files: HashMap<String, FileSpec>,
+    pub files: BTreeMap<String, FileSpec>,
     #[serde(default)]
     pub default: DefaultAction,
 }

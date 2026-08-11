@@ -5661,3 +5661,53 @@ fn a_very_long_operator_chain_does_not_crash() {
         );
     }
 }
+
+/// `--spec-template` serialises its file map, and a `HashMap` there let the key
+/// order change on every run -- 10 distinct orders in 10 runs on an unchanged
+/// working copy. That made two templates of the same state compare unequal, so
+/// a checked-in template produced a spurious diff and `diff`ing two templates
+/// said nothing. The order must be stable, and it must agree with `list`, which
+/// has always been path-sorted.
+///
+/// The assertion reads the *raw text*, not a parsed object: `serde_json::Map`
+/// is a `BTreeMap` by default, so parsing sorts the keys and would pass no
+/// matter what order the binary actually wrote.
+#[test]
+fn spec_template_file_order_is_deterministic_and_sorted() {
+    const NAMES: &[&str] = &[
+        "zeta.txt",
+        "alpha.txt",
+        "mike.txt",
+        "bravo.txt",
+        "yank.txt",
+        "delta.txt",
+        "charlie.txt",
+        "oscar.txt",
+    ];
+    let repo = metachar_repo("spec-template-order", NAMES);
+
+    let textual_order = |template: &str| -> Vec<String> {
+        let mut found: Vec<(usize, String)> = NAMES
+            .iter()
+            .map(|n| {
+                let at = template
+                    .find(&format!("\"{n}\""))
+                    .unwrap_or_else(|| panic!("{n} missing from template:\n{template}"));
+                (at, (*n).to_string())
+            })
+            .collect();
+        found.sort_by_key(|(at, _)| *at);
+        found.into_iter().map(|(_, n)| n).collect()
+    };
+
+    let first = textual_order(&repo.hunk_ok(&["list", "--spec-template"]));
+
+    let mut sorted = first.clone();
+    sorted.sort();
+    assert_eq!(first, sorted, "template file keys must be path-sorted");
+
+    for run in 1..8 {
+        let again = textual_order(&repo.hunk_ok(&["list", "--spec-template"]));
+        assert_eq!(first, again, "template key order changed on run {run}");
+    }
+}
