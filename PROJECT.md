@@ -179,6 +179,24 @@ ambiguity, identifier matching` is four — so any bug count would be a guess.
 Commit counts are what can be checked, so commit counts are what appear here.
 
 
+### Licensing
+
+MIT, and the `LICENSE` file names three copyright holders because the code has
+three origins. The commit record is what decided them, not guesswork:
+**Laurynas Keturakis and the laulauland/jj-hunk contributors** for the base (23
+of its 28 commits are his; Yann Hodique, Giovanni d'Amelio and Hauke Schnau
+account for the rest), **Yann Hodique** for the imports (all 13 of sigma's
+commits are his), and **Alberto Leal** for this fork (all 49 commits past the
+base).
+
+Worth knowing if you go looking: **no LICENSE file existed anywhere in this
+lineage** until this fork added one. `laulauland/jj-hunk` and `sigma/jj-hunk`
+both declare `license = "MIT"` in `Cargo.toml` and neither ships the text, and
+no source file carries a copyright header. MIT requires the notice travel with
+the code, so this repo was the first in the chain to satisfy that. The
+attribution above is a reading of the commit history, offered in good faith; it
+is not a legal opinion, and anyone with a claim to correct should correct it.
+
 ### Why the reference remotes stay
 
 `upstream`, `sigma` and `mvzink` are kept deliberately, as **read-only
@@ -799,6 +817,7 @@ and will discard work done in other workspaces since that operation.
 | `src/semantic.rs` | tree-sitter analyzer, 20 language configs |
 | `src/glob.rs` | Glob matching for path predicates |
 | `PROJECT.md` | This documentation |
+| `LICENSE` | MIT, with the three copyright holders the history shows |
 
 ## Version Scheme
 

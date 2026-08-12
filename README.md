@@ -1099,4 +1099,11 @@ jj-hunk commit '{"files": {"src/fix.rs": {"action": "keep"}}, "default": "reset"
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+Copyright is held jointly, because the code has three origins: Laurynas
+Keturakis and the [laulauland/jj-hunk](https://github.com/laulauland/jj-hunk)
+contributors for the base, Yann Hodique for the hunkset language and
+tree-sitter analysis imported from [sigma/jj-hunk](https://github.com/sigma/jj-hunk),
+and Alberto Leal for this fork. **Provenance** in [PROJECT.md](PROJECT.md)
+records which commits came from where.
