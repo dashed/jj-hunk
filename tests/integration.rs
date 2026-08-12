@@ -8430,3 +8430,530 @@ fn a_mask_applies_inside_groups_without_unlabelling_them() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// --dry-run
+//
+// `list --spec` already answers "which hunks does my selector match?". What it
+// cannot answer is "and then what?", and the five rewriting verbs disagree
+// about that in the way that costs a revision: `diffedit` keeps what you name
+// and `restore` undoes it, over the very same set of hunks. So these tests are
+// about the *outcome* fields, not about the hunk list.
+// ---------------------------------------------------------------------------
+
+/// A working copy with two files, each carrying hunks, so every verb has both
+/// something to select and something to leave behind.
+fn dry_run_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("f.txt", "L1\nL2\nL3\nL4\nL5\nL6\nL7\n");
+    repo.write_file("g.txt", "g1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("f.txt", "X1\nL2\nL3\nL4\nL5\nL6\nX7\n");
+    repo.write_file("g.txt", "G1\n");
+    repo
+}
+
+/// Every dry run this fixture supports, as complete argument vectors.
+fn every_dry_run() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["split", "--dry-run", r#"file("f.txt")"#, "msg"],
+        vec!["commit", "--dry-run", r#"file("f.txt")"#, "msg"],
+        vec!["squash", "--dry-run", r#"file("f.txt")"#],
+        vec!["diffedit", "--dry-run", r#"file("f.txt")"#],
+        vec!["restore", "--dry-run", r#"file("f.txt")"#],
+    ]
+}
+
+/// Everything about the repository a run could disturb: the operation log, the
+/// commit graph, and the bytes on disk.
+///
+/// Reading the operation log is itself what settles the working copy -- `jj op
+/// log` snapshots it, which is observable: on a dirty tree the head moves
+/// between the first call and the second. That is what makes the comparison
+/// below meaningful rather than vacuous. By the time a dry run starts there is
+/// nothing left to snapshot, so an operation appearing afterwards is one the
+/// dry run itself created.
+fn repo_state(repo: &TestRepo) -> (String, String, Vec<(String, String)>) {
+    let ops = repo.jj_ok(&[
+        "op",
+        "log",
+        "--no-graph",
+        "-T",
+        r#"id.short() ++ " " ++ description ++ "\n""#,
+    ]);
+    let graph = repo.jj_ok(&[
+        "log",
+        "--no-graph",
+        "-r",
+        "all()",
+        "-T",
+        r#"change_id ++ " " ++ commit_id ++ " " ++ description.first_line() ++ "\n""#,
+    ]);
+    (ops, graph, working_copy_files(repo))
+}
+
+/// Every file on disk, `.jj` and `.git` aside, as (path, contents).
+fn working_copy_files(repo: &TestRepo) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let root = repo.path();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if name == ".jj" || name == ".git" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                let rel = path.strip_prefix(root).unwrap().display().to_string();
+                out.push((rel, text));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **The whole promise of the flag.** Five dry runs must leave the operation
+/// log, the commit graph and the working copy byte-identical.
+///
+/// The operation log is checked rather than the diff because jj records more
+/// than commits there: a working-copy snapshot is an operation, and a check
+/// that only compared `jj diff` would pass straight through one. The second
+/// half runs a verb for real and asserts the log *does* move, so that a broken
+/// reader -- one returning the same text whatever happened -- could not make
+/// the first half pass by accident.
+#[test]
+fn dry_run_leaves_the_repository_and_the_operation_log_untouched() {
+    let repo = dry_run_repo("dry-run-no-side-effects");
+    let before = repo_state(&repo);
+
+    for args in every_dry_run() {
+        let out = repo.hunk_ok(&args);
+        let plan = parse(&out);
+        assert_eq!(plan["dry_run"], serde_json::json!(true), "{args:?}: {out}");
+        assert_eq!(plan["changed"], serde_json::json!(false), "{args:?}: {out}");
+    }
+
+    let after = repo_state(&repo);
+    assert_eq!(before.0, after.0, "a dry run wrote to the operation log");
+    assert_eq!(before.1, after.1, "a dry run rewrote a commit");
+    assert_eq!(before.2, after.2, "a dry run touched the working copy");
+
+    // Teeth: the same comparison over a real run must fail to match, or the
+    // three assertions above prove nothing about dry runs specifically.
+    repo.hunk_ok(&["commit", r#"file("f.txt")"#, "for real"]);
+    let real = repo_state(&repo);
+    assert_ne!(
+        after.0, real.0,
+        "a real run must move the operation log, or the check above has no teeth"
+    );
+}
+
+/// **The reason a dry run has to describe the outcome and not the selection.**
+///
+/// `diffedit` and `restore` are handed the same selector over the same diff and
+/// match the same hunks. Everything a caller needs to tell them apart is in the
+/// outcome: `diffedit` keeps what is named and discards the rest, `restore`
+/// undoes what is named and leaves the rest. A preview that only listed hunks
+/// would be identical for both.
+#[test]
+fn diffedit_and_restore_dry_runs_read_as_opposites() {
+    let repo = dry_run_repo("dry-run-opposites");
+
+    let edit = parse(&repo.hunk_ok(&["diffedit", "--dry-run", r#"file("f.txt")"#]));
+    let undo = parse(&repo.hunk_ok(&["restore", "--dry-run", r#"file("f.txt")"#]));
+
+    assert_eq!(edit["selected"]["effect"], "keep", "{edit}");
+    assert_eq!(edit["unselected"]["effect"], "discard", "{edit}");
+    assert_eq!(undo["selected"]["effect"], "undo", "{undo}");
+    assert_eq!(undo["unselected"]["effect"], "keep", "{undo}");
+
+    // The half that loses content is the other one in each case, and it names
+    // the revision whose content takes over.
+    assert_eq!(edit["selected"]["loses_content"], serde_json::json!(false));
+    assert_eq!(edit["unselected"]["loses_content"], serde_json::json!(true));
+    assert_eq!(undo["selected"]["loses_content"], serde_json::json!(true));
+    assert_eq!(undo["unselected"]["loses_content"], serde_json::json!(false));
+
+    assert!(
+        edit["unselected"]["replaced_by"]["commit_id"].is_string(),
+        "a discarding half must say what replaces the content: {edit}"
+    );
+    assert!(
+        undo["selected"]["replaced_by"]["commit_id"].is_string(),
+        "an undoing half must say where the content comes back from: {undo}"
+    );
+    assert!(
+        edit["selected"]["replaced_by"].is_null() && undo["unselected"]["replaced_by"].is_null(),
+        "a half that keeps its content must not claim a replacement"
+    );
+}
+
+/// The two verbs whose selected hunks go to the same kind of place differ in
+/// where the *remainder* goes, and that is the only thing separating their
+/// previews. Reporting both remainders as "a new commit" would make `commit`
+/// read like `split`.
+#[test]
+fn split_and_commit_dry_runs_differ_in_where_the_remainder_lands() {
+    let repo = dry_run_repo("dry-run-split-vs-commit");
+
+    let split = parse(&repo.hunk_ok(&["split", "--dry-run", r#"file("f.txt")"#, "msg"]));
+    let commit = parse(&repo.hunk_ok(&["commit", "--dry-run", r#"file("f.txt")"#, "msg"]));
+
+    assert_eq!(split["selected"]["lands_in"]["kind"], "new-commit");
+    assert_eq!(commit["selected"]["lands_in"]["kind"], "new-commit");
+    assert_eq!(split["selected"]["lands_in"]["message"], "msg", "{split}");
+
+    assert_eq!(
+        split["unselected"]["lands_in"]["kind"], "new-commit",
+        "split's remainder becomes jj's second commit: {split}"
+    );
+    assert_eq!(
+        commit["unselected"]["lands_in"]["kind"], "working-copy",
+        "commit's remainder stays in the working copy: {commit}"
+    );
+}
+
+/// `squash` is the one verb whose selection lands in a revision that already
+/// exists, so it is the one that can name it. Naming the source instead would
+/// read as "nothing moves".
+#[test]
+fn squash_dry_run_names_the_parent_it_would_move_into() {
+    let repo = dry_run_repo("dry-run-squash-parent");
+    let plan = parse(&repo.hunk_ok(&["squash", "--dry-run", r#"file("f.txt")"#]));
+
+    assert_eq!(plan["selected"]["effect"], "move");
+    assert_eq!(plan["selected"]["lands_in"]["kind"], "revision");
+
+    let parent = repo.jj_ok(&["log", "--no-graph", "-r", "@-", "-T", "commit_id"]);
+    let source = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    assert_eq!(plan["selected"]["lands_in"]["commit_id"], parent, "{plan}");
+    assert_eq!(plan["unselected"]["lands_in"]["commit_id"], source, "{plan}");
+    assert_eq!(plan["revision"]["commit_id"], source, "{plan}");
+}
+
+/// **The reversal, checked against a real repository.**
+///
+/// `diffedit` and `restore` are handed target diffs that point opposite ways,
+/// and both of them nonetheless rewrite `@` and take their replacement content
+/// from `@-`. Building the plan off the wrong end of `restore`'s reversed
+/// target would name `@-` as the revision being rewritten -- the single most
+/// misleading thing this output could say, and one the effect fields alone do
+/// not catch: swapping the two ends leaves every `effect` exactly as it was.
+#[test]
+fn diffedit_and_restore_dry_runs_rewrite_the_same_revision() {
+    let repo = dry_run_repo("dry-run-reversal");
+    let here = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let parent = repo.jj_ok(&["log", "--no-graph", "-r", "@-", "-T", "commit_id"]);
+
+    let edit = parse(&repo.hunk_ok(&["diffedit", "--dry-run", r#"file("f.txt")"#]));
+    let undo = parse(&repo.hunk_ok(&["restore", "--dry-run", r#"file("f.txt")"#]));
+
+    for (verb, plan) in [("diffedit", &edit), ("restore", &undo)] {
+        assert_eq!(
+            plan["revision"]["commit_id"], here,
+            "{verb} rewrites @: {plan}"
+        );
+        assert_eq!(
+            plan["selected"]["lands_in"]["commit_id"], here,
+            "{verb}'s selected half is realised in @: {plan}"
+        );
+        assert_eq!(
+            plan["unselected"]["lands_in"]["commit_id"], here,
+            "{verb}'s unselected half is realised in @ too: {plan}"
+        );
+    }
+
+    // Only the half that loses content names a replacement, and for both verbs
+    // that replacement is the parent -- reached from opposite ends of the two
+    // target diffs.
+    assert_eq!(
+        edit["unselected"]["replaced_by"]["commit_id"], parent,
+        "{edit}"
+    );
+    assert_eq!(undo["selected"]["replaced_by"]["commit_id"], parent, "{undo}");
+}
+
+/// `restore` reads a reversed diff, so an id copied from `jj-hunk list -r REV`
+/// names nothing in it. The plan states the listing its own ids came from,
+/// which is what a caller needs in order to widen or narrow the selection
+/// after reading the preview.
+#[test]
+fn restore_dry_run_points_at_the_listing_its_ids_came_from() {
+    let repo = dry_run_repo("dry-run-restore-listing");
+    let plan = parse(&repo.hunk_ok(&["restore", "--dry-run", r#"file("f.txt")"#]));
+
+    let listing = plan["listing"].as_str().expect("a listing command");
+    assert!(
+        listing.contains("--from") && listing.contains("--to"),
+        "restore's listing is a two-revision diff: {listing}"
+    );
+    assert!(
+        plan["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("reversed diff")),
+        "{plan}"
+    );
+
+    // And the ids really are the reversed ones: they must not appear in the
+    // forward listing, which is the mistake the note warns about.
+    let forward: Vec<String> = listed_ids(&repo, &[])
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect();
+    let previewed: Vec<String> = plan["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .flat_map(|f| f["selected_hunks"].as_array().unwrap())
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect();
+    assert!(!previewed.is_empty(), "{plan}");
+    for id in &previewed {
+        assert!(
+            !forward.contains(id),
+            "{id} is a forward-listing id, so the plan was built from the wrong diff"
+        );
+    }
+}
+
+/// The plan has to say which hunk goes which way, not just how many. The ids
+/// are the full ones `list --format json` prints, so a caller can compare them
+/// for equality rather than guessing at a prefix.
+#[test]
+fn a_dry_run_partitions_the_diff_by_full_hunk_id() {
+    let repo = dry_run_repo("dry-run-partition");
+    let listed = listed_ids(&repo, &[]);
+    let first_id = listed
+        .iter()
+        .find(|(path, _, _)| path == "f.txt")
+        .map(|(_, id, _)| id.clone())
+        .expect("f.txt has hunks");
+
+    let spec = format!(r#"{{"files": {{"f.txt": {{"ids": ["{first_id}"]}}}}}}"#);
+    let plan = parse(&repo.hunk_ok(&["split", "--dry-run", &spec, "msg"]));
+
+    let f = plan["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|f| f["path"] == "f.txt")
+        .unwrap_or_else(|| panic!("{plan}"));
+
+    assert_eq!(
+        f["selected_hunks"].as_array().unwrap(),
+        &vec![serde_json::json!(first_id)],
+        "{plan}"
+    );
+    assert!(
+        !f["unselected_hunks"].as_array().unwrap().is_empty(),
+        "the other hunk of f.txt has to appear on the other side: {plan}"
+    );
+
+    // Every listed id appears in exactly one of the two halves, and nothing
+    // else does.
+    let mut all: Vec<String> = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| {
+            f["selected_hunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(f["unselected_hunks"].as_array().unwrap())
+        })
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect();
+    let mut listed: Vec<String> = listed.into_iter().map(|(_, id, _)| id).collect();
+    all.sort();
+    listed.sort();
+    assert_eq!(all, listed, "{plan}");
+}
+
+/// A change with no hunks at all -- a binary here -- is not a hunk, and must
+/// not be counted as one: a caller reading "3 hunks" and finding two ids in
+/// `files` would conclude the plan had dropped something.
+///
+/// The fixture also pins the *other* half of the same problem, which is the
+/// one that surprised this test into existence. A rename with an edit, and a
+/// file replaced by a symlink, both produce a hunk **and** carry a change no
+/// hunk expresses. They are therefore not `whole_file` entries -- there is a
+/// hunk id to name -- and the fact that the rename and the link target ride
+/// along with that hunk rather than being selectable apart from it is stated
+/// in `notes`, where it is the only place it can be.
+#[test]
+fn a_dry_run_counts_a_hunkless_change_apart_from_the_hunks() {
+    let repo = hunkless_repo("dry-run-hunkless");
+    let plan = parse(&repo.hunk_ok(&["commit", "--dry-run", "all()", "msg"]));
+
+    let hunkless: Vec<&serde_json::Value> = plan["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter(|f| !f["whole_file"].is_null())
+        .collect();
+    assert_eq!(
+        hunkless.len(),
+        1,
+        "only bin.dat produces no hunks at all: {plan}"
+    );
+    assert_eq!(hunkless[0]["path"], "bin.dat", "{plan}");
+    assert_eq!(hunkless[0]["whole_file"]["reason"], "binary", "{plan}");
+    assert!(
+        hunkless[0]["selected_hunks"].as_array().unwrap().is_empty()
+            && hunkless[0]["unselected_hunks"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+        "a change with no hunks must not be reported as having any: {plan}"
+    );
+
+    assert_eq!(
+        plan["selected"]["whole_file_changes"],
+        serde_json::json!(1),
+        "counted apart from `hunks`: {plan}"
+    );
+    assert_eq!(
+        plan["selected"]["hunks"],
+        serde_json::json!(2),
+        "the rename and the symlink each contribute one real hunk: {plan}"
+    );
+
+    let notes = plan["notes"].as_array().expect("notes");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("no hunks at all")),
+        "{plan}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("no hunk expresses")),
+        "the rename and the symlink have to be called out too: {plan}"
+    );
+}
+
+/// **A dry run that succeeds where the real run fails is worse than no dry
+/// run.** Every refusal has to arrive under the same code, so a caller can
+/// treat the preview as a decision it does not have to re-take.
+///
+/// Each case is run both ways and the two codes compared, so a code that is
+/// renamed later keeps this test passing and fails only the test that pins the
+/// name.
+#[test]
+fn a_dry_run_refuses_exactly_what_the_real_run_refuses() {
+    let repo = dry_run_repo("dry-run-refusals");
+    let listed = listed_ids(&repo, &[]);
+    let real_id = &listed[0].1;
+    let stale = format!("hunk-{}", "a".repeat(real_id.len() - "hunk-".len()));
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "PATH_NOT_IN_DIFF",
+            format!(r#"{{"files": {{"f.txt": {{"ids": ["{stale}"]}}}}}}"#),
+        ),
+        (
+            "PATH_OUTSIDE_WORKSPACE",
+            r#"{"files": {"../outside.txt": {"action": "keep"}}}"#.to_string(),
+        ),
+        ("EMPTY_SELECTION", r#"file("nope.txt")"#.to_string()),
+        ("PARSE_ERROR", "file(".to_string()),
+        ("UNKNOWN_FUNCTION", r#"nosuch("x")"#.to_string()),
+    ];
+
+    for (expected, spec) in &cases {
+        let real = error_json(&repo, &["commit", spec, "msg"]);
+        let dry = error_json(&repo, &["commit", "--dry-run", spec, "msg"]);
+        assert_eq!(real["code"], *expected, "the real run: {real}");
+        assert_eq!(
+            dry["code"], real["code"],
+            "--dry-run took a different path than the real run: {dry}"
+        );
+        assert_eq!(dry["error"], real["error"], "{dry}");
+    }
+
+    // A revset the real run cannot resolve must not become resolvable just
+    // because nothing is going to be written.
+    let dry = error_json(&repo, &["squash", "--dry-run", "all()", "-r", "nosuchrev"]);
+    assert_eq!(dry["code"], "REVSET_UNRESOLVED", "{dry}");
+}
+
+/// `--allow-empty` still means what it meant: an empty *result* is permitted.
+/// A preview of one has to say so, because "0 hunks are committed" is
+/// otherwise indistinguishable from a selector that silently matched nothing.
+#[test]
+fn a_dry_run_of_an_empty_selection_says_allow_empty_permitted_it() {
+    let repo = dry_run_repo("dry-run-allow-empty");
+    let plan = parse(&repo.hunk_ok(&[
+        "commit",
+        "--dry-run",
+        "--allow-empty",
+        r#"file("nope.txt")"#,
+        "msg",
+    ]));
+
+    assert_eq!(plan["selected"]["hunks"], serde_json::json!(0), "{plan}");
+    assert!(
+        plan["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("--allow-empty")),
+        "{plan}"
+    );
+}
+
+/// The output is one JSON object on stdout and nothing else. An agent that has
+/// to skip a banner line, or read stderr to find the plan, is back to parsing
+/// prose.
+#[test]
+fn a_dry_run_writes_one_json_object_to_stdout_and_nothing_to_stderr() {
+    let repo = dry_run_repo("dry-run-stdout");
+
+    for args in every_dry_run() {
+        let out = repo.hunk(&args);
+        assert!(out.status.success(), "{args:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote to stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let plan: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{args:?} did not emit one JSON object ({e}): {text}"));
+        assert_eq!(plan["command"], args[0], "{text}");
+        assert!(plan["summary"].is_string(), "{text}");
+    }
+}
+
+/// An agent choosing a verb has to know whether it can look before it leaps,
+/// and discovering the answer by running `--help` for each of eight verbs --
+/// or by having `--dry-run` rejected on a real revision -- is the discovery
+/// path `schema` exists to replace.
+#[test]
+fn the_schema_says_which_verbs_can_be_dry_run() {
+    let repo = TestRepo::new("dry-run-schema");
+    let schema = parse(&repo.hunk_ok(&["schema"]));
+
+    let mut previewable: Vec<&str> = schema["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .filter(|c| c["has_dry_run"] == serde_json::json!(true))
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    previewable.sort_unstable();
+
+    assert_eq!(
+        previewable,
+        vec!["absorb", "commit", "diffedit", "restore", "split", "squash"],
+        "every verb that writes must be previewable, and nothing else: {schema}"
+    );
+}

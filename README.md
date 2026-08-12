@@ -122,6 +122,8 @@ cat spec.json | jj-hunk commit - "bug fix"
 | `jj-hunk restore [-c rev] <spec>` | Undo the selected hunks |
 | `jj-hunk absorb [-r rev] [<spec>]` | Move hunks into the ancestors that last touched their lines |
 
+Every one of the six verbs that writes also takes [`--dry-run`](#--dry-run).
+
 ### What a named hunk means
 
 The mutating verbs do **not** agree about this, and it is the easiest thing in the
@@ -167,6 +169,142 @@ name are all reported either way. `--allow-empty` only says that a selection whi
 legitimately keeps nothing should produce an empty commit instead of failing. Without
 it, keeping nothing is an error — the main guard against a typo'd selector producing a
 silent no-op.
+
+### `--dry-run`
+
+`split`, `commit`, `squash`, `diffedit`, `restore` and `absorb` all accept `--dry-run`.
+It runs every check the real command runs, prints what would be true afterwards, and
+writes nothing.
+
+It is **not** a second way to see which hunks matched — `list --spec '<expr>'` already
+does that, and for the same expression it prints the same hunks for `diffedit` as for
+`restore`. What `--dry-run` adds is the *consequence*, which is where the verbs
+disagree: which hunks land where, which revision each side ends up as, and what would
+be lost.
+
+```jsonc
+{
+  "dry_run": true,
+  "command": "diffedit",
+  "changed": false,                 // always false; the machine-readable "nothing was changed"
+  "selector": "content(\"X1\")",    // what you asked for, verbatim
+  "listing": "jj-hunk list",        // the listing these hunk ids come from
+  "revision": { "revset": "@", "change_id": "…", "commit_id": "…" },  // what would be rewritten
+  "selected":   { /* the hunks the selector names */ },
+  "unselected": { /* everything else in the diff */ },
+  "files": [
+    { "path": "f.txt", "status": "modified",
+      "selected_hunks":   ["hunk-0714330…"],   // full ids, as list --format json prints them
+      "unselected_hunks": ["hunk-29e0a64…"] }
+  ],
+  "notes":   [ /* facts the counts cannot carry */ ],
+  "summary": "diffedit --dry-run: 1 hunk in 1 file is kept in @ (qpwqsonr); 1 hunk in 1 file is DISCARDED …"
+}
+```
+
+Each of `selected` and `unselected` is:
+
+```jsonc
+{
+  "hunks": 1,                 // hunks in this half
+  "whole_file_changes": 0,    // changes with no hunks at all, counted apart from them
+  "files": 1,                 // a file split down the middle counts in both halves
+  "effect": "discard",
+  "loses_content": true,      // the one field to read before turning a preview into a run
+  "lands_in":    { "kind": "revision", "revset": "@", "change_id": "…", "commit_id": "…" },
+  "replaced_by": { "revset": "@-", … },   // present exactly when loses_content is true
+  "describe": "1 hunk in 1 file is DISCARDED from @ (qpwqsonr), whose content there goes back to @- (vtsrvnns)"
+}
+```
+
+`effect` is one of five values, and `lands_in.kind` is one of three:
+
+| Verb | `selected.effect` | `selected.lands_in.kind` | `unselected.effect` | `unselected.lands_in.kind` |
+|------|-------------------|--------------------------|---------------------|----------------------------|
+| `split` | `commit` | `new-commit` | `keep` | `new-commit` |
+| `commit` | `commit` | `new-commit` | `keep` | `working-copy` |
+| `squash` | `move` | `revision` | `keep` | `revision` |
+| `diffedit` | `keep` | `revision` | `discard` | `revision` |
+| `restore` | `undo` | `revision` | `keep` | `revision` |
+
+`split` and `commit` share both effects because they do the same thing to the hunks;
+what separates them is where the remainder goes. All four columns together are unique
+per verb.
+
+#### `diffedit` against `restore`
+
+The pair the flag exists for. Same repository, same selector, same matched hunk — and
+opposite outcomes, readable without knowing either verb in advance:
+
+```console
+$ jj-hunk diffedit --dry-run 'content("X1")' | jq '{selected, unselected} | map_values({effect, loses_content})'
+{
+  "selected": {
+    "effect": "keep",
+    "loses_content": false
+  },
+  "unselected": {
+    "effect": "discard",
+    "loses_content": true
+  }
+}
+
+$ jj-hunk restore --dry-run 'content("X1")' | jq '{selected, unselected} | map_values({effect, loses_content})'
+{
+  "selected": {
+    "effect": "undo",
+    "loses_content": true
+  },
+  "unselected": {
+    "effect": "keep",
+    "loses_content": false
+  }
+}
+```
+
+`diffedit` keeps what you name and discards the rest; `restore` undoes what you name and
+leaves the rest. Both rewrite the same revision and both take their replacement content
+from the same one — reached from opposite ends of two target diffs that point opposite
+ways. `restore`'s `listing` and `revision` are spelled with resolved commit ids rather
+than `@`, because that is how `restore` pins its two sides before reading them.
+
+#### `notes`
+
+The role absorb's `note:` lines play, as a list of strings. They carry what the counts
+cannot:
+
+- how many changes produced **no hunks at all** (a binary, a pure rename, a mode-only
+  flip, a retargeted symlink, an empty add) — each of those is kept or reset as a whole
+  and no content-level selector can reach it. Each appears in `files` with a
+  `whole_file` object giving `selected` and a `reason`
+- how many files carry a change no hunk expresses **alongside** hunks — a rename with an
+  edit, an exec-bit flip. That part rides along with the file's hunks: it survives if any
+  hunk of that file survives, and cannot be selected apart from them
+- spec paths that this diff does not contain, so the run does less than the spec appears
+  to ask for
+- that `--allow-empty` is what permitted an empty selection
+
+#### What it does not catch
+
+`--dry-run` is the real code path with the final `jj` invocation removed, not a second
+implementation of it, so every refusal listed under [Errors](#errors) arrives with the
+same code, on the same input, at the same point. It does **not** run jj's own refusals:
+an immutable revision, a concurrent operation, a rebase that conflicts. Those are still
+discovered by running for real.
+
+It is also not free of *reads*. Previewing means looking at the working copy, and jj's
+only way to show a caller the working copy is to snapshot it — so on a dirty tree a dry
+run causes the same snapshot operation that `jj status`, `jj-hunk list`, or even `jj op
+log` causes. What it never adds is an operation of its own: on a settled repository the
+operation log, the commit graph and the files on disk come out byte-identical.
+
+#### `absorb --dry-run` is prose, not JSON
+
+`absorb` prints its routing plan whether or not `--dry-run` is passed — the flag only
+stops it acting on the plan — so that text is `absorb`'s ordinary output and changing it
+would be a breaking change. The five rewriting verbs print nothing on stdout without the
+flag, so theirs is JSON from the start. `jj-hunk schema` reports `has_dry_run` per verb;
+it does not report which shape comes out.
 
 ### List options
 
@@ -641,8 +779,8 @@ Error: spec does not resolve against the diff:
 
 A **hunkset** expression is different: `id()` resolves as it evaluates, so
 `list --spec 'id(hunk-deadbeef)'` *does* error. So `list --spec` validates a hunkset but not a JSON
-spec — to check a JSON spec before writing, run the verb with `--dry-run` where available, or accept
-that an empty listing is ambiguous between "matched nothing" and "names nothing real".
+spec — to check a JSON spec before writing, run the verb with [`--dry-run`](#--dry-run), which
+applies every one of these rules and changes nothing.
 
 ## Schema
 
@@ -683,7 +821,8 @@ evaluator by tests that run every predicate over a real hunk and a hunkless chan
     "predicates":       [ /* 20 entries */ ]
   },
   "errors":   [ { "code": "UNKNOWN_ID", "category": "selection" } ],
-  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true } ]
+  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true,
+                  "has_dry_run": true } ]
 }
 ```
 
@@ -722,10 +861,14 @@ that ignores unknown keys keeps working across additions.
 ### What it deliberately leaves out
 
 There is no per-flag command schema. `commands[]` is an index — name, one-line summary, whether the
-verb takes a hunkset, whether it has `--allow-empty` — and nothing more. Flags, arity and defaults
-are in `--help`, which clap generates from the same definitions and which therefore cannot drift
-either; restating them here would double the output to say what is already available. What `--help`
-does not answer in a single read is which verbs take a hunkset at all.
+verb takes a hunkset, whether it has `--allow-empty`, whether it has `--dry-run` — and nothing more.
+Flags, arity and defaults are in `--help`, which clap generates from the same definitions and which
+therefore cannot drift either; restating them here would double the output to say what is already
+available. What `--help` does not answer in a single read is which verbs take a hunkset at all, and
+which can be previewed before they write.
+
+`has_dry_run` says the flag exists, not what it prints: `absorb`'s plan is prose and the five
+rewriting verbs' is JSON. See [`--dry-run`](#--dry-run).
 
 ### Recipes
 
@@ -742,6 +885,10 @@ jj-hunk schema | jq -r '.hunkset.predicates[] | select(.available|not) | .name'
 
 # Every error code, for a retry table written before anything fails
 jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
+
+# Which verbs can be previewed before they write
+jj-hunk schema | jq -r '.commands[] | select(.has_dry_run) | .name'
+# split commit squash diffedit restore absorb
 ```
 
 ## Hunkset Query Language

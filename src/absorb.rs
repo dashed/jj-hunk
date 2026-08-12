@@ -946,7 +946,7 @@ fn squash_into(source: &CommitRef, target: &CommitRef, groups: &[HunkGroup]) -> 
         &target.change_id,
     ];
 
-    commands::run_jj_with_selection(&args, Some(&spec), None, Some(&source.change_id), false)
+    commands::run_jj_with_selection(&args, Some(&spec), None, Some(&source.change_id), false, None)
         .with_context(|| format!("failed to squash into {}", target.label()))
 }
 

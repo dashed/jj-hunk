@@ -411,6 +411,17 @@ struct CommandEntry {
     /// Whether it has `--allow-empty`, i.e. whether it can fail with
     /// `EMPTY_SELECTION`.
     has_allow_empty: bool,
+    /// Whether it has `--dry-run`, i.e. whether its outcome can be read before
+    /// it writes.
+    ///
+    /// Here for the same reason `has_allow_empty` is: an agent choosing a verb
+    /// wants "can I look before I leap?" answered in one read, not by running
+    /// `--help` eight times or by discovering the flag's absence as a usage
+    /// error on a real revision. The shape of what `--dry-run` prints differs
+    /// between `absorb` (prose, because it is what a real absorb prints too)
+    /// and the five rewriting verbs (JSON), which is documented rather than
+    /// published: this field answers whether the flag exists, not what it emits.
+    has_dry_run: bool,
 }
 
 /// A predicate's class, computed from the two facts that define it rather than
@@ -493,6 +504,7 @@ fn commands(cli: &clap::Command) -> Vec<CommandEntry> {
                 summary: sub.get_about().map(ToString::to_string),
                 accepts_selection: has("spec") || has("spec_file"),
                 has_allow_empty: has("allow_empty"),
+                has_dry_run: has("dry_run"),
             }
         })
         .collect()
@@ -1054,5 +1066,6 @@ mod tests {
         assert_eq!(commands[0]["name"], "list");
         assert_eq!(commands[0]["accepts_selection"], true);
         assert_eq!(commands[0]["has_allow_empty"], false);
+        assert_eq!(commands[0]["has_dry_run"], false);
     }
 }

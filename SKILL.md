@@ -90,6 +90,8 @@ other six rewrite history.
 | `absorb [<spec>]` | Route each hunk into the mutable ancestor that last touched its lines |
 | `select <left> <right>` | Called by `jj --tool=jj-hunk`; not for direct use |
 
+All six writing verbs take [`--dry-run`](#--dry-run-read-the-outcome-before-you-cause-it).
+
 ### The trap: the verbs disagree about what a named hunk MEANS
 
 Read this before writing a selector. The same expression means different things per verb:
@@ -105,6 +107,101 @@ Read this before writing a selector. The same expression means different things 
 `diffedit` and `restore` are near-inverses. Against the same diff, `diffedit 'id(X)'` throws away
 everything *except* X; `restore 'id(X)'` throws away *only* X. Confusing the two destroys the
 wrong half of the diff.
+
+### `--dry-run`: read the outcome before you cause it
+
+`split`, `commit`, `squash`, `diffedit`, `restore` and `absorb` take `--dry-run`. It runs every
+check the real command runs, prints what would be true afterwards, and writes nothing.
+
+**It is not `list --spec` again.** `list --spec '<expr>'` tells you which hunks matched, and for the
+same expression it prints the same hunks whether you are about to run `diffedit` or `restore`. What
+`--dry-run` prints is the *outcome*, which is the half of the trap above that `list` cannot show:
+
+```console
+$ jj-hunk diffedit --dry-run 'content("X1")' | jq '{selected, unselected} | map_values({effect, loses_content})'
+{
+  "selected": {
+    "effect": "keep",
+    "loses_content": false
+  },
+  "unselected": {
+    "effect": "discard",
+    "loses_content": true
+  }
+}
+
+$ jj-hunk restore --dry-run 'content("X1")' | jq '{selected, unselected} | map_values({effect, loses_content})'
+{
+  "selected": {
+    "effect": "undo",
+    "loses_content": true
+  },
+  "unselected": {
+    "effect": "keep",
+    "loses_content": false
+  }
+}
+```
+
+Same repository, same selector, same matched hunk, opposite answers. **Before running either verb,
+check that the half carrying `"loses_content": true` is the half you meant to lose.**
+
+The output is one pretty-printed JSON object on stdout — always JSON, there is no `--format` — and
+nothing on stderr. The fields:
+
+| Field | What it says |
+|-------|--------------|
+| `dry_run`, `changed` | `true` and `false`. Assert on them before trusting that nothing happened |
+| `selector` | what you asked for, verbatim |
+| `listing` | the `jj-hunk list` invocation these hunk ids come from. For `restore` this is the reversed diff |
+| `revision` | the revision this run would rewrite: `revset`, `change_id`, `commit_id` |
+| `selected`, `unselected` | the two halves, below |
+| `files[]` | `path`, `status`, optional `from`, and `selected_hunks` / `unselected_hunks` as **full** ids |
+| `notes[]` | facts the counts cannot carry — see below |
+| `summary` | one English line. Everything in it is also a field; nothing needs to parse it |
+
+A half:
+
+| Field | What it says |
+|-------|--------------|
+| `hunks`, `whole_file_changes`, `files` | counts. A change with no hunks is not a hunk, so it is counted apart. A file split down the middle is counted in both halves |
+| `effect` | `commit`, `keep`, `move`, `discard` or `undo` |
+| `loses_content` | true for `discard` and `undo`. **The field to read before acting** |
+| `lands_in` | `{"kind": "revision", …}`, `{"kind": "working-copy"}` or `{"kind": "new-commit", "label": …, "message": …}` |
+| `replaced_by` | the revision whose content takes over. Present exactly when `loses_content` is true |
+| `describe` | that half as one English clause |
+
+Per verb:
+
+| Verb | `selected.effect` / `lands_in.kind` | `unselected.effect` / `lands_in.kind` |
+|------|-------------------------------------|----------------------------------------|
+| `split` | `commit` / `new-commit` | `keep` / `new-commit` |
+| `commit` | `commit` / `new-commit` | `keep` / `working-copy` |
+| `squash` | `move` / `revision` | `keep` / `revision` |
+| `diffedit` | `keep` / `revision` | `discard` / `revision` |
+| `restore` | `undo` / `revision` | `keep` / `revision` |
+
+`split` and `commit` share both effects because they do the same thing to the hunks; the remainder's
+`lands_in.kind` is what separates them. All four columns together are unique per verb.
+
+Read `notes` too. It is where the hazards that no count expresses are stated: how many changes
+produced **no hunks at all** (each also carries a `whole_file` object in `files[]` with a `reason`),
+how many files carry a change no hunk expresses *alongside* hunks — a rename with an edit, an
+exec-bit flip, which rides along with that file's hunks and cannot be selected apart from them —
+which spec paths this diff does not contain, and whether `--allow-empty` is what permitted an empty
+selection.
+
+**What it does not catch.** `--dry-run` is the real code path with the final `jj` invocation
+removed, so every refusal in [Errors](#errors) arrives with the same code on the same input. It does
+not run jj's own refusals: an immutable revision, a concurrent operation, a rebase that conflicts.
+Nor is it free of *reads* — previewing means looking at the working copy, and jj's only way to show
+you the working copy is to snapshot it, so on a dirty tree a dry run causes the same snapshot
+operation `jj status` or `jj-hunk list` causes. What it never adds is an operation of its own.
+
+**`absorb --dry-run` prints prose, not JSON.** `absorb` prints its routing plan either way — the
+flag only stops it acting on the plan — so that text is absorb's ordinary output. The five rewriting
+verbs print nothing on stdout without the flag, so theirs is JSON. `jj-hunk schema` reports
+`has_dry_run` per verb; it does not report which shape comes out.
 
 ### `restore` reads its ids from a REVERSED listing
 
@@ -198,6 +295,8 @@ something about *this* binary rather than about jj-hunk in general. Three questi
    is running a tree-sitter predicate and reading the failure.
 3. **What can fail, and how do I branch on it?** `errors[]` is the complete code list, so retry
    logic can be written before anything has failed.
+4. **Can I look before I leap?** `commands[].has_dry_run`. The alternative is running `--help` for
+   each of eight verbs, or having the flag rejected on a real revision.
 
 ### Shape
 
@@ -214,7 +313,8 @@ something about *this* binary rather than about jj-hunk in general. Three questi
     "predicates":       [ /* 20 entries, see below */ ]
   },
   "errors":   [ { "code": "UNKNOWN_ID", "category": "selection" } ],
-  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true } ]
+  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true,
+                  "has_dry_run": true } ]
 }
 ```
 
@@ -919,6 +1019,17 @@ jj-hunk split 'glob("src/api/**")' "feat: add API endpoints"
 jj-hunk split 'added("TODO") | added("FIXME")' "chore: add TODOs"
 ```
 
+Add `--dry-run` to any of those to read the outcome first. It changes nothing and fails on exactly
+what the real run fails on, so a plan that comes back clean is a decision you do not have to take
+twice. For `diffedit` and `restore` this is not optional care — it is the only way to check you are
+holding the verb you think you are:
+
+```bash
+jj-hunk diffedit --dry-run 'glob("src/api/**")' | jq '.summary, .unselected.loses_content'
+```
+
+See [`--dry-run`](#--dry-run-read-the-outcome-before-you-cause-it).
+
 A selection that matches nothing is a hard error, from every mutating verb:
 
 ```
@@ -1106,5 +1217,6 @@ main
 - **`"default": "reset"` is safer**: Explicitly include what you want rather than excluding what you don't.
 - **Watch the matching mode**: `function("x")` is exact. If a query unexpectedly returns nothing, try `substring:"x"` before assuming the hunk isn't there.
 - **Check which verb you are holding**: `diffedit` keeps what you name, `restore` undoes what you name. Re-read [the trap](#the-trap-the-verbs-disagree-about-what-a-named-hunk-means) before either.
+- **`--dry-run` before anything that writes**, and read `selected.loses_content` / `unselected.loses_content` rather than the exit code. `list --spec` cannot tell `diffedit` from `restore`; this can. See [`--dry-run`](#--dry-run-read-the-outcome-before-you-cause-it).
 - **`--dry-run` before every `absorb`**, and read the summary line rather than the exit code — a refused rename exits 0.
 - **Do not trust exit 0 to mean "everything moved"**: a `content()`-only selector leaves every hunkless change behind — binaries, symlinks, renames, mode flips, empty adds — silently. Run `list` again afterwards to see what is left.

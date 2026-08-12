@@ -3,6 +3,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 
 mod absorb;
 mod diff;
+mod dry_run;
 #[cfg(feature = "semantic")]
 mod semantic;
 mod errors;
@@ -93,6 +94,9 @@ enum Commands {
         /// Allow a selection that keeps nothing (creates an empty commit)
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+        /// Print what would happen, as JSON, and change nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Commit selected hunks
@@ -107,6 +111,9 @@ enum Commands {
         /// Allow a selection that keeps nothing (creates an empty commit)
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+        /// Print what would happen, as JSON, and change nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Squash selected hunks into parent
@@ -122,6 +129,9 @@ enum Commands {
         /// Allow a selection that keeps nothing (creates an empty commit)
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+        /// Print what would happen, as JSON, and change nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Edit a revision's diff, keeping only the selected hunks
@@ -144,6 +154,9 @@ enum Commands {
         /// Allow a selection that keeps nothing (discards the whole diff)
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+        /// Print what would happen, as JSON, and change nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Undo the selected hunks, restoring their content from another revision
@@ -166,6 +179,9 @@ enum Commands {
         /// Allow a selection that undoes nothing
         #[arg(long = "allow-empty")]
         allow_empty: bool,
+        /// Print what would happen, as JSON, and change nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Move hunks into the mutable ancestors that last touched their lines
@@ -304,22 +320,43 @@ fn run(cli: Cli) -> Result<()> {
             spec_file,
             rev,
             allow_empty,
+            dry_run,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "split")?;
-            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref(), allow_empty)
+            commands::split(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                &message,
+                rev.as_deref(),
+                allow_empty,
+                dry_run,
+            )
         }
         Commands::Commit {
             spec,
             message,
             spec_file,
             allow_empty,
+            dry_run,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "commit")?;
-            commands::commit(spec.as_deref(), spec_file.as_deref(), &message, allow_empty)
+            commands::commit(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                &message,
+                allow_empty,
+                dry_run,
+            )
         }
-        Commands::Squash { spec, spec_file, rev, allow_empty } => {
+        Commands::Squash { spec, spec_file, rev, allow_empty, dry_run } => {
             let spec = normalize_spec_only(spec, &spec_file, "squash")?;
-            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref(), allow_empty)
+            commands::squash(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                rev.as_deref(),
+                allow_empty,
+                dry_run,
+            )
         }
         Commands::Diffedit {
             spec,
@@ -328,6 +365,7 @@ fn run(cli: Cli) -> Result<()> {
             from,
             to,
             allow_empty,
+            dry_run,
         } => {
             let spec = normalize_spec_only(spec, &spec_file, "diffedit")?;
             commands::diffedit(
@@ -337,6 +375,7 @@ fn run(cli: Cli) -> Result<()> {
                 from.as_deref(),
                 to.as_deref(),
                 allow_empty,
+                dry_run,
             )
         }
         Commands::Restore {
@@ -346,6 +385,7 @@ fn run(cli: Cli) -> Result<()> {
             from,
             into,
             allow_empty,
+            dry_run,
         } => {
             let spec = normalize_spec_only(spec, &spec_file, "restore")?;
             commands::restore(
@@ -355,6 +395,7 @@ fn run(cli: Cli) -> Result<()> {
                 from.as_deref(),
                 into.as_deref(),
                 allow_empty,
+                dry_run,
             )
         }
         Commands::Absorb {

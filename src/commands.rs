@@ -1,4 +1,5 @@
 use crate::diff::{self, apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::dry_run;
 use crate::errors::{self, CodedError};
 use crate::fields::FieldMask;
 use serde_json::{Map, Value};
@@ -878,7 +879,7 @@ impl FileHunks {
     /// loader's own type is the only way the two cannot answer differently,
     /// and them disagreeing is exactly how a shape goes missing from one verb
     /// while looking fine in another.
-    fn changes_without_hunks(&self) -> bool {
+    pub(crate) fn changes_without_hunks(&self) -> bool {
         self.is_binary
             || self.mode.is_some()
             || self.is_symlink
@@ -3145,8 +3146,16 @@ pub(crate) fn run_jj_with_selection(
     spec_file: Option<&str>,
     rev: Option<&str>,
     allow_empty: bool,
+    dry_run: Option<dry_run::Verb<'_>>,
 ) -> Result<()> {
-    run_jj_with_selection_on(args, spec, spec_file, &DiffTarget::rev(rev), allow_empty)
+    run_jj_with_selection_on(
+        args,
+        spec,
+        spec_file,
+        &DiffTarget::rev(rev),
+        allow_empty,
+        dry_run,
+    )
 }
 
 /// As `run_jj_with_selection`, but for a command whose diff editor is shown
@@ -3155,12 +3164,21 @@ pub(crate) fn run_jj_with_selection(
 /// `target` must be the view jj will hand to `select`, because that is the text
 /// the spec's hunk ids are hashes of. Naming the wrong one does not misfire
 /// loudly; it just matches nothing.
+///
+/// `dry_run` is the verb to describe instead of running. It is honoured at the
+/// very end, after every check below has passed, and it is a *return* from this
+/// one function rather than a second code path: that is what makes a dry run
+/// fail with the same code, on the same input, at the same point as the real
+/// run. Anything that short-circuited earlier -- resolving a revision up front
+/// to build a plan, say -- would let a dry run report a revset problem where
+/// the real run reports a parse error.
 fn run_jj_with_selection_on(
     args: &[&str],
     spec: Option<&str>,
     spec_file: Option<&str>,
     target: &DiffTarget,
     allow_empty: bool,
+    dry_run: Option<dry_run::Verb<'_>>,
 ) -> Result<()> {
     let raw_spec = resolve_spec_input(spec, spec_file)?;
     let is_hunkset = hunkset::is_hunkset(&raw_spec);
@@ -3171,6 +3189,12 @@ fn run_jj_with_selection_on(
     } else {
         raw_spec.clone()
     };
+
+    // Kept past the block below so `--dry-run` can describe what `select` would
+    // have been handed. `None` means the input parsed as neither JSON nor YAML,
+    // which the real run discovers one process later, inside `select`.
+    let mut parsed_spec: Option<Spec> = None;
+    let mut loaded_hunks: Option<Vec<FileHunks>> = None;
 
     if let Ok(mut parsed) = Spec::from_str(&spec_content) {
         // First, and before `adopt_spec_frame` rewrites anything, so the
@@ -3203,29 +3227,58 @@ fn run_jj_with_selection_on(
         // A hunkset spec is built from the diff it was evaluated against, so
         // its paths and ids resolve by construction and it already carries
         // every rename source. A hand-written one needs both passes.
-        if !is_hunkset {
+        //
+        // A dry run needs the diff either way -- it reports which hunk lands
+        // where. For a hand-written spec that is the load the validation pass
+        // below already does; for a hunkset it is a second read of the same
+        // diff, `evaluate_hunkset` having consumed its own. Both are reads.
+        //
+        // The position is what matters and it is unchanged: still after the two
+        // checks above, so a spec that is both mis-framed and pointed at a
+        // merge commit reports the same one of the two it always did.
+        if !is_hunkset || dry_run.is_some() {
             // `Mark`, not `Skip`: a binary file has no hunks but is still a
             // legitimate spec target via `{"action": "keep"}`.
             let file_hunks = load_file_hunks(target, BinaryMode::Mark, Truncation::NONE)?;
-            // Before validating, not after: a spec generated one directory up
-            // is not wrong, it is written in another frame, and reporting every
-            // one of its paths as absent would be the wrong complaint.
-            let frame = PathFrame::discover();
-            let mut rewritten = adopt_spec_frame(&mut parsed, &frame_pairs(&file_hunks, &frame));
-            // Not gated on `allow_empty`. That flag says an empty *result* is
-            // acceptable; it never meant "do not check whether what I wrote
-            // refers to anything". Gating this too meant that passing it once
-            // -- because one entry was legitimately blanked out -- switched off
-            // typo detection for every other entry in the same spec, and a
-            // mistyped path or stale id then produced an empty commit at exit
-            // 0, which is precisely what this check exists to make loud.
-            validate_spec_resolves(&parsed, &file_hunks, target)?;
-            rewritten |= fill_rename_sources(&mut parsed, &file_hunks);
-            if rewritten {
-                spec_content = serde_json::to_string(&parsed)
-                    .context("failed to re-serialize spec for the tool")?;
+            if !is_hunkset {
+                // Before validating, not after: a spec generated one directory
+                // up is not wrong, it is written in another frame, and
+                // reporting every one of its paths as absent would be the wrong
+                // complaint.
+                let frame = PathFrame::discover();
+                let mut rewritten =
+                    adopt_spec_frame(&mut parsed, &frame_pairs(&file_hunks, &frame));
+                // Not gated on `allow_empty`. That flag says an empty *result*
+                // is acceptable; it never meant "do not check whether what I
+                // wrote refers to anything". Gating this too meant that passing
+                // it once -- because one entry was legitimately blanked out --
+                // switched off typo detection for every other entry in the same
+                // spec, and a mistyped path or stale id then produced an empty
+                // commit at exit 0, which is precisely what this check exists to
+                // make loud.
+                validate_spec_resolves(&parsed, &file_hunks, target)?;
+                rewritten |= fill_rename_sources(&mut parsed, &file_hunks);
+                if rewritten {
+                    spec_content = serde_json::to_string(&parsed)
+                        .context("failed to re-serialize spec for the tool")?;
+                }
             }
+            loaded_hunks = Some(file_hunks);
         }
+        parsed_spec = Some(parsed);
+    }
+
+    // Every check above has now run and passed, so a plan printed here is a
+    // description of a run that would have got as far as jj.
+    if let Some(verb) = dry_run {
+        return dry_run::report(
+            verb,
+            target,
+            parsed_spec.as_ref(),
+            loaded_hunks.as_deref(),
+            &raw_spec,
+            allow_empty,
+        );
     }
 
     let temp_spec = TempSpec::create(&spec_content)?;
@@ -3410,14 +3463,22 @@ pub fn split(
     message: &str,
     rev: Option<&str>,
     allow_empty: bool,
+    dry_run: bool,
 ) -> Result<()> {
-    let message = message_arg(message);
-    let mut args = vec!["split", JJ_HUNK_TOOL_ARG, message.as_str()];
+    let message_flag = message_arg(message);
+    let mut args = vec!["split", JJ_HUNK_TOOL_ARG, message_flag.as_str()];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
+    run_jj_with_selection(
+        &args,
+        spec,
+        spec_file,
+        rev,
+        allow_empty,
+        dry_run.then_some(dry_run::Verb::Split { message }),
+    )
 }
 
 pub fn commit(
@@ -3425,14 +3486,16 @@ pub fn commit(
     spec_file: Option<&str>,
     message: &str,
     allow_empty: bool,
+    dry_run: bool,
 ) -> Result<()> {
-    let message = message_arg(message);
+    let message_flag = message_arg(message);
     run_jj_with_selection(
-        &["commit", "-i", JJ_HUNK_TOOL_ARG, message.as_str()],
+        &["commit", "-i", JJ_HUNK_TOOL_ARG, message_flag.as_str()],
         spec,
         spec_file,
         None, // commit always operates on @
         allow_empty,
+        dry_run.then_some(dry_run::Verb::Commit { message }),
     )
 }
 
@@ -3441,13 +3504,21 @@ pub fn squash(
     spec_file: Option<&str>,
     rev: Option<&str>,
     allow_empty: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let mut args = vec!["squash", "-i", JJ_HUNK_TOOL_ARG];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, rev, allow_empty)
+    run_jj_with_selection(
+        &args,
+        spec,
+        spec_file,
+        rev,
+        allow_empty,
+        dry_run.then_some(dry_run::Verb::Squash),
+    )
 }
 
 /// Rewrite a revision so it contains only the selected hunks of its diff.
@@ -3463,6 +3534,7 @@ pub fn diffedit(
     from: Option<&str>,
     to: Option<&str>,
     allow_empty: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let mut args = vec!["diffedit", JJ_HUNK_TOOL_ARG];
 
@@ -3488,7 +3560,14 @@ pub fn diffedit(
         DiffTarget::from_to(from.unwrap_or("@"), to.unwrap_or("@"))
     };
 
-    run_jj_with_selection_on(&args, spec, spec_file, &target, allow_empty)
+    run_jj_with_selection_on(
+        &args,
+        spec,
+        spec_file,
+        &target,
+        allow_empty,
+        dry_run.then_some(dry_run::Verb::Diffedit),
+    )
 }
 
 /// Undo the selected hunks, taking their content from another revision.
@@ -3509,6 +3588,7 @@ pub fn restore(
     from: Option<&str>,
     into: Option<&str>,
     allow_empty: bool,
+    dry_run: bool,
 ) -> Result<()> {
     if changes_in.is_some() && (from.is_some() || into.is_some()) {
         anyhow::bail!("-c/--changes-in cannot be used with --from/--into");
@@ -3549,7 +3629,14 @@ pub fn restore(
         DiffTarget::from_to(into.unwrap_or("@"), from.unwrap_or("@"))
     };
 
-    run_jj_with_selection_on(&args, spec, spec_file, &target, allow_empty)
+    run_jj_with_selection_on(
+        &args,
+        spec,
+        spec_file,
+        &target,
+        allow_empty,
+        dry_run.then_some(dry_run::Verb::Restore),
+    )
 }
 
 #[cfg(test)]
