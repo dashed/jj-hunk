@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "alberto/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -80,25 +80,19 @@ jobs:
         run: cargo test --locked ${{ matrix.flags }}
 
   clippy:
-    name: clippy (advisory)
+    name: clippy
     runs-on: ubuntu-latest
-    # Advisory only, and it has to stay that way while the fork is split
-    # across feature branches.
+    # A gate, as of the fork becoming permanent.
     #
-    # The fork's own code IS clean: zero clippy warnings on the integration
-    # merge in all three feature modes, as of the two `chore(clippy)` commits
-    # on alberto/hunkset-lang and alberto/tree-sitter-semantic.
+    # This was advisory for a long time, and the reason was real: CI ran on the
+    # feature branches too, and those carried upstream's `src/` unchanged, so
+    # gating would have failed a branch's own build over code it did not own.
+    # The stated trigger was "main itself being clean".
     #
-    # What is left belongs to upstream, and is only visible when a branch is
-    # built on its own. This branch carries main's `src/` unchanged, which
-    # still reports 9: five derivable `impl Default`s, two over-long argument
-    # lists, an elidable lifetime, and a manual loop counter. Gating here
-    # would fail this branch's own build over code it does not own -- exactly
-    # the outcome the earlier note promised to avoid.
-    #
-    # So the trigger is not "the fork's backlog is cleared" (it is); it is
-    # main itself being clean.
-    continue-on-error: true
+    # Collapsing to a single branch settled it from both ends. `main` is now
+    # the only branch CI runs on, and it is clippy-clean -- zero warnings in
+    # every feature mode, from the `chore(clippy)` work that cleared all
+    # eleven. There is no longer a branch carrying unowned code to protect.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,8 +102,7 @@ jobs:
         with:
           key: clippy
       - name: Clippy
-        # RUSTFLAGS is cleared here so clippy reports rather than fails; the
-        # step is advisory and its findings are read from the log.
-        env:
-          RUSTFLAGS: ""
-        run: cargo clippy --locked --all-targets
+        # `-D warnings` after `--` denies clippy's own lints, which RUSTFLAGS
+        # alone does not reliably do. The top-level `-Dwarnings` still covers
+        # rustc's.
+        run: cargo clippy --locked --all-targets -- -D warnings

@@ -705,21 +705,20 @@ Nothing on the feature roadmap. `alberto/short-ids` and `alberto/jj-verbs` were
 the last two entries here and both shipped — see **Fixed** above. What is left
 is hygiene.
 
-**Clippy is still advisory, and no longer has a reason to be.**
-`cargo clippy --locked --all-targets` now reports **zero** warnings on `main` in
-all three feature modes — default, `--no-default-features`, `--all-features`.
-The 11 that used to sit here were cleared by two `chore(clippy)` commits.
+**Clippy is a gate.** `cargo clippy --locked --all-targets -- -D warnings`
+reports zero warnings on `main` in every feature mode, and CI now fails on a new
+one rather than logging it.
 
-The CI job stayed advisory because gating it would have failed the *other*
-branches, which carried upstream's `src/` unchanged and its nine warnings with
-it; `ci.yml`'s comment says so, and names main-being-clean as the real trigger.
-That blocker died with the branches. `main` is now the only branch CI runs on
-and it is clean, so the gate can be turned on by deleting `continue-on-error`
-and restoring `RUSTFLAGS` on that step. Do it, or drop the comment — the promise
-has been about to come due for long enough.
+It was advisory for a long time, for a real reason: CI ran on the feature
+branches too, and those carried upstream's `src/` unchanged along with its nine
+warnings, so gating would have failed a branch's own build over code it did not
+own. `ci.yml` named main-being-clean as the trigger. Collapsing to one branch
+settled it from both ends — `main` is the only branch CI runs on, and the two
+`chore(clippy)` commits had already cleared all eleven of its warnings.
 
-`ci.yml` also still triggers on `push: branches: [main, "alberto/**"]`. The
-second pattern matches nothing now.
+Nine warnings do still exist in upstream's `src/` at `3643ee8`. They are not
+reachable from anything this project builds, and are noted only so the number is
+not rediscovered as a surprise.
 
 **Agent worktrees accumulate.** At last count 9 `worktree-agent-*` branches
 existed against 2 live worktrees — so 8 branches outliving the directory they
