@@ -1,98 +1,18 @@
-# jj-hunk Fork Workflow
+# jj-hunk
 
-This document describes what this fork of `jj-hunk` is, where its code came from,
-what was fixed along the way, and how to work on it.
+Programmatic hunk selection for [jj (Jujutsu)](https://github.com/jj-vcs/jj).
 
-## Overview
+**This project is built on other people's work.** It is a permanent fork of
+[laulauland/jj-hunk](https://github.com/laulauland/jj-hunk) v0.4.1, carrying the
+hunkset query language and tree-sitter semantic analysis imported from
+[sigma/jj-hunk](https://github.com/sigma/jj-hunk), and three verbs whose design
+follows [mvzink/jj-hunk-tool](https://github.com/mvzink/jj-hunk-tool). See
+**Provenance** below for exactly what came from where, down to the commit.
 
-`jj-hunk` selects diff hunks programmatically — for `split`, `commit`, `squash`,
-`diffedit`, `restore` and `absorb` — with no interactive UI, so a script or an
-agent can drive it. This fork is a **permanent divergence** from
-[`laulauland/jj-hunk`](https://github.com/laulauland/jj-hunk). It adds the
-hunkset query language, tree-sitter semantic predicates, three verbs upstream
-lacks, test CI, and 528 tests where upstream has 17.
-
-There is one branch, `main`. It is the default branch and the only place work
-lands. Jujutsu (jj) drives it in colocated mode, so `git` works too.
-
-### The four-branch era, and why it ended
-
-Until 2026-08-11 the fork was four feature branches — `alberto/hunkset-lang`,
-`alberto/tree-sitter-semantic`, `alberto/fork-customizations`, `alberto/test-ci`
-— each based directly on a `main` pinned to the pristine upstream base
-(`3643ee8`, v0.4.1), and combined by a four-parent integration merge on
-`alberto/my-jj-hunk`. Every branch built and tested green on its own.
-
-That structure existed to make **upstream rebases cheap**: rebase and validate
-one branch at a time instead of debugging a four-way merge, and drop a feature
-from the merge to turn it off. It was the right shape for a fork that expected to
-track upstream.
-
-It stopped being the right shape once the fork stopped expecting that. Upstream
-has not moved since `3643ee8`; this fork is 45 commits past it, has rewritten
-`src/commands.rs` in 24 of them, and has a verb set and a query language upstream
-does not have. There is no rebase left to be cheap, and no PR that lands this
-back. What remained was only the cost: every change had to be filed onto the
-branch that owned its files, the merge rebuilt by hand afterwards, and a change
-filed onto the wrong branch — or onto the right one without rebuilding the merge
-— silently did nothing, with a test count that failed to go up as the only
-symptom.
-
-So `main` was fast-forwarded to the integration merge and is now the mainline;
-the four pull requests closed as merged, and the branches are retired. The merge
-commit `0a796e2` is still in the history and still names its four parents, which
-is what keeps **Provenance** below attributable.
-
-## Why This Fork Exists
-
-Three projects solve non-interactive hunk selection for jj, and none of them is
-the tool this fork wants to be:
-
-| Project | Strength | Why not just use it |
-|---|---|---|
-| [`laulauland/jj-hunk`](https://github.com/laulauland/jj-hunk) | Only tool on the [official jj community-tools list](https://docs.jj-vcs.dev/latest/community_tools/); ships via crates.io, Homebrew, Nix. Fine hunk granularity. | Thin command surface, 17 tests, **no test CI**, slow release cadence. |
-| [`sigma/jj-hunk`](https://github.com/sigma/jj-hunk) | The **hunkset query language** and tree-sitter semantics — the best ideas in this space. | All of it sits unmerged on branches, unreleased and never PR'd upstream. |
-| [`mvzink/jj-hunk-tool`](https://github.com/mvzink/jj-hunk-tool) | Best engineering: 125 tests, `absorb`/`diffedit`/`restore`, sub-hunk line ranges, short IDs. | Different architecture; coarser git-style hunks; **no CI at all**; rejects renamed files outright. Its ID algorithm and patch slicer live in the `git-surgeon` crate, floated as `"0.1.14"` (i.e. `^0.1.14`) — and its documented install path, `cargo install --git`, re-resolves dependencies unless `--locked` is passed, so an upstream patch release could silently change every hunk ID. Also shells out to `patch(1)` at runtime. |
-
-This fork takes `laulauland/jj-hunk` as its base — it keeps the distribution
-channels and the community listing — then lands sigma's unmerged work, ports the
-best of `jj-hunk-tool`'s ideas on top, and puts the result under test. What that
-actually produced, and who is owed for which part of it, is **Provenance** below.
-
-### Why this base, concretely
-
-Both upstream tools drive jj through the **same `--tool` diff-editor callback
-protocol**, so ideas port between them. The tiebreakers were hunk granularity and
-dependency surface. On identical input:
-
-```
-             import sys  +  rewrite of load()      →  jj-hunk:      2 separable hunks
-             (adjacent lines)                         jj-hunk-tool: 1 welded hunk
-```
-
-`jj-hunk` diffs with `similar` change-groups, so adjacent-but-unrelated edits stay
-separable. `jj-hunk-tool` uses git-style 3-line context, which welds them together
-and then needs sub-hunk line ranges to undo the damage. For splitting commits by
-*concern*, finer default granularity is the more valuable property.
-
-## Branch Structure
-
-One branch: `main`.
-
-```
-◆  main — the whole fork: 8 verbs, 528 tests, CI
-│
-◇  3643ee8 — laulauland/jj-hunk v0.4.1, the base
-```
-
-`main` is the fast-forwarded integration merge, so the whole history is here:
-the four retired branches' commits, the merge that combined them, and the
-imports at the root. What that structure was and why it ended is under
-**Overview** above.
-
-Their names still appear in **Provenance** and **Fixed** below, where they say
-*which commits* a piece of work shipped in. Those commits are all on `main`; the
-branches are not — do not go looking for them.
+The rest of this document is the project's own record: the bugs found in that
+code and what each one taught, the roadmap, and the jj and hunkset reference
+worth keeping in one place. For what the tool does and how to drive it, see
+[README.md](README.md) and [SKILL.md](SKILL.md).
 
 ## The `semantic` Feature
 
@@ -150,7 +70,8 @@ than original. The base for everything is `laulauland/jj-hunk` at `3643ee8`
 The fork branch names below are **retired**; they say which commits carried
 which work, and every one of those commits is on `main` now. The commit ids
 that live outside this repo resolve only while the remotes described under
-**Remotes** below stay configured.
+**Why the reference remotes stay**, under Provenance, explains why they are
+still configured.
 
 **The import copied trees, not commits.** There are exactly two import commits,
 both rooted directly at `3643ee8`, and their files are byte-identical to the
@@ -257,15 +178,8 @@ several independent repairs — `fix: symlink corruption, argument validation, i
 ambiguity, identifier matching` is four — so any bug count would be a guess.
 Commit counts are what can be checked, so commit counts are what appear here.
 
-## Remotes
 
-```bash
-git remote -v
-# origin    https://github.com/dashed/jj-hunk.git      ← this fork
-# upstream  git@github.com:laulauland/jj-hunk.git      ← the base, v0.4.1
-# sigma     https://github.com/sigma/jj-hunk.git       ← source of the imported features
-# mvzink    https://github.com/mvzink/jj-hunk-tool.git ← reference for ported ideas
-```
+### Why the reference remotes stay
 
 `upstream`, `sigma` and `mvzink` are kept deliberately, as **read-only
 reference**. Nothing tracks them, nothing merges from them, and no bookmark here
@@ -287,14 +201,8 @@ look up. Re-adding and re-fetching would restore it — but only for as long as
 those repositories exist and still carry those refs, which is not a guarantee
 anyone here controls.
 
-`mvzink` in particular is an unrelated codebase fetched into the same object
-store purely so its history is greppable when porting ideas.
-
-Pushing:
-
-```bash
-jj git push --remote origin --bookmark main
-```
+`mvzink` is an unrelated codebase, fetched into the same object store purely
+so its history is greppable when porting ideas.
 
 ## Jujutsu (jj) Setup
 
@@ -890,7 +798,7 @@ and will discard work done in other workspaces since that operation.
 | `src/absorb.rs` | Blame-based routing, context-free fingerprints, squash plan |
 | `src/semantic.rs` | tree-sitter analyzer, 20 language configs |
 | `src/glob.rs` | Glob matching for path predicates |
-| `FORK_WORKFLOW.md` | This documentation |
+| `PROJECT.md` | This documentation |
 
 ## Version Scheme
 

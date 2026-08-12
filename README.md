@@ -1,11 +1,12 @@
-# jj-hunk (fork)
+# jj-hunk
 
-> **This is a fork** of [laulauland/jj-hunk](https://github.com/laulauland/jj-hunk),
-> and a permanent one — it does not track upstream.
-> It adds the [hunkset query language](FORK_WORKFLOW.md#hunkset-quick-reference) and
-> tree-sitter semantic predicates, imported from [sigma/jj-hunk](https://github.com/sigma/jj-hunk);
-> the `diffedit`, `restore` and `absorb` verbs; and test CI.
-> See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for provenance, the fix log, and the roadmap.
+> A permanent fork of [laulauland/jj-hunk](https://github.com/laulauland/jj-hunk) v0.4.1,
+> which does not track upstream. The [hunkset query language](PROJECT.md#hunkset-quick-reference)
+> and tree-sitter semantic predicates are imported from
+> [sigma/jj-hunk](https://github.com/sigma/jj-hunk); the `diffedit`, `restore` and
+> `absorb` verbs follow [mvzink/jj-hunk-tool](https://github.com/mvzink/jj-hunk-tool).
+> Test CI and the fixes are this fork's. See [PROJECT.md](PROJECT.md) for
+> provenance down to the commit, the fix log, and the roadmap.
 
 Programmatic hunk selection for [jj (Jujutsu)](https://github.com/martinvonz/jj).
 
