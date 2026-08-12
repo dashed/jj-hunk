@@ -19,58 +19,38 @@ const JJ_HUNK_TOOL_ARG: &str = "--tool=jj-hunk";
 const JJ_HUNK_PROGRAM_KEY: &str = "merge-tools.jj-hunk.program";
 const JJ_HUNK_EDIT_ARGS_KEY: &str = "merge-tools.jj-hunk.edit-args";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum ListFormat {
+    #[default]
     Json,
     Yaml,
     Text,
     Diff,
 }
 
-impl Default for ListFormat {
-    fn default() -> Self {
-        Self::Json
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum ListGrouping {
+    #[default]
     None,
     Directory,
     Extension,
     Status,
 }
 
-impl Default for ListGrouping {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum BinaryMode {
     Skip,
+    #[default]
     Mark,
     Include,
 }
 
-impl Default for BinaryMode {
-    fn default() -> Self {
-        Self::Mark
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListMode {
+    #[default]
     Full,
     Files,
     SpecTemplate,
-}
-
-impl Default for ListMode {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 /// Caps applied to a file's contents *before* it is diffed, so a very large

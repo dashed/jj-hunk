@@ -202,10 +202,8 @@ pub fn get_hunks(path: &str, before: &str, after: &str) -> Vec<Hunk> {
                         &mut current_removed,
                         &mut current_added,
                         &before_lines,
-                        hunk_before_start,
-                        hunk_after_start,
-                        hunk_before_len,
-                        hunk_after_len,
+                        LineRange { start: hunk_before_start, length: hunk_before_len },
+                        LineRange { start: hunk_after_start, length: hunk_after_len },
                     );
                     hunk_before_len = 0;
                     hunk_after_len = 0;
@@ -248,10 +246,8 @@ pub fn get_hunks(path: &str, before: &str, after: &str) -> Vec<Hunk> {
             &mut current_removed,
             &mut current_added,
             &before_lines,
-            hunk_before_start,
-            hunk_after_start,
-            hunk_before_len,
-            hunk_after_len,
+            LineRange { start: hunk_before_start, length: hunk_before_len },
+            LineRange { start: hunk_after_start, length: hunk_after_len },
         );
     }
 
@@ -269,22 +265,12 @@ fn finalize_hunk(
     current_removed: &mut String,
     current_added: &mut String,
     before_lines: &[&str],
-    before_start: usize,
-    after_start: usize,
-    before_length: usize,
-    after_length: usize,
+    before_range: LineRange,
+    after_range: LineRange,
 ) {
     let removed = std::mem::take(current_removed);
     let added = std::mem::take(current_added);
     let hunk_type = determine_hunk_type(&removed, &added);
-    let before_range = LineRange {
-        start: before_start,
-        length: before_length,
-    };
-    let after_range = LineRange {
-        start: after_start,
-        length: after_length,
-    };
     let context = build_context(before_lines, &before_range);
     let id = ids.next_id(hunk_type, &removed, &added, context.as_ref());
 

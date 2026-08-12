@@ -446,7 +446,7 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
     // than turning into a silent non-match inside a predicate.
     let compiled = compile_args(name, args)?;
 
-    match name.as_ref() {
+    match name {
         // `file()` and `glob()` filter the same field and differ only in the
         // kind they assume for an argument without a prefix.
         "file" | "glob" => Ok(eval_path(&compiled, hunks)),
@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn eval_type_filter() {
-        let hunks_data = vec![
+        let hunks_data = [
             make_hunk(0, "insert", "", "new line\n"),
             make_hunk(1, "delete", "old line\n", ""),
             make_hunk(2, "replace", "before\n", "after\n"),
