@@ -16,6 +16,10 @@ use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Trun
 #[derive(Parser)]
 #[command(name = "jj-hunk")]
 #[command(about = "Programmatic hunk selection for jj")]
+// Derived from CARGO_PKG_VERSION, which carries the fork suffix
+// (`0.4.1-my-jj-hunk`) -- the only way to tell an installed fork build from
+// upstream's at a glance.
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -7082,3 +7082,37 @@ fn a_copy_is_matched_by_the_path_it_was_copied_from() {
         "file() did not reach the copy made from orig.txt"
     );
 }
+
+/// `--version` has to work on the installed binary, and has to report the
+/// version cargo actually built.
+///
+/// It did not exist at all until late: clap only derives `--version` when the
+/// `version` attribute is present, so the flag errored with "unexpected
+/// argument". That matters more for a fork than it would upstream. The crate
+/// version carries a fork suffix (`0.4.1-my-jj-hunk`), and once the binary is
+/// installed onto a PATH there is otherwise no way to tell a fork build from
+/// upstream's — which is exactly when you want to ask.
+///
+/// Asserting against `CARGO_PKG_VERSION` rather than a literal means the test
+/// cannot drift out of step with a version bump.
+#[test]
+fn version_flag_reports_the_built_version() {
+    for flag in ["--version", "-V"] {
+        let out = std::process::Command::new(jj_hunk_bin())
+            .arg(flag)
+            .output()
+            .expect("failed to run jj-hunk");
+        assert!(
+            out.status.success(),
+            "{flag} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(env!("CARGO_PKG_VERSION")),
+            "{flag} did not report {}: {stdout:?}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
