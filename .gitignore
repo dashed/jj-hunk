@@ -5,3 +5,7 @@
 # Added by cargo
 
 /target
+
+# Agent worktrees. Untracked but not ignored, these were swept into a
+# `git add -A` and committed as gitlinks inside an integration merge.
+.claude/worktrees/

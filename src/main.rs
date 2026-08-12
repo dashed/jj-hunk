@@ -1,13 +1,17 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+mod absorb;
 mod diff;
 #[cfg(feature = "semantic")]
 mod semantic;
+mod glob;
+mod hunkset;
 mod spec;
 mod commands;
 
-use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions};
+use absorb::{AbsorbOptions, InsertionPolicy};
+use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
 
 #[derive(Parser)]
 #[command(name = "jj-hunk")]
@@ -32,7 +36,7 @@ enum Commands {
 
     /// Split changes with hunk selection
     Split {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
@@ -42,22 +46,28 @@ enum Commands {
         /// Revision to split (default: @)
         #[arg(short, long)]
         rev: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
     },
 
     /// Commit selected hunks
     Commit {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
         spec_file: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
     },
 
     /// Squash selected hunks into parent
     Squash {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
@@ -65,14 +75,86 @@ enum Commands {
         /// Revision to squash (default: @)
         #[arg(short, long)]
         rev: Option<String>,
+        /// Allow a selection that keeps nothing (creates an empty commit)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+    },
+
+    /// Edit a revision's diff, keeping only the selected hunks
+    Diffedit {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin.
+        /// The hunks it names are the ones KEPT
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Revision to edit (default: @)
+        #[arg(short, long, conflicts_with_all = ["from", "to"])]
+        rev: Option<String>,
+        /// Show changes from this revision (default: @)
+        #[arg(long)]
+        from: Option<String>,
+        /// Edit changes in this revision (default: @)
+        #[arg(short = 't', long)]
+        to: Option<String>,
+        /// Allow a selection that keeps nothing (discards the whole diff)
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+    },
+
+    /// Undo the selected hunks, restoring their content from another revision
+    Restore {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin.
+        /// The hunks it names are the ones UNDONE
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Undo the changes in this revision (default: @)
+        #[arg(short = 'c', long = "changes-in", conflicts_with_all = ["from", "into"])]
+        changes_in: Option<String>,
+        /// Revision to restore from, the source (default: @)
+        #[arg(long)]
+        from: Option<String>,
+        /// Revision to restore into, the destination (default: @)
+        #[arg(short = 't', long, alias = "to")]
+        into: Option<String>,
+        /// Allow a selection that undoes nothing
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+    },
+
+    /// Move hunks into the mutable ancestors that last touched their lines
+    Absorb {
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
+        /// (default: every hunk in the revision)
+        spec: Option<String>,
+        /// Read spec from a file (JSON or YAML)
+        #[arg(long = "spec-file", short = 'f')]
+        spec_file: Option<String>,
+        /// Revision to absorb from (default: @)
+        #[arg(short, long)]
+        rev: Option<String>,
+        /// Print the routing plan without changing anything
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// What to do with hunks that only add lines
+        #[arg(long, value_enum, default_value_t = InsertionPolicy::Skip)]
+        insertions: InsertionPolicy,
     },
 }
 
 #[derive(Args)]
 struct ListArgs {
     /// Revset to diff (e.g. @, @-, or a change id)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with_all = ["from", "to"])]
     rev: Option<String>,
+    /// Diff from this revision instead of a revision's parent (default: @)
+    #[arg(long)]
+    from: Option<String>,
+    /// Diff to this revision (default: @)
+    #[arg(long)]
+    to: Option<String>,
     /// Include glob patterns (repeatable)
     #[arg(short = 'i', long)]
     include: Vec<String>,
@@ -94,7 +176,7 @@ struct ListArgs {
     /// Truncate file contents to N lines before diffing
     #[arg(long)]
     max_lines: Option<usize>,
-    /// Optional JSON/YAML spec to preview (inline or '-')
+    /// Filter output with a hunkset expression or JSON/YAML spec
     #[arg(long)]
     spec: Option<String>,
     /// Read spec from a file (JSON or YAML)
@@ -123,6 +205,8 @@ fn main() -> Result<()> {
 
             let options = ListOptions {
                 rev: args.rev,
+                from: args.from,
+                to: args.to,
                 include: args.include,
                 exclude: args.exclude,
                 group: args.group,
@@ -131,8 +215,10 @@ fn main() -> Result<()> {
                 spec: args.spec,
                 spec_file: args.spec_file,
                 binary: args.binary,
-                max_bytes: args.max_bytes,
-                max_lines: args.max_lines,
+                truncation: Truncation {
+                    max_bytes: args.max_bytes,
+                    max_lines: args.max_lines,
+                },
             };
 
             commands::list(options)
@@ -143,21 +229,79 @@ fn main() -> Result<()> {
             message,
             spec_file,
             rev,
+            allow_empty,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "split")?;
-            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref())
+            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref(), allow_empty)
         }
         Commands::Commit {
             spec,
             message,
             spec_file,
+            allow_empty,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "commit")?;
-            commands::commit(spec.as_deref(), spec_file.as_deref(), &message)
+            commands::commit(spec.as_deref(), spec_file.as_deref(), &message, allow_empty)
         }
-        Commands::Squash { spec, spec_file, rev } => {
+        Commands::Squash { spec, spec_file, rev, allow_empty } => {
             let spec = normalize_spec_only(spec, &spec_file, "squash")?;
-            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref())
+            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref(), allow_empty)
+        }
+        Commands::Diffedit {
+            spec,
+            spec_file,
+            rev,
+            from,
+            to,
+            allow_empty,
+        } => {
+            let spec = normalize_spec_only(spec, &spec_file, "diffedit")?;
+            commands::diffedit(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                rev.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                allow_empty,
+            )
+        }
+        Commands::Restore {
+            spec,
+            spec_file,
+            changes_in,
+            from,
+            into,
+            allow_empty,
+        } => {
+            let spec = normalize_spec_only(spec, &spec_file, "restore")?;
+            commands::restore(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                changes_in.as_deref(),
+                from.as_deref(),
+                into.as_deref(),
+                allow_empty,
+            )
+        }
+        Commands::Absorb {
+            spec,
+            spec_file,
+            rev,
+            dry_run,
+            insertions,
+        } => {
+            // Unlike the other commands, the spec is optional: absorb with no
+            // selector considers every hunk, which is the usual way to run it.
+            if spec.is_some() && spec_file.is_some() {
+                anyhow::bail!("absorb: omit <spec> when using --spec-file");
+            }
+            absorb::absorb(AbsorbOptions {
+                spec,
+                spec_file,
+                rev,
+                dry_run,
+                insertions,
+            })
         }
     }
 }

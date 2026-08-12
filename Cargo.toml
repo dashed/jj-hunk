@@ -1,6 +1,6 @@
 [package]
 name = "jj-hunk"
-version = "0.4.1"
+version = "0.4.1-my-jj-hunk"
 edition = "2021"
 description = "Programmatic hunk selection for jj"
 license = "MIT"
@@ -41,6 +41,8 @@ anyhow = "1"
 walkdir = "2"
 serde_yaml = "0.9"
 sha2 = "0.10"
+regex = "1"
+thiserror = "2"
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }

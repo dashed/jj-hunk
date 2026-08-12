@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "alberto/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crate is warning-free in every build mode. Keep it that way.
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The two modes are genuinely different builds, not a formality:
+        # `default` compiles the tree-sitter grammars and enables the semantic
+        # predicates; `none` exercises the feature-contract path where those
+        # predicates must error instead of silently returning nothing.
+        features: [default, none]
+        include:
+          - features: default
+            flags: ""
+          - features: none
+            flags: "--no-default-features"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Feature sets produce different artifacts; don't let them evict
+          # each other. The default build compiles 21 grammar crates.
+          key: ${{ matrix.features }}
+
+      - name: Install jj
+        shell: bash
+        env:
+          # Pinned deliberately. The integration tests assert on jj's output
+          # format and revset behaviour, so an unpinned jj would turn an
+          # upstream release into a mystery failure here.
+          JJ_VERSION: v0.44.0
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   TARGET=x86_64-unknown-linux-musl ;;
+            Linux-ARM64) TARGET=aarch64-unknown-linux-musl ;;
+            macOS-ARM64) TARGET=aarch64-apple-darwin ;;
+            macOS-X64)   TARGET=x86_64-apple-darwin ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          URL="https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-${TARGET}.tar.gz"
+          echo "installing $URL"
+          mkdir -p "$HOME/.local/bin"
+          # Members are stored with a leading "./". Extract the whole archive
+          # and move the binary out, rather than naming a member -- GNU and
+          # BSD tar disagree about whether "jj" matches "./jj".
+          TMP="$(mktemp -d)"
+          curl -fsSL "$URL" | tar xz -C "$TMP"
+          mv "$TMP/jj" "$HOME/.local/bin/jj"
+          chmod +x "$HOME/.local/bin/jj"
+          rm -rf "$TMP"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify jj is the pinned version
+        run: jj --version
+
+      - name: Build
+        run: cargo build --locked ${{ matrix.flags }}
+
+      - name: Test
+        run: cargo test --locked ${{ matrix.flags }}
+
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    # Advisory only, and it has to stay that way while the fork is split
+    # across feature branches.
+    #
+    # The fork's own code IS clean: zero clippy warnings on the integration
+    # merge in all three feature modes, as of the two `chore(clippy)` commits
+    # on alberto/hunkset-lang and alberto/tree-sitter-semantic.
+    #
+    # What is left belongs to upstream, and is only visible when a branch is
+    # built on its own. This branch carries main's `src/` unchanged, which
+    # still reports 9: five derivable `impl Default`s, two over-long argument
+    # lists, an elidable lifetime, and a manual loop counter. Gating here
+    # would fail this branch's own build over code it does not own -- exactly
+    # the outcome the earlier note promised to avoid.
+    #
+    # So the trigger is not "the fork's backlog is cleared" (it is); it is
+    # main itself being clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: Clippy
+        # RUSTFLAGS is cleared here so clippy reports rather than fails; the
+        # step is advisory and its findings are read from the log.
+        env:
+          RUSTFLAGS: ""
+        run: cargo clippy --locked --all-targets
