@@ -134,19 +134,114 @@ everything still compiles.
 ## Provenance
 
 Most of what is on the feature branches is imported, reorganized, and verified
-rather than original. Track it honestly:
+rather than original. The base for everything is `laulauland/jj-hunk` at
+`3643ee8` (v0.4.1) — which is also `upstream/main` and `sigma/main`.
 
-| Branch | Imported from | Upstream commits |
-|---|---|---|
-| `alberto/tree-sitter-semantic` | `sigma/dev` | `59143b6`, `6dee312`, `558f184`, `56a3c97` |
-| `alberto/hunkset-lang` | `sigma/dev` | `3fafa16`, `4e3b820`, `8decd9d`, `854c6dd`, `86cf49c` |
+**The import copied trees, not commits.** There are exactly two import commits,
+both rooted directly at `3643ee8`, and their files are byte-identical to the
+source trees — same blob SHAs, not merely the same content. So a per-*commit*
+attribution was never going to be exact; what follows is per-tree, which is
+checkable.
 
-The fork's own contributions so far: the reorganization (sigma ships these as one
-entangled DAG with two merge commits, semantic and hunkset interleaved — here they
-are two independent branches that each build and test green alone), the README
-hunkset documentation that the import initially left behind, and the
-two bug-fix commits on `alberto/hunkset-lang` — `fix(diff-format)` and
-`fix(hunkset)` — with 25 regression tests between them.
+| Fork branch | Import commit | Source tree | Content taken |
+|---|---|---|---|
+| `alberto/tree-sitter-semantic` | `49264d0` | `sigma/tree-sitter-semantic` @ `59143b6` | `src/semantic.rs` verbatim (blob `21b78b9b`), plus the tree-sitter deps and the `semantic` feature list |
+| `alberto/hunkset-lang` | `6c56150` | `sigma/dev` @ `6844166` (the roll-up merge) | everything else, byte-identical to that tree: `commands.rs`, `diff.rs`, `glob.rs`, `spec.rs`, all of `hunkset/`, and the README hunkset section |
+
+Note the two sources differ. `semantic.rs` matches the **topic branch** tip
+`59143b6`, not `sigma/dev` — the two differ by one `#[allow(dead_code)]` line.
+Everything else matches only `sigma/dev`'s tip, because just that roll-up merge
+has both the `semantic-features` line and `diff-output-format` in one tree.
+
+`sigma/dev` is 13 commits over the base, two of them merges, carrying **three**
+feature lines: `hunkset-language` (`3fafa16`), `tree-sitter-semantic`
+(`59143b6`), and `diff-output-format` (`8decd9d`). After the first merge, single
+commits edit the query language and the analyzer together, so the concerns
+cannot be separated by picking commits — the fork had to split them at the file
+level. That is why this is a 3→2 reorganization rather than an unpicking.
+
+**A caution if you re-derive this table.** sigma's commits are squashes whose
+subjects often describe work that is not in their diff. `558f184` is titled
+"Python docstring detection" and touches no `semantic.rs` at all (that logic
+already shipped in `59143b6`); `4e3b820` is titled "semantic predicates" and is
+entirely hunkset evaluator code. An earlier version of this table filed both by
+subject, and got `558f184` wrong. Read the diffs.
+
+Deliberately **not** imported:
+
+- `6844166`'s `SKILL.md` revision. The import shipped upstream's `SKILL.md`
+  untouched (same blob, `d9075de0`), and the fork later wrote its own.
+- `upstream/codex/fix-merge-list` (`6d7d44e`), which handles merge commits by
+  materializing trees through a hidden subcommand and
+  `JJ_HUNK_LIST_REQUEST`/`JJ_HUNK_LIST_OUTPUT`. None of those identifiers exist
+  here; `063d1ee` rejects merge revisions instead, naming the parents. A reader
+  should not assume that work was taken.
+
+**`mvzink/jj-hunk-tool` shares no history with this repo** — there is no merge
+base — and none of its code is here: none of its dependencies, and none of its
+identifiers. Its influence is real but conceptual and disclosed: it has the same
+three verbs this fork adds, and a hunk fingerprint over "path plus non-context
+lines" that `absorb` uses the same device for. The implementations are separate
+and deliberately diverge; `c65ab6d` names jj-hunk-tool and argues against its
+routing fallback.
+
+### What the fork actually contributed
+
+**The reorganization** described above: two branches that each build and test
+green standalone in their own default configuration — `hunkset-lang` at 435
+tests, `tree-sitter-semantic` at 103. Two caveats worth stating plainly, because
+"builds green alone" overstates without them: `hunkset-lang` does **not** compile
+under `--all-features`, by design, since its `semantic = []` is a contract-only
+flag whose analyzer lives on the other branch; and that flag is inert there —
+no tested configuration turns it on. The feature seam itself (`require_semantic`,
+the `#[cfg]` pair) is sigma's and is byte-identical here. Using it as a *branch
+boundary* is the fork's decision, and it is a packaging one, not new code.
+
+**The verification effort, which is the bulk of it.** Upstream and `sigma/dev`
+share a byte-identical `tests/integration.rs` — 521 lines, 11 tests. sigma added
+a 3,737-line production codebase and **no integration tests at all**. This fork's
+is 7,084 lines and 260 tests. Alongside them, **26 fix commits** (23 on
+`hunkset-lang`, 3 on `tree-sitter-semantic`), and the target was mostly not the
+imports: `src/commands.rs`, which is upstream's code, is touched by 24 of the 34
+commits on `hunkset-lang`, and what turned up there was the serious kind —
+writing outside the working tree, silently losing files and mode changes,
+symlink corruption, CRLF loss.
+
+**`src/absorb.rs`** (1,371 lines), and the `diffedit` and `restore` verbs, taking
+the binary from five commands to eight. The verb *set* is mvzink's, as above;
+the implementations are ours. Plus flags no ancestor has: `--allow-empty`,
+`list --from/--to`, absorb's `--dry-run` and `--insertions`.
+
+**`.github/workflows/ci.yml`** — the only test CI in any of the three projects.
+
+**The `SKILL.md` rewrite.** The import left a 345-line document describing a
+binary that no longer existed; it is now 840 lines describing the eight-command
+one that does. (The README hunkset section, by contrast, arrived *with* the
+import and was never missing — an earlier version of this file claimed credit
+for it in error.)
+
+### Numbers, and what each counts
+
+| | base `3643ee8` | `sigma/dev` | this fork |
+|---|---|---|---|
+| tests, default build | 17 | 83 | **528** |
+| tests, `--no-default-features` | — | — | 435 |
+| `tests/integration.rs` | 521 lines, 11 tests | *byte-identical to base* | 7,084 lines, 260 tests |
+| `src/` production lines | 1,896 | 3,737 | 8,745 |
+| test CI | none | none | yes |
+
+On the integration merge `default = ["semantic"]`, so `--all-features` and the
+default build are the same thing; 528 is simply the default. 435 is the
+semantic-off build.
+
+Commits over base: 44 across four branches — `hunkset-lang` 34 (23 fix, 5 docs,
+3 feat, 2 test, 1 chore), `tree-sitter-semantic` 5, `fork-customizations` 3,
+`test-ci` 2.
+
+**"Bugs fixed" is deliberately not reported.** 14 of those subjects bundle
+several independent repairs — `fix: symlink corruption, argument validation, id
+ambiguity, identifier matching` is four — so any bug count would be a guess.
+Commit counts are what can be checked, so commit counts are what appear here.
 
 ## Remotes
 
