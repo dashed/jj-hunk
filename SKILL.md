@@ -312,35 +312,49 @@ all reject one outright rather than matching nothing — which matters most unde
 Error: hunkset evaluation error: invalid glob 'src/[': unclosed '[' -- a character class needs a matching ']'
 ```
 
-### Binary files: half the predicates cannot see them
+### Changes with no hunks: half the predicates cannot see them
 
-A binary file has no hunks to match, so it is selected **whole** or not at all. Which predicates
-can reach it is a hard split:
+Five kinds of change have nothing to select *within* — a binary file, a symlink, a mode-only
+flip, a rename or copy whose text did not move, and an add or remove of an empty file. Each is
+selected **whole** or not at all. Which predicates can reach one is a hard split:
 
-| Reach binaries (select them whole) | Never reach binaries |
-|------------------------------------|----------------------|
+| Reach them (select them whole) | Never reach them |
+|--------------------------------|------------------|
 | `all()`, `file()`, `glob()`, `extension()`, `status()`, and any negation `~x` | `content()`, `added()`, `removed()`, `lines()`, `id()` |
 
-**This is the trap: a `content()`-only selector silently leaves a binary change behind.** It is not
-an error and nothing warns you — the binary just stays in the revision you were emptying:
+The right column is not an oversight. These changes are given a stand-in hunk that carries a path
+and a status and no text at all, precisely so that a question about content cannot be answered
+about bytes that were never diffed — a link's target and a renamed file's body are not in any
+hunk, so nothing matches them.
+
+**This is the trap: a `content()`-only selector silently leaves every one of them behind.** It is
+not an error and nothing warns you — they just stay in the revision you were emptying:
 
 ```bash
 $ jj-hunk list --format text
 M blob.bin [binary]
-M text.rs
-  hunk 0 replace hunk-789d8071 (before 2+1 after 2+1)
-    - two
-    + TWO
+A brand_new_empty.txt
+M config [symlink, whole-file only]
+R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
+M script.sh [mode 100644 -> 100755, not selectable]
+M text.txt
+  hunk 0 replace hunk-ac0f7677 (before 2+1 after 2+1)
+    - world
+    + WORLD
 
-$ jj-hunk split 'content("TWO")' "text only"     # succeeds, exit 0
-$ jj-hunk list --format text                     # ... but this is left over
+$ jj-hunk split 'content("WORLD")' "text only"   # succeeds, exit 0
+$ jj-hunk list --format text                     # ... but all of this is left over
 M blob.bin [binary]
+A brand_new_empty.txt
+M config [symlink, whole-file only]
+R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
+M script.sh [mode 100644 -> 100755, not selectable]
 ```
 
 When a selection is meant to cover everything, reach for a predicate from the left column —
-`all() ~ content("...")`, `glob("**")`, or an explicit `{"action": "keep"}` entry. To include a
-binary in a JSON spec use `{"action": "keep"}`; `{"ids": []}` resets it, restoring the parent
-byte-for-byte, and works on symlinks and non-UTF-8 paths too.
+`all()`, `all() ~ content("...")`, `glob("**")`, or `--spec-template`, which names every one of
+them explicitly. To pin one down in a JSON spec use `{"action": "keep"}`; `{"ids": []}` resets it,
+restoring the parent byte-for-byte, and works on symlinks and non-UTF-8 paths too.
 
 ### Decorator-only changes attribute differently per language
 
@@ -583,10 +597,12 @@ Other `list` options:
 mode-only changes, and empty-file adds and removes. `--spec-template` emits `{"action": "keep"}`
 for them (plus `"from"` for a rename or copy), so the template always covers the whole diff.
 
-A **hunkset expression reaches none of those except a binary**, which is the only one given a
-stand-in hunk for predicates to match. `jj-hunk split 'all()'` therefore leaves a symlink, a
-rename, a mode-only flip and an empty add behind, at exit 0. Drive the whole diff from
-`--spec-template` instead.
+A **hunkset expression reaches all of those, but only through a file-level predicate** — each is
+given a stand-in hunk carrying its path and status for `all()`, `file()`, `glob()`, `extension()`,
+`status()` and `~x` to match, and a selected one becomes `{"action": "keep"}`. A *content-level*
+predicate still cannot reach one, so `jj-hunk split 'content("...")'` leaves every symlink, rename,
+mode flip, empty add and binary behind, at exit 0. See
+[Changes with no hunks](#changes-with-no-hunks-half-the-predicates-cannot-see-them).
 
 Paths — in output, in spec keys, and in `file()`/`glob()` — are **relative to the current
 directory**, not the repo root. Running from a subdirectory works, but the paths and therefore the
@@ -794,4 +810,4 @@ main
 - **Watch the matching mode**: `function("x")` is exact. If a query unexpectedly returns nothing, try `substring:"x"` before assuming the hunk isn't there.
 - **Check which verb you are holding**: `diffedit` keeps what you name, `restore` undoes what you name. Re-read [the trap](#the-trap-the-verbs-disagree-about-what-a-named-hunk-means) before either.
 - **`--dry-run` before every `absorb`**, and read the summary line rather than the exit code — a refused rename exits 0.
-- **Do not trust exit 0 to mean "everything moved"**: a `content()`-only selector leaves binary changes behind, silently. Run `list` again afterwards to see what is left.
+- **Do not trust exit 0 to mean "everything moved"**: a `content()`-only selector leaves every hunkless change behind — binaries, symlinks, renames, mode flips, empty adds — silently. Run `list` again afterwards to see what is left.

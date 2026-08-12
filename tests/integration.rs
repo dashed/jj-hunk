@@ -5858,6 +5858,431 @@ fn hunkset_status_and_extension_name_an_added_binary_file() {
 }
 
 // ---------------------------------------------------------------------------
+// hunksets and the rest of the hunkless shapes
+//
+// A binary was only the narrowest instance of the bug the stand-in above was
+// written to stop. Every predicate matches *hunks*, so the other four hunkless
+// shapes -- a retargeted symlink, a mode-only flip, a rename whose text did not
+// move, an empty file added or removed -- could not be named by any expression
+// at all, while the spec that came back still said `default: reset`. `split
+// 'all()'`, which reads as "commit everything", therefore committed a subset
+// and left the rest in the working copy at exit 0.
+//
+// The generalisation is the same trade the binary made: give every hunkless
+// change a stand-in hunk carrying only what a *file-level* predicate reads, so
+// it can be named, and rewrite a selected one into a whole-file action, because
+// its id names nothing `select` could resolve.
+// ---------------------------------------------------------------------------
+
+/// The only way to produce a mode-only change: jj's exec bit is not part of any
+/// hunk, so flipping it is a change with nothing to select inside it.
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+/// The five hunkless shapes in one working copy, in `jj diff --summary` order,
+/// plus the one ordinary edit that shares it.
+#[cfg(unix)]
+const EVERY_SHAPE: [&str; 6] = [
+    "M blob.bin",
+    "A empty-add.txt",
+    "M link",
+    "R {moved.txt => moved_elsewhere.txt}",
+    "M script.sh",
+    "M text.txt",
+];
+
+/// A working copy holding one of every shape at once: five changes no hunk can
+/// express, and one ordinary edit so that a selector always has something real
+/// it could have preferred instead.
+///
+/// The precondition is asserted, not assumed, because two of these shapes are
+/// only what they look like by jj's leave. Rename detection has a similarity
+/// threshold, and a file below it is reported as a delete plus an add -- two
+/// entries that carry their own hunks, so every test here would still pass
+/// while exercising a shape that was never broken. `moved.txt` is renamed with
+/// its bytes untouched, which is as far above the threshold as it goes.
+#[cfg(unix)]
+fn hunkless_shapes_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("text.txt", "line one\n");
+    std::fs::write(repo.path().join("blob.bin"), [0u8, 1, 2, 0, 255, 254]).unwrap();
+    repo.write_file("old-target.txt", "OLD\n");
+    repo.write_file("new-target.txt", "NEW\n");
+    std::os::unix::fs::symlink("old-target.txt", repo.path().join("link")).unwrap();
+    repo.write_file("script.sh", "echo hi\n");
+    repo.write_file("moved.txt", "content that does not move\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("text.txt", "line one\nline two\n");
+    std::fs::write(repo.path().join("blob.bin"), [0u8, 1, 2, 0, 255, 253, 9, 9]).unwrap();
+    std::fs::remove_file(repo.path().join("link")).unwrap();
+    std::os::unix::fs::symlink("new-target.txt", repo.path().join("link")).unwrap();
+    repo.write_file("empty-add.txt", "");
+    std::fs::rename(
+        repo.path().join("moved.txt"),
+        repo.path().join("moved_elsewhere.txt"),
+    )
+    .unwrap();
+    make_executable(&repo.path().join("script.sh"));
+
+    let mut summary = repo.changed_files("@");
+    summary.sort();
+    let mut expected = EVERY_SHAPE.to_vec();
+    expected.sort();
+    assert_eq!(
+        summary, expected,
+        "jj does not see the six shapes this fixture is made of, so every test \
+         built on it would pass for the wrong reason"
+    );
+    repo
+}
+
+/// `jj diff --summary` for a revision, sorted, so a test can name a set rather
+/// than depend on the order jj happens to print.
+fn sorted_changes(repo: &TestRepo, rev: &str) -> Vec<String> {
+    let mut changes = repo.changed_files(rev);
+    changes.sort();
+    changes
+}
+
+/// Everything in `EVERY_SHAPE` except the entries whose text contains one of
+/// `without`.
+#[cfg(unix)]
+fn every_shape_but(without: &[&str]) -> Vec<String> {
+    let mut kept: Vec<String> = EVERY_SHAPE
+        .iter()
+        .filter(|line| !without.iter().any(|drop| line.contains(drop)))
+        .map(|line| line.to_string())
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// The reproduction. `all()` reads as "commit everything" and used to commit
+/// two of six changes -- the binary, which had a stand-in, and the one file
+/// with a real hunk -- leaving a retargeted link, a rename, a mode flip and an
+/// added empty file in the working copy. At exit 0, with no warning, which is
+/// why this asserts on what landed rather than on the status.
+#[cfg(unix)]
+#[test]
+fn hunkset_all_commits_every_hunkless_shape_not_just_the_binary() {
+    let repo = hunkless_shapes_repo("hunkless-all");
+    let expected_blob = std::fs::read(repo.path().join("blob.bin")).unwrap();
+
+    repo.hunk_ok(&["split", "all()", "committed by all()"]);
+
+    let mut expected = EVERY_SHAPE.to_vec();
+    expected.sort();
+    assert_eq!(
+        sorted_changes(&repo, "@-"),
+        expected,
+        "all() committed a subset of the diff"
+    );
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "all() left changes in the working copy: {:?}",
+        repo.changed_files("@")
+    );
+
+    // Contents, not just names: a shape can reach the commit as the wrong
+    // thing. A link is the one that fails silently -- rebuilt as a regular
+    // file holding its target's bytes, it still shows up as `M link`.
+    assert_eq!(repo.file_at("@-", "text.txt"), "line one\nline two\n");
+    let shown = repo.jj(&["file", "show", "-r", "@-", "file:blob.bin"]);
+    assert_eq!(
+        shown.stdout, expected_blob,
+        "the binary did not land byte for byte"
+    );
+    let committed = repo.jj_ok(&["diff", "-r", "@-", "--git"]);
+    assert!(
+        committed.contains("120000") && committed.contains("+new-target.txt"),
+        "the retarget did not reach the commit as a link:\n{committed}"
+    );
+    assert!(
+        committed.contains("100755"),
+        "the exec bit did not reach the commit:\n{committed}"
+    );
+
+    // And the working copy is still the tree the user had, not a rebuild of it.
+    assert_eq!(link_target(&repo, "link"), "new-target.txt");
+    assert!(
+        std::fs::read_to_string(repo.path().join("moved_elsewhere.txt")).is_ok(),
+        "the renamed file is not on disk under its new name"
+    );
+}
+
+/// Each hunkless shape has to be nameable on its own, by each kind of
+/// file-level predicate -- that is the whole point of giving it a stand-in.
+/// Before the fix every one of these matched nothing and was refused as an
+/// empty selection.
+#[cfg(unix)]
+#[test]
+fn a_file_level_predicate_reaches_each_hunkless_shape_on_its_own() {
+    for (expr, expected) in [
+        (r#"file("link")"#, "M link"),
+        (r#"file("script.sh")"#, "M script.sh"),
+        (r#"status("added")"#, "A empty-add.txt"),
+        (r#"glob("moved_*")"#, "R {moved.txt => moved_elsewhere.txt}"),
+    ] {
+        let repo = hunkless_shapes_repo("hunkless-each");
+        repo.hunk_ok(&["split", expr, "one shape"]);
+        assert_eq!(
+            repo.changed_files("@-"),
+            vec![expected],
+            "{expr} did not commit exactly the shape it names"
+        );
+        assert_eq!(
+            sorted_changes(&repo, "@"),
+            every_shape_but(&[expected]),
+            "{expr} took something else with it"
+        );
+    }
+}
+
+/// Negation is the dangerous direction: `~file("text.txt")` reads as "all the
+/// rest", and used to mean the binary alone. The four shapes it silently
+/// dropped are exactly the ones a user asking for "everything but that file"
+/// would never think to check on.
+#[cfg(unix)]
+#[test]
+fn negation_reaches_every_hunkless_shape() {
+    let repo = hunkless_shapes_repo("hunkless-negation");
+
+    repo.hunk_ok(&["split", r#"~file("text.txt")"#, "everything but the text"]);
+
+    assert_eq!(
+        sorted_changes(&repo, "@-"),
+        every_shape_but(&["text.txt"]),
+        "~file() reached only some of the rest"
+    );
+    assert_eq!(repo.changed_files("@"), vec!["M text.txt"]);
+}
+
+/// The guard against a fix that makes the stand-ins too real. A stand-in
+/// carries no text and occupies no line, so a predicate that asks about
+/// content must go on missing it: there are no bytes it ever looked at, and
+/// selecting on a guess is how a link or a rename would ride along with a
+/// selector that never mentioned it.
+///
+/// Preservation guard: it passed before the stand-ins were generalised, when
+/// these shapes were unreachable by *every* predicate, and so cannot have
+/// failed beforehand. Its whole value is in what it forbids next.
+#[cfg(unix)]
+#[test]
+fn content_and_line_predicates_still_cannot_reach_a_hunkless_change() {
+    for expr in [
+        r#"content("line two")"#,
+        r#"added("line two")"#,
+        "lines(1..100000)",
+    ] {
+        let repo = hunkless_shapes_repo("hunkless-content-guard");
+        repo.hunk_ok(&["split", expr, "just the text"]);
+        assert_eq!(
+            repo.changed_files("@-"),
+            vec!["M text.txt"],
+            "{expr} reached a change whose bytes it never saw"
+        );
+        assert_eq!(
+            sorted_changes(&repo, "@"),
+            every_shape_but(&["text.txt"]),
+            "{expr} moved more than the text"
+        );
+    }
+}
+
+/// And the text a stand-in might plausibly have been given -- the link's new
+/// target, the renamed file's contents, the added file's name -- matches
+/// nothing at all. Each of these is a string that exists somewhere in the
+/// change; none of it is in a hunk, so none of it is matchable.
+///
+/// Preservation guard, like the test above: unreachable before and unreachable
+/// after, so it could not have failed beforehand.
+#[cfg(unix)]
+#[test]
+fn no_content_predicate_matches_the_text_surrounding_a_hunkless_change() {
+    // One repo for all of them: an unmatched selector is refused, so nothing
+    // here mutates the working copy.
+    let repo = hunkless_shapes_repo("hunkless-content-none");
+
+    for expr in [
+        r#"content("new-target.txt")"#,
+        r#"added("new-target.txt")"#,
+        r#"removed("old-target.txt")"#,
+        r#"content("content that does not move")"#,
+        r#"removed("content that does not move")"#,
+        r#"added("empty-add.txt")"#,
+    ] {
+        let err = repo.hunk_fail(&["split", expr, "should not match"]);
+        assert!(
+            err.contains("selection matched no hunks"),
+            "{expr} matched a hunkless change: {err}"
+        );
+    }
+    assert_eq!(
+        sorted_changes(&repo, "@"),
+        every_shape_but(&[]),
+        "a refused selector still moved something"
+    );
+}
+
+/// Nor can `id()`. The stand-in's id is deliberately not in `hunk-<hex>` form,
+/// so it is rejected as an argument rather than merely failing to match -- a
+/// hunkless change cannot be selected by an identity it does not have. And
+/// there is no id to copy in the first place: `list` prints none for any of
+/// them.
+///
+/// Preservation guard: before the fix these shapes had no stand-in to be named
+/// by at all, so this could not have failed. It pins the one property of the
+/// stand-in that a later "make `id()` work on it" change would quietly undo.
+#[cfg(unix)]
+#[test]
+fn id_cannot_name_a_hunkless_stand_in() {
+    let repo = hunkless_shapes_repo("hunkless-id");
+
+    let err = repo.hunk_fail(&["split", r#"id("whole-file:link")"#, "no"]);
+    assert!(
+        err.contains("id() does not accept"),
+        "a stand-in's own id was accepted as an argument: {err}"
+    );
+
+    let listed = repo.hunk_ok(&["list", "--format", "text"]);
+    assert_eq!(
+        listed.matches("hunk-").count(),
+        1,
+        "only text.txt has an id to name; the stand-ins must print none:\n{listed}"
+    );
+}
+
+/// `list --spec all()` has to show what the unfiltered listing shows. The
+/// hunkless shapes were visible in `list` but vanished from `list --spec`,
+/// which is the command the docs point at for checking a selector before
+/// running it -- so the check agreed with the bug rather than exposing it.
+#[cfg(unix)]
+#[test]
+fn list_spec_all_shows_every_hunkless_shape_that_plain_list_shows() {
+    let repo = hunkless_shapes_repo("hunkless-list-spec");
+
+    let plain = repo.hunk_ok(&["list", "--format", "text"]);
+    let filtered = repo.hunk_ok(&["list", "--format", "text", "--spec", "all()"]);
+
+    assert_eq!(filtered, plain, "all() hid part of the diff:\n{plain}");
+    for name in [
+        "blob.bin",
+        "empty-add.txt",
+        "link",
+        "moved_elsewhere.txt",
+        "script.sh",
+    ] {
+        assert!(
+            plain.contains(name),
+            "{name} missing from the listing:\n{plain}"
+        );
+    }
+}
+
+/// Selecting a pure rename by expression has to carry its source path, or
+/// `select` looks for the "before" content under the new name, finds nothing,
+/// and writes an empty file where the rename should be.
+#[cfg(unix)]
+#[test]
+fn a_hunkset_selected_rename_carries_its_source_path() {
+    let repo = hunkless_shapes_repo("hunkless-rename-from");
+
+    let spec = repo.hunk_ok(&["list", "--spec", r#"glob("moved_*")"#, "--spec-template"]);
+    assert!(
+        spec.contains("moved.txt"),
+        "the evaluated spec dropped the rename source:\n{spec}"
+    );
+
+    repo.hunk_ok(&["split", r#"glob("moved_*")"#, "just the rename"]);
+    assert_eq!(
+        repo.file_at("@-", "moved_elsewhere.txt"),
+        "content that does not move\n",
+        "the rename landed without its content"
+    );
+}
+
+/// Preservation guard: this passed before the change too, and cannot fail
+/// beforehand. Binaries were the one hunkless shape that already worked, and
+/// generalising the stand-in must leave them exactly as they were -- including
+/// a binary that is *also* renamed, where the whole-file action the stand-in is
+/// rewritten into has to keep carrying `from`.
+#[test]
+fn a_renamed_binary_still_rides_along_with_all() {
+    let repo = TestRepo::new("hunkless-binary-rename");
+    // Large enough that jj's rename detection is in no doubt about it.
+    let bytes: Vec<u8> = (0..400u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(repo.path().join("bin.dat"), &bytes).unwrap();
+    repo.write_file("t.txt", "a\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::rename(repo.path().join("bin.dat"), repo.path().join("moved.dat")).unwrap();
+    repo.write_file("t.txt", "a\nb\n");
+    assert!(
+        repo.changed_files("@")
+            .iter()
+            .any(|l| l.starts_with('R') && l.contains("moved.dat")),
+        "precondition: jj must call this a rename: {:?}",
+        repo.changed_files("@")
+    );
+
+    repo.hunk_ok(&["split", "all()", "everything"]);
+
+    assert_eq!(
+        sorted_changes(&repo, "@-"),
+        vec!["M t.txt", "R {bin.dat => moved.dat}"]
+    );
+    assert!(repo.changed_files("@").is_empty());
+    let shown = repo.jj(&["file", "show", "-r", "@-", "file:moved.dat"]);
+    assert_eq!(
+        shown.stdout, bytes,
+        "the renamed binary did not land byte for byte"
+    );
+}
+
+/// Preservation guard: `--spec-template` reaches these shapes through
+/// `build_spec_template`, a path this change does not touch, and it must go on
+/// naming every one of them. It cannot fail before the fix -- it is here so
+/// that the two ways of covering a whole diff are checked against the same
+/// fixture, and a later narrowing of either is caught.
+#[cfg(unix)]
+#[test]
+fn the_spec_template_still_names_every_hunkless_shape() {
+    let repo = hunkless_shapes_repo("hunkless-template");
+
+    let template = repo.hunk_ok(&["list", "--spec-template"]);
+    for name in [
+        "blob.bin",
+        "empty-add.txt",
+        "link",
+        "moved_elsewhere.txt",
+        "script.sh",
+        "text.txt",
+    ] {
+        assert!(
+            template.contains(name),
+            "--spec-template dropped {name}:\n{template}"
+        );
+    }
+    assert!(
+        template.contains("moved.txt"),
+        "--spec-template dropped the rename source:\n{template}"
+    );
+
+    repo.hunk_ok(&["split", &template, "everything the template names"]);
+    assert!(
+        repo.changed_files("@").is_empty(),
+        "the template left something behind: {:?}",
+        repo.changed_files("@")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the `select` child is this binary
 // ---------------------------------------------------------------------------
 

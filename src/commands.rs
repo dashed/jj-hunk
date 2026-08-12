@@ -401,6 +401,11 @@ where
             continue;
         }
 
+        // Asked before `fh.hunks` is moved out, and asked of `fh` rather than
+        // of the entry below, so that `list` and `evaluate_hunkset` read the
+        // one definition of the question.
+        let hunkless_change = fh.changes_without_hunks();
+
         let mut hunks = fh.hunks;
 
         if let SpecDecision::KeepSelection(selection) = &decision {
@@ -423,7 +428,7 @@ where
         // the hunks away. Everything else here came from `jj diff`, so it is a
         // change by definition, and dropping the ones no hunk can express made
         // them invisible to `list` and to `--spec-template` both.
-        if entry.hunks.is_empty() && !entry.changes_without_hunks() {
+        if entry.hunks.is_empty() && !hunkless_change {
             continue;
         }
 
@@ -627,11 +632,20 @@ pub(crate) fn evaluate_hunkset(
     // instead, each standing in for its whole-file change.
     let file_hunks = load_file_hunks(target, BinaryMode::Mark, truncation)?;
 
+    // A binary was only the narrowest instance of that bug. Every shape
+    // `changes_without_hunks` names has the same two halves -- no hunk to be
+    // matched by, and a real change that `default: reset` will undo -- so
+    // `all()` also meant "all except the symlinks, the renames, the mode flips
+    // and the empty adds", and left every one of them behind at exit 0.
+    //
+    // Computed once, and used again below to rewrite what was selected. Two
+    // separate conditions could disagree, and the way they would fail is a
+    // spec naming stand-in ids that `select` cannot resolve.
     let stand_ins: Vec<(usize, Hunk)> = file_hunks
         .iter()
         .enumerate()
-        .filter(|(_, fh)| fh.is_binary)
-        .map(|(index, fh)| (index, binary_stand_in(fh)))
+        .filter(|(_, fh)| fh.hunks.is_empty() && fh.changes_without_hunks())
+        .map(|(index, fh)| (index, whole_file_stand_in(fh)))
         .collect();
 
     let mut enriched: Vec<EnrichedHunk> = file_hunks
@@ -664,15 +678,18 @@ pub(crate) fn evaluate_hunkset(
         .collect();
     let mut spec = hunkset::to_spec(&selected, &enriched, &rename_sources);
 
-    // A binary file is kept or reset whole, never hunk-wise: `select` rebuilds
-    // a file from text, and a non-UTF-8 file cannot survive that round trip.
-    // The stand-in exists only so a predicate can name the file, and the id it
-    // carries names nothing `select` could resolve, so a selected binary is
-    // rewritten into the same whole-file action `--spec-template` emits for it.
-    for fh in &file_hunks {
-        if !fh.is_binary {
-            continue;
-        }
+    // Each of these is kept or reset whole, never hunk-wise -- a binary cannot
+    // survive `select`'s text round trip, and a link target, an exec bit and a
+    // path are each one atomic value with no half to pick. The stand-in exists
+    // only so a predicate can name the file, and the id it carries names
+    // nothing `select` could resolve, so a selected one is rewritten into the
+    // same whole-file action `--spec-template` emits for it.
+    //
+    // This walks the set the stand-ins were built from, not a second guess at
+    // it: a file given a stand-in and missed here would leave `whole-file:`
+    // ids in the spec, which `select` rejects.
+    for (index, _) in &stand_ins {
+        let fh = &file_hunks[*index];
         if let Some(entry) = spec.files.get_mut(&fh.path) {
             *entry = FileSpec::Action {
                 action: Action::Keep,
@@ -684,26 +701,29 @@ pub(crate) fn evaluate_hunkset(
     serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
 }
 
-/// The one hunk a binary file gets to be named by.
+/// The one hunk a file with no hunks gets to be named by.
 ///
-/// A binary change is atomic -- git models it the same way, as "these two files
-/// differ" and nothing finer -- so the stand-in carries exactly what a
+/// Each such change is atomic -- git models a binary the same way, as "these
+/// two files differ" and nothing finer, and a link target, an exec bit and a
+/// path have no halves either -- so the stand-in carries exactly what a
 /// *file-level* predicate reads: the path and status come from the enclosing
 /// [`EnrichedHunk`], and `type()` reports what happened to the file as a whole.
 /// Everything a *content-level* predicate reads is deliberately empty, so
 /// `content()`, `added()`, `removed()` and `lines()` cannot match a file whose
-/// bytes they were never able to look at.
+/// bytes they were never able to look at. That emptiness is the point: a
+/// stand-in made any more real would start answering questions about text it
+/// never saw.
 ///
 /// The id is not in hunk-id form on purpose. `normalize_hunk_id` only ever
 /// yields `hunk-<hex>`, so no `id()` argument can prefix-match this one, and
 /// the stand-in cannot be selected by an identity it does not really have.
-fn binary_stand_in(file: &FileHunks) -> Hunk {
+fn whole_file_stand_in(file: &FileHunks) -> Hunk {
     let hunk_type = match file.status.as_str() {
         "added" | "copied" => "insert",
         "removed" => "delete",
         _ => "replace",
     };
-    let name = format!("binary-file:{}", file.path);
+    let name = format!("whole-file:{}", file.path);
 
     Hunk {
         index: 0,
@@ -737,6 +757,34 @@ pub(crate) struct FileHunks {
 }
 
 impl FileHunks {
+    /// Whether this file carries a change that no hunk can express, so an
+    /// empty hunk list does not mean "nothing happened here".
+    ///
+    /// Five shapes reach this: binary contents (never split hunk-wise), a
+    /// mode-only flip (jj's exec bit is not part of any hunk), a rename or copy
+    /// of a file whose text did not move (both sides diff identical), an
+    /// empty file added or removed (nothing on either side to diff), and a
+    /// symlink, whose target `jj file show` will not print -- so a link
+    /// retargeted from one path to another diffs empty against empty. All five
+    /// have to stay visible in `list`, be named by `--spec-template`, and be
+    /// reachable by a hunkset expression, because a file none of those reaches
+    /// takes `default: reset` -- which for a rename restores the old path and
+    /// deletes the new one, and for an added empty file deletes it outright.
+    ///
+    /// This lives on `FileHunks` rather than on the `FileEntry` built from it
+    /// because the two callers need it at different points: `list` asks before
+    /// it has an entry, and `evaluate_hunkset` never builds one. Asking the
+    /// loader's own type is the only way the two cannot answer differently,
+    /// and them disagreeing is exactly how a shape goes missing from one verb
+    /// while looking fine in another.
+    fn changes_without_hunks(&self) -> bool {
+        self.is_binary
+            || self.mode.is_some()
+            || self.is_symlink
+            || rename_source(&self.rename, &self.path).is_some()
+            || matches!(self.status.as_str(), "added" | "removed")
+    }
+
     /// All paths associated with this file entry (primary + rename source).
     pub(crate) fn all_paths(&self) -> Vec<&str> {
         let mut paths = vec![self.path.as_str()];
@@ -1344,32 +1392,6 @@ fn rename_source(rename: &Option<RenameInfo>, path: &str) -> Option<String> {
         .as_ref()
         .filter(|r| r.from != path)
         .map(|r| r.from.clone())
-}
-
-impl FileEntry {
-    /// Whether this file carries a change that no hunk can express, so an
-    /// empty hunk list does not mean "nothing happened here".
-    ///
-    /// Five shapes reach this: binary contents (never split hunk-wise), a
-    /// mode-only flip (jj's exec bit is not part of any hunk), a rename or copy
-    /// of a file whose text did not move (both sides diff identical), an
-    /// empty file added or removed (nothing on either side to diff), and a
-    /// symlink, whose target `jj file show` will not print -- so a link
-    /// retargeted from one path to another diffs empty against empty. All five
-    /// have to stay visible in `list` and be named by `--spec-template`,
-    /// because a file the template does not name takes `default: reset` --
-    /// which for a rename restores the old path and deletes the new one, and
-    /// for an added empty file deletes it outright.
-    ///
-    /// The `added | removed` arm already covered a link that appeared or
-    /// vanished, which is why only the retargeted one was ever invisible.
-    fn changes_without_hunks(&self) -> bool {
-        self.binary == Some(true)
-            || self.mode.is_some()
-            || self.symlink == Some(true)
-            || rename_source(&self.rename, &self.path).is_some()
-            || matches!(self.status.as_str(), "added" | "removed")
-    }
 }
 
 fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {

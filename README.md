@@ -399,7 +399,7 @@ M config [symlink, whole-file only]
 R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
 M script.sh [mode 100644 -> 100755, not selectable]
 M text.txt
-  hunk 0 replace hunk-1a94e681 (before 2+1 after 2+1)
+  hunk 0 replace hunk-ac0f7677 (before 2+1 after 2+1)
     - world
     + WORLD
 ```
@@ -420,12 +420,15 @@ Four details worth knowing:
   for a link, so a link pointed at a new target diffs empty against empty and carries no
   hunks at all — `list` marks it `[symlink, whole-file only]`, and `action`/`default` is
   the only way to select it.
-- **A hunkset expression cannot name most of these.** `all()`, `file()` and `glob()`
-  match hunks, and a binary is the only hunkless shape given a stand-in hunk to be
-  matched by. A symlink, a rename, a mode-only flip and an empty add or remove are
-  reachable from a JSON spec but not from a hunkset, so a hunkset-driven verb leaves
-  them behind. Use `--spec-template`, which names every one of them, when a selection is
-  meant to cover the whole diff.
+- **A hunkset expression reaches all of these, but only through a file-level
+  predicate.** Each hunkless change is given a stand-in hunk carrying its path, its
+  status and nothing else, so `all()`, `file()`, `glob()`, `extension()`, `status()` and
+  any negation `~x` can name it — and a selected one is turned into `{"action": "keep"}`,
+  because there is no half of it to take. `content()`, `added()`, `removed()`, `lines()`
+  and `id()` still cannot reach one: the stand-in holds no text and occupies no line, so
+  a content question about a file whose bytes were never diffed goes on being answered
+  "no". A `content()`-only selector therefore still leaves every one of these behind, at
+  exit 0.
 
 ### Renamed files: the `from` field
 
@@ -702,32 +705,42 @@ includes line 20, and `lines(7..7)` selects the hunk on line 7. `depth()` ranges
 The haystack is the hunk's own added and removed lines — not its context, and not the
 rest of the file.
 
-#### Binary files
+#### Changes with no hunks
 
-A binary change has no hunks to look inside, so the predicates split in two. Half of
-them can still name a binary file, and select it whole; the other half can never reach
-one:
+A binary file, a symlink, a mode-only flip, a pure rename or copy, and an added or
+removed empty file all have no hunks to look inside, so the predicates split in two.
+Half of them can still name such a file, and select it whole; the other half can never
+reach one:
 
-| Reach binary files (selected whole) | Never reach them |
-|-------------------------------------|------------------|
+| Reach them (selected whole) | Never reach them |
+|-----------------------------|------------------|
 | `all()`, `file()`, `glob()`, `extension()`, `status()`, and any negation | `content()`, `added()`, `removed()`, `lines()`, `id()` |
 
+The right column is deliberate. Each of these changes gets a stand-in hunk that carries
+only a path and a status, so a file-level question has something to match — and a
+content-level question, asked about bytes that were never diffed, goes on being answered
+"no" rather than guessed at. A link's target and a renamed file's body are in no hunk.
+
 The consequence is worth stating plainly: **a selector built only from `content()` and
-friends leaves every binary change behind.** If a selection is meant to cover the whole
-diff, union in a file-level term — `content("TODO") | extension("png")` — or start from
-`all()` and subtract.
+friends leaves every one of these changes behind.** If a selection is meant to cover the
+whole diff, union in a file-level term — `content("TODO") | ~file("text.txt")` — or start
+from `all()` and subtract.
 
 ```bash
 $ jj-hunk list --spec 'all()' --format text
 M blob.bin [binary]
+A brand_new_empty.txt
+M config [symlink, whole-file only]
+R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
+M script.sh [mode 100644 -> 100755, not selectable]
 M text.txt
-  hunk 0 replace hunk-1a94e681 (before 2+1 after 2+1)
+  hunk 0 replace hunk-ac0f7677 (before 2+1 after 2+1)
     - world
     + WORLD
 
-$ jj-hunk list --spec 'content("WORLD")' --format text   # blob.bin is gone
+$ jj-hunk list --spec 'content("WORLD")' --format text   # the other five are gone
 M text.txt
-  hunk 0 replace hunk-1a94e681 (before 2+1 after 2+1)
+  hunk 0 replace hunk-ac0f7677 (before 2+1 after 2+1)
     - world
     + WORLD
 ```
