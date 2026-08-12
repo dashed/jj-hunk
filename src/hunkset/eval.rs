@@ -258,7 +258,7 @@ fn require_semantic(name: &str) -> Result<(), HunksetError> {
 ///
 /// An explicit `kind:"value"` is never overridden. Silently replacing a kind
 /// the user asked for is how a misunderstood query becomes an empty result.
-fn default_kind(name: &str) -> Option<PatternKind> {
+pub(crate) fn default_kind(name: &str) -> Option<PatternKind> {
     match name {
         "glob" => Some(PatternKind::Glob),
         // Paths and enum-like values name one thing exactly. Substring
@@ -296,8 +296,9 @@ fn compile_args(name: &str, args: &[Arg]) -> Result<Vec<CompiledPattern>, Hunkse
 
 /// Values accepted by the enum-like predicates. A misspelling here would
 /// otherwise select nothing and exit 0.
-const VALID_TYPES: &[&str] = &["insert", "delete", "replace"];
-const VALID_STATUSES: &[&str] = &["modified", "added", "removed", "renamed", "copied"];
+pub(crate) const VALID_TYPES: &[&str] = &["insert", "delete", "replace"];
+pub(crate) const VALID_STATUSES: &[&str] =
+    &["modified", "added", "removed", "renamed", "copied"];
 
 fn validate_enum_args(func: &str, args: &[Arg], valid: &[&str]) -> Result<(), HunksetError> {
     for p in extract_patterns(args) {
@@ -349,7 +350,7 @@ fn warn_if_nothing_analyzed(func: &str, result: &HashSet<usize>, hunks: &[Enrich
 
 /// What shape of arguments a predicate accepts.
 #[derive(PartialEq)]
-enum ArgShape {
+pub(crate) enum ArgShape {
     /// At least one string/pattern argument, no ranges.
     Patterns,
     /// At least one number or range. `lines(2)` is accepted as `2..2`.
@@ -360,7 +361,7 @@ enum ArgShape {
     OptionalPatterns,
 }
 
-fn arg_shape(name: &str) -> ArgShape {
+pub(crate) fn arg_shape(name: &str) -> ArgShape {
     match name {
         "file" | "glob" | "extension" | "status" | "type" | "content" | "added" | "removed"
         | "id" | "function" | "scope" => ArgShape::Patterns,

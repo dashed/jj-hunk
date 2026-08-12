@@ -24,6 +24,13 @@ pub use error::HunksetError;
 pub use eval::{evaluate, to_spec, EnrichedHunk};
 pub use parser::parse;
 
+// Re-exported for `crate::schema`, which describes the language rather than
+// evaluating it. It reads these directly instead of restating them, so a
+// predicate's advertised argument shape and default pattern kind cannot drift
+// from the ones evaluation actually applies.
+pub(crate) use ast::PatternKind;
+pub(crate) use eval::{arg_shape, default_kind, ArgShape, VALID_STATUSES, VALID_TYPES};
+
 /// Returns true if the input *looks like* a hunkset expression rather than
 /// JSON or YAML.
 ///

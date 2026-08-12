@@ -7779,3 +7779,336 @@ fn the_flag_is_accepted_on_either_side_of_the_subcommand() {
         String::from_utf8_lossy(&after.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// jj-hunk schema
+// ---------------------------------------------------------------------------
+//
+// `--help` describes the command line. It cannot describe the hunkset
+// language, and the part of that language most expensive to get wrong -- which
+// predicates can reach a change that produced no hunks -- is invisible until it
+// produces a wrong answer at exit 0. These tests hold the published description
+// against what the binary really does.
+
+/// Parse `jj-hunk schema`, asserting the invariants that hold for every run.
+fn schema_json() -> serde_json::Value {
+    // Deliberately not in a repo: a caller reads the schema to find out how to
+    // talk to this tool, which it may well do before it has a workspace, and
+    // before it has learnt that most subcommands need one.
+    let out = Command::new(jj_hunk_bin())
+        .arg("schema")
+        .current_dir(std::env::temp_dir())
+        .env_remove("JJ_CONFIG")
+        .output()
+        .expect("failed to run jj-hunk schema");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "schema must exit 0 outside a repo: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "schema wrote to stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("schema did not emit JSON on stdout")
+}
+
+fn published_predicate<'a>(schema: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    schema["hunkset"]["predicates"]
+        .as_array()
+        .expect("predicates must be an array")
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("the schema does not publish {name}()"))
+}
+
+/// The output has to be machine-readable without a repo, and the fields a
+/// caller is told to branch on have to be there under those names.
+///
+/// `schema_version` is the one an agent pins: it is bumped when a field is
+/// removed or changes meaning, and left alone when one is added, so a caller
+/// can refuse a shape it does not understand instead of misreading it.
+#[test]
+fn schema_is_json_on_stdout_and_needs_no_repo() {
+    let schema = schema_json();
+
+    assert_eq!(schema["schema_version"], 1);
+    assert_eq!(schema["tool"]["name"], "jj-hunk");
+    assert_eq!(schema["tool"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(schema["hunkset"]["predicates"].is_array());
+    assert!(schema["errors"].is_array());
+    assert!(schema["commands"].is_array());
+}
+
+/// **The claim this feature exists to make, checked against the binary.**
+///
+/// A change that produced no hunks -- here a pure rename -- is reachable by a
+/// file-level predicate and by nothing else. The schema says so in two fields;
+/// this drives the real binary over a real rename and confirms both.
+///
+/// Without this, `class` and `reaches_hunkless_changes` are a comment in a JSON
+/// file. An agent that believed a wrong one would run `split 'content("x")'`,
+/// see exit 0, and never learn that the rename it left behind was reset.
+#[test]
+fn the_class_the_schema_publishes_is_the_one_the_binary_enforces() {
+    let schema = schema_json();
+    let repo = pure_rename_repo("schema-class-split");
+
+    // The rename is in the diff at all -- otherwise everything below is
+    // vacuously true.
+    let everything = listed_paths(&repo, &["list", "--spec", "all"]);
+    assert!(
+        everything.contains(&"dst.txt".to_string()),
+        "the hunkless change is not in the diff: {everything:?}"
+    );
+
+    for name in ["file", "glob", "extension", "status", "type"] {
+        let published = published_predicate(&schema, name);
+        assert_eq!(published["class"], "file", "{name}() is published wrong");
+        assert_eq!(published["reaches_hunkless_changes"], true);
+    }
+    for name in ["content", "added", "removed", "lines", "id"] {
+        let published = published_predicate(&schema, name);
+        assert_eq!(published["class"], "content", "{name}() is published wrong");
+        assert_eq!(published["reaches_hunkless_changes"], false);
+    }
+
+    // A file-level predicate written as widely as it can be: the rename comes
+    // with it.
+    let by_file = listed_paths(&repo, &["list", "--spec", r#"glob("*.txt")"#]);
+    assert!(
+        by_file.contains(&"dst.txt".to_string()),
+        "glob() is published as class file but did not reach the rename: {by_file:?}"
+    );
+
+    // And a content predicate written as widely as it can be -- the empty
+    // substring is inside every string -- still cannot.
+    let by_content = listed_paths(&repo, &["list", "--spec", r#"content("")"#]);
+    assert!(
+        !by_content.is_empty(),
+        "content(\"\") matched nothing at all, so it proves nothing"
+    );
+    assert!(
+        !by_content.contains(&"dst.txt".to_string()),
+        "content() is published as class content but reached the rename: {by_content:?}"
+    );
+
+    // The line predicates were the other half of the same bug: line 0 is inside
+    // 0..N, and a stand-in reports a zero-length range at line 0.
+    let by_lines = listed_paths(&repo, &["list", "--spec", "lines(0..100000)"]);
+    assert!(
+        !by_lines.contains(&"dst.txt".to_string()),
+        "lines() is published as class content but reached the rename: {by_lines:?}"
+    );
+}
+
+/// `build.semantic` must describe the binary that answered, not the binary the
+/// developer happened to build.
+///
+/// CI builds `--no-default-features`, where the eight tree-sitter predicates
+/// are absent. A schema that claimed otherwise would send a caller down a path
+/// that always fails, which is exactly the discovery-by-failure this replaces.
+/// So the claim is checked by asking the same binary to run one.
+#[test]
+fn the_schema_agrees_with_this_build_about_the_semantic_predicates() {
+    let schema = schema_json();
+    let available = schema["build"]["semantic"]
+        .as_bool()
+        .expect("build.semantic must be a boolean");
+
+    for name in [
+        "function",
+        "scope",
+        "annotation",
+        "decorator",
+        "doc",
+        "import",
+        "toplevel",
+        "depth",
+    ] {
+        let published = published_predicate(&schema, name);
+        assert_eq!(published["class"], "semantic", "{name}() is published wrong");
+        assert_eq!(published["available"], available);
+        assert_eq!(published["requires_feature"], "semantic");
+    }
+
+    let repo = pure_rename_repo("schema-semantic-availability");
+    let out = repo.hunk(&["--error-format", "json", "list", "--spec", "doc()"]);
+
+    if available {
+        assert!(
+            out.status.success(),
+            "the schema says semantic predicates work here, but doc() failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    } else {
+        let json: serde_json::Value = serde_json::from_slice(&out.stderr)
+            .expect("a refusal must still be structured on stderr");
+        assert_eq!(
+            json["code"], "SEMANTIC_FEATURE_REQUIRED",
+            "the schema says semantic predicates are unavailable here, so doc() must say why"
+        );
+    }
+}
+
+/// Every code the binary actually emits is one the schema listed up front.
+///
+/// The point of publishing the list is that a caller can write its retry logic
+/// before it has ever seen a failure. That only holds if the list is complete:
+/// a code met at runtime and absent from the schema falls into the caller's
+/// "unknown failure" branch, which is the prose-matching fallback the codes
+/// exist to retire. Triggering them is also how a caller would otherwise have
+/// to find them, and for the mutating verbs that means doing it to a real
+/// revision.
+#[test]
+fn every_error_code_the_binary_emits_is_one_the_schema_published() {
+    let schema = schema_json();
+    let published: Vec<&str> = schema["errors"]
+        .as_array()
+        .expect("errors must be an array")
+        .iter()
+        .map(|e| e["code"].as_str().expect("a code is a string"))
+        .collect();
+    assert!(
+        published.contains(&"UNKNOWN"),
+        "the catch-all code must be published, or a caller has no branch for an uncoded failure"
+    );
+
+    let repo = error_repo("schema-error-codes");
+    for spec in [
+        "nosuchpred()",
+        "type(insert",
+        r#"status("nope")"#,
+        r#"glob(regex:"[")"#,
+        r#"id("hunk-deadbeef")"#,
+    ] {
+        let json = error_json(&repo, &["list", "--spec", spec]);
+        let code = json["code"].as_str().expect("every failure carries a code");
+        assert!(
+            published.contains(&code),
+            "{spec:?} failed with {code}, which `schema` does not publish: {published:?}"
+        );
+        assert_ne!(
+            code, "UNKNOWN",
+            "{spec:?} is a selection error and should carry a specific code"
+        );
+    }
+}
+
+/// The command list is generated from clap's own view of the parser, so a
+/// renamed flag or a new subcommand cannot leave a stale entry. This proves the
+/// generation is wired to the real parser rather than to a copy of it.
+///
+/// It stays deliberately shallow: flags, arity and defaults are in `--help`,
+/// which clap builds from the same definitions. What `--help` does not answer
+/// in one read is which verbs take a hunkset at all.
+#[test]
+fn the_published_commands_are_the_ones_the_binary_accepts() {
+    let schema = schema_json();
+    let commands = schema["commands"]
+        .as_array()
+        .expect("commands must be an array");
+
+    let help = String::from_utf8_lossy(
+        &Command::new(jj_hunk_bin())
+            .arg("--help")
+            .output()
+            .expect("failed to run jj-hunk --help")
+            .stdout,
+    )
+    .to_string();
+
+    for command in commands {
+        let name = command["name"].as_str().expect("a name is a string");
+        assert!(
+            help.contains(name),
+            "the schema publishes {name}, which --help does not list"
+        );
+    }
+
+    let named: Vec<&str> = commands
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(named.contains(&"schema"), "schema must describe itself too");
+
+    let accepts_selection = |name: &str| {
+        commands
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not published"))["accepts_selection"]
+            == serde_json::Value::Bool(true)
+    };
+    assert!(accepts_selection("split"), "split takes a hunkset");
+    assert!(accepts_selection("list"), "list filters with --spec");
+    assert!(
+        !accepts_selection("select"),
+        "select is the merge-tool hop and reads its selection from the environment"
+    );
+}
+
+/// Argument facts are read off the evaluator rather than restated, and these
+/// are the two that silently cost a caller a whole selection when guessed.
+///
+/// A misspelled `status()` or `type()` value would select nothing at exit 0 if
+/// it were not rejected, so the closed value sets are the most useful thing in
+/// the output after the class split. The default pattern kind is next:
+/// `added(TODO)` is a substring match while `file(src/a.rs)` is an equality
+/// one, and getting that backwards is an empty result rather than an error.
+#[test]
+fn the_schema_publishes_the_argument_facts_that_are_silent_when_guessed_wrong() {
+    let schema = schema_json();
+    let repo = error_repo("schema-argument-facts");
+
+    for (name, expected) in [
+        (
+            "status",
+            vec!["modified", "added", "removed", "renamed", "copied"],
+        ),
+        ("type", vec!["insert", "delete", "replace"]),
+    ] {
+        let values: Vec<&str> = published_predicate(&schema, name)["values"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}() must publish its value set"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(values, expected);
+
+        // Every published value is one the binary really takes, and one that is
+        // not published is refused rather than quietly matching nothing.
+        for value in &values {
+            repo.hunk_ok(&["list", "--spec", &format!(r#"{name}("{value}")"#)]);
+        }
+        let json = error_json(&repo, &["list", "--spec", &format!(r#"{name}("nope")"#)]);
+        assert_eq!(json["code"], "INVALID_ARGUMENT");
+    }
+
+    assert_eq!(
+        published_predicate(&schema, "file")["default_pattern_kind"],
+        "exact"
+    );
+    assert_eq!(
+        published_predicate(&schema, "glob")["default_pattern_kind"],
+        "glob"
+    );
+    assert_eq!(
+        published_predicate(&schema, "content")["default_pattern_kind"],
+        "substring"
+    );
+
+    // `id()` resolves its argument instead of matching with it, so it is the
+    // one predicate that does not take the whole prefix set.
+    let prefixes: Vec<&str> = published_predicate(&schema, "id")["pattern_prefixes"]
+        .as_array()
+        .expect("id() publishes its prefixes")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(prefixes, vec!["exact"]);
+    let json = error_json(&repo, &["list", "--spec", r#"id(substring:"abcd")"#]);
+    assert_eq!(json["code"], "INVALID_ARGUMENT");
+}

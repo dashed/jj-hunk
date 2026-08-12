@@ -46,12 +46,22 @@ Error: hunkset evaluation error: function() requires the 'semantic' feature (bui
 it and `--features semantic` is redundant. You only see that error from a deliberate
 `--no-default-features` build; reinstall without that flag to get it back.
 
-Everything else — `file`, `glob`, `extension`, `status`, `type`, `lines`, `content`, `added`,
-`removed`, `id`, `all`, `none`, and the whole JSON/YAML spec format — works in any build.
+Everything else — `file`, `glob`, `extension`, `status`, `type`, `lines`, `before_line`,
+`after_line`, `content`, `added`, `removed`, `id`, `all`, `none`, and the whole JSON/YAML spec
+format — works in any build.
+
+To find out which build you have without provoking that error, ask:
+
+```bash
+jj-hunk schema | jq .build.semantic   # true or false, exit 0 either way
+```
 
 ## Quick Start
 
 ```bash
+# Describe the query language, error codes and verbs as JSON (no repo needed)
+jj-hunk schema
+
 # See what hunks exist in your changes
 jj-hunk list
 
@@ -104,6 +114,7 @@ cat spec.json | jj-hunk commit - "bug fix"
 | Command | Description |
 |---------|-------------|
 | `jj-hunk list [options]` | List hunks, files, or spec templates |
+| `jj-hunk schema` | Describe the hunkset language, error codes and verbs as JSON |
 | `jj-hunk split [-r rev] <spec> <message>` | Split changes into two commits |
 | `jj-hunk commit <spec> <message>` | Commit selected hunks |
 | `jj-hunk squash [-r rev] <spec>` | Squash selected hunks into parent |
@@ -442,6 +453,14 @@ Four details worth knowing:
   `content("")` and `lines(0..N)` are true of it. A `content()`-only selector therefore
   still leaves every one of these behind, at exit 0.
 
+That last split is published as data, so a selector can be checked before it is run rather than
+after — see [Schema](#schema):
+
+```bash
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.reaches_hunkless_changes) | .name'
+# file glob extension status type
+```
+
 ### Renamed files: the `from` field
 
 A file entry for a renamed or copied file carries an extra `from` field naming its source path. It
@@ -623,6 +642,106 @@ A **hunkset** expression is different: `id()` resolves as it evaluates, so
 `list --spec 'id(hunk-deadbeef)'` *does* error. So `list --spec` validates a hunkset but not a JSON
 spec — to check a JSON spec before writing, run the verb with `--dry-run` where available, or accept
 that an empty listing is ambiguous between "matched nothing" and "names nothing real".
+
+## Schema
+
+`jj-hunk schema` prints one JSON object describing the hunkset language, the error codes and the
+verbs. It exits 0, writes nothing to stderr, and does not need a jj repo — a caller can read it
+before it has a workspace.
+
+```bash
+jj-hunk schema
+jj-hunk schema | jq .build.semantic
+```
+
+`--help` describes the command line. It cannot describe the hunkset language, and the part of that
+language most expensive to get wrong is invisible until it produces a wrong answer at exit 0: which
+predicates can reach a change that produced **no hunks** — a binary, a retargeted symlink, a
+mode-only flip, a pure rename, an empty add. `split 'content("x")'` in a diff containing a rename
+leaves the rename behind and says nothing. `reaches_hunkless_changes` states that up front.
+
+Everything in the output is generated from the code that implements it: argument shapes from the
+validation pass, default pattern kinds from the pass that applies them, the `status()`/`type()`
+value sets from the constants those are checked against, availability from the build's own cargo
+features, the error codes from their declarations, and the command list from clap's parser. The
+remaining facts — which predicates exist, and which reach a hunkless change — are held against the
+evaluator by tests that run every predicate over a real hunk and a hunkless change and compare.
+
+### Shape
+
+```jsonc
+{
+  "schema_version": 1,               // bumped on a breaking change; new fields do not bump it
+  "tool":   { "name": "jj-hunk", "version": "0.4.1-my-jj-hunk" },
+  "build":  { "semantic": true, "features": ["semantic"] },
+  "hunkset": {
+    "classes":          [ /* file / content / semantic, and what each reaches */ ],
+    "pattern_prefixes": [ "exact", "substring", "glob", "regex" ],
+    "operators":        [ /* |, &, ~ infix, ~ prefix */ ],
+    "constants":        [ /* all, none */ ],
+    "predicates":       [ /* 20 entries */ ]
+  },
+  "errors":   [ { "code": "UNKNOWN_ID", "category": "selection" } ],
+  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true } ]
+}
+```
+
+A predicate entry:
+
+```json
+{
+  "name": "content",
+  "class": "content",
+  "reaches_hunkless_changes": false,
+  "arity": "one_or_more",
+  "argument": "pattern",
+  "pattern_prefixes": ["exact", "substring", "glob", "regex"],
+  "default_pattern_kind": "substring",
+  "available": true,
+  "summary": "Match a hunk whose added or removed text matches. Defaults to substring matching."
+}
+```
+
+| Field | Values | Means |
+|-------|--------|-------|
+| `class` | `file`, `content`, `semantic` | The coarse grouping. **`semantic` is a kind of `content`**: it does not reach a hunkless change either |
+| `reaches_hunkless_changes` | `true`/`false` | Whether *any* argument makes this predicate select a change with no hunks. The one field worth branching on |
+| `arity` | `none`, `one_or_more`, `zero_or_more` | `zero_or_more` is `annotation()`/`decorator()`, where no argument means "has any" |
+| `argument` | `pattern`, `number_or_range`, `none` | What the argument is |
+| `pattern_prefixes` | subset of the four | Which `kind:"value"` prefixes are meaningful. Empty for numeric arguments; `["exact"]` for `id()`, which resolves its argument rather than matching with it |
+| `default_pattern_kind` | one of the four, omitted when there is none | What an unprefixed argument means: `file(a.rs)` is exact, `added(TODO)` is a substring |
+| `values` | present only on `status()` and `type()` | The closed set. A value outside it is an error, not an empty result |
+| `available` | `true`/`false` | False in a build missing `requires_feature`, where the predicate fails with `SEMANTIC_FEATURE_REQUIRED` |
+| `requires_feature` | `"semantic"`, or absent | The cargo feature this predicate needs |
+
+`schema_version` is what a caller pins. It is bumped when a field is removed, renamed, or changes
+meaning, and **not** bumped when a field, predicate, error code or command is added — so a caller
+that ignores unknown keys keeps working across additions.
+
+### What it deliberately leaves out
+
+There is no per-flag command schema. `commands[]` is an index — name, one-line summary, whether the
+verb takes a hunkset, whether it has `--allow-empty` — and nothing more. Flags, arity and defaults
+are in `--help`, which clap generates from the same definitions and which therefore cannot drift
+either; restating them here would double the output to say what is already available. What `--help`
+does not answer in a single read is which verbs take a hunkset at all.
+
+### Recipes
+
+```bash
+# Predicates that carry a rename or a binary along with a selection
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.reaches_hunkless_changes) | .name'
+# file glob extension status type
+
+# Valid status() values, rather than guessing "deleted" and selecting nothing
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.name=="status") | .values[]'
+
+# Predicates missing from this build
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.available|not) | .name'
+
+# Every error code, for a retry table written before anything fails
+jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
+```
 
 ## Hunkset Query Language
 
@@ -1095,6 +1214,13 @@ this feature existed.
 `code`, never on `message`: the ambiguity, empty-selection and unresolved-path wordings have each
 been rewritten within the last few releases, and a caller matching their text would have broken
 three times.
+
+The table below is prose. `jj-hunk schema` carries the same list as data, generated from the
+declarations themselves, so a retry table can be built before anything has failed:
+
+```bash
+jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
+```
 
 | `code` | Raised when | `details` carries | What to do about it |
 |--------|-------------|-------------------|---------------------|

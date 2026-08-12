@@ -64,17 +64,24 @@ Error: hunkset evaluation error: function() requires the 'semantic' feature (bui
 
 If you see that, you are on a `--no-default-features` build — `semantic` is on by default
 here, so reinstall without that flag. Every other predicate
-(`file`, `glob`, `extension`, `status`, `type`, `lines`, `content`, `added`, `removed`, `id`,
-`all`, `none`) works in any build.
+(`file`, `glob`, `extension`, `status`, `type`, `lines`, `before_line`, `after_line`, `content`,
+`added`, `removed`, `id`, `all`, `none`) works in any build.
+
+You do not have to provoke the error to find out which build you are on:
+
+```bash
+jj-hunk schema | jq .build.semantic   # true or false, exit 0 either way
+```
 
 ## Commands
 
-Eight subcommands. `list` is read-only, `select` is plumbing that `jj` invokes, and the other six
-rewrite history.
+Nine subcommands. `list` and `schema` are read-only, `select` is plumbing that `jj` invokes, and the
+other six rewrite history.
 
 | Command | What it does |
 |---------|--------------|
 | `list` | Show the hunks in a diff. Read-only — the only one safe to run speculatively |
+| `schema` | Describe the hunkset language, the error codes and the verbs as JSON. Read-only, and works outside a repo |
 | `split <spec> <msg>` | Move the selected hunks into a new commit |
 | `commit <spec> <msg>` | Commit the selected hunks |
 | `squash <spec>` | Move the selected hunks into the parent |
@@ -171,6 +178,94 @@ there is.
 An absorb that can route nothing is **not an error**. It prints `Nothing to absorb: every hunk
 stays in <rev>.` and exits **0**, so an agent checking only the exit code will read a refused
 rename as success. Check the summary line, not the status.
+
+## Ask the binary: `jj-hunk schema`
+
+The query language reference that follows is prose, and prose goes stale. `jj-hunk schema` is the
+same information as JSON, generated from the code that implements it, and it costs one read:
+
+```bash
+jj-hunk schema                      # one JSON object on stdout, exit 0, no repo needed
+```
+
+Reach for it before writing a selector you cannot easily verify, and whenever you need to know
+something about *this* binary rather than about jj-hunk in general. Three questions it answers that
+`--help` cannot:
+
+1. **Can this predicate reach a change with no hunks?** `reaches_hunkless_changes`. Getting this
+   wrong is a wrong answer at exit 0 — see [Changes with no hunks](#changes-with-no-hunks-half-the-predicates-cannot-see-them).
+2. **Is this a `semantic` build?** `build.semantic`, and `available` per predicate. The alternative
+   is running a tree-sitter predicate and reading the failure.
+3. **What can fail, and how do I branch on it?** `errors[]` is the complete code list, so retry
+   logic can be written before anything has failed.
+
+### Shape
+
+```jsonc
+{
+  "schema_version": 1,               // bumped on a breaking change; new fields do not bump it
+  "tool":   { "name": "jj-hunk", "version": "0.4.1-my-jj-hunk" },
+  "build":  { "semantic": true, "features": ["semantic"] },
+  "hunkset": {
+    "classes":          [ { "name": "file", "reaches_hunkless_changes": true, "description": "..." } ],
+    "pattern_prefixes": [ "exact", "substring", "glob", "regex" ],
+    "operators":        [ { "symbol": "~", "position": "prefix", "name": "negation", "description": "..." } ],
+    "constants":        [ { "name": "all", "reaches_hunkless_changes": true, "summary": "..." } ],
+    "predicates":       [ /* 20 entries, see below */ ]
+  },
+  "errors":   [ { "code": "UNKNOWN_ID", "category": "selection" } ],
+  "commands": [ { "name": "split", "summary": "...", "accepts_selection": true, "has_allow_empty": true } ]
+}
+```
+
+A predicate entry, in full:
+
+```json
+{
+  "name": "content",
+  "class": "content",
+  "reaches_hunkless_changes": false,
+  "arity": "one_or_more",
+  "argument": "pattern",
+  "pattern_prefixes": ["exact", "substring", "glob", "regex"],
+  "default_pattern_kind": "substring",
+  "available": true,
+  "summary": "Match a hunk whose added or removed text matches. Defaults to substring matching."
+}
+```
+
+| Field | Values | Read it for |
+|-------|--------|-------------|
+| `class` | `file`, `content`, `semantic` | The coarse grouping. **`semantic` is a kind of `content`** — it never reaches a hunkless change either |
+| `reaches_hunkless_changes` | `true`/`false` | The load-bearing fact. `false` means no argument makes this predicate select a binary, a pure rename, a mode-only flip, a retargeted symlink or an empty add |
+| `arity` | `none`, `one_or_more`, `zero_or_more` | `zero_or_more` is `annotation()`/`decorator()`, where no argument means "has any" |
+| `argument` | `pattern`, `number_or_range`, `none` | |
+| `pattern_prefixes` | subset of the four | Empty for numeric arguments. `["exact"]` for `id()`, which resolves its argument rather than matching with it |
+| `default_pattern_kind` | one of the four, absent when there is none | What an unprefixed argument means. `file(a.rs)` is exact, `added(TODO)` is a substring |
+| `values` | present only for `status()` and `type()` | The closed set. A value outside it is an error, not an empty result |
+| `available` | `true`/`false` | False in a build missing `requires_feature` |
+
+### Recipes
+
+```bash
+# Which predicates can carry a rename or a binary along with a selection?
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.reaches_hunkless_changes) | .name'
+# file glob extension status type
+
+# Is this a semantic build, without provoking an error?
+jj-hunk schema | jq .build.semantic
+
+# The valid status() values, rather than guessing "deleted" and selecting nothing
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.name=="status") | .values[]'
+
+# Every error code, for a retry table written up front
+jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
+```
+
+`schema` describes the language, not the flags — for those, `--help` is generated from the same
+definitions and cannot drift either. What it deliberately does *not* carry is a per-flag command
+schema: `commands[]` is an index (name, one-line summary, whether the verb takes a hunkset, whether
+it has `--allow-empty`) and `jj-hunk <verb> --help` has the rest.
 
 ## Hunkset Query Language
 
@@ -398,6 +493,13 @@ R moved_elsewhere.txt (moved.txt -> moved_elsewhere.txt)
 M script.sh [mode 100644 -> 100755, not selectable]
 ```
 
+The same split is machine-readable, so a query can be checked before it is run rather than after:
+
+```bash
+jj-hunk schema | jq -r '.hunkset.predicates[] | select(.reaches_hunkless_changes) | .name'
+# file glob extension status type
+```
+
 When a selection is meant to cover everything, reach for a predicate from the left column —
 `all()`, `all() ~ content("...")`, `glob("**")`, or `--spec-template`, which names every one of
 them explicitly. To pin one down in a JSON spec use `{"action": "keep"}`; `{"ids": []}` resets it,
@@ -577,6 +679,13 @@ this feature existed.
 `code`, never on `message`: the ambiguity, empty-selection and unresolved-path wordings have each
 been rewritten within the last few releases, and a caller matching their text would have broken
 three times.
+
+The table below is prose. `jj-hunk schema` carries the same list as data, generated from the
+declarations themselves, so a retry table can be built before anything has failed:
+
+```bash
+jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
+```
 
 | `code` | Raised when | `details` carries | What to do about it |
 |--------|-------------|-------------------|---------------------|

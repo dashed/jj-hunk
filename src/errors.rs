@@ -97,6 +97,35 @@ pub const PATH_OUTSIDE_WORKSPACE: ErrorCode =
 /// caller loses nothing it had before -- but it should not branch on this.
 pub const UNKNOWN: ErrorCode = ErrorCode::new("internal", "UNKNOWN");
 
+/// Every code above, in the order `jj-hunk schema` reports them.
+///
+/// A caller that knows the whole set up front can write its retry logic
+/// without discovering codes by triggering them -- which, for the mutating
+/// verbs, means triggering them on a real revision.
+///
+/// This list is the one place the set is written down: the distinctness test
+/// below reads it, `crate::schema` publishes it, and a test in that module
+/// fails if a `pub const ... : ErrorCode` in this file is missing from it. The
+/// hand-maintained copy that used to live in that test had already fallen a
+/// code behind by the time this replaced it.
+pub const ALL: &[ErrorCode] = &[
+    PARSE_ERROR,
+    UNKNOWN_FUNCTION,
+    INVALID_ARGUMENT,
+    INVALID_GLOB,
+    INVALID_REGEX,
+    UNKNOWN_ID,
+    AMBIGUOUS_ID,
+    SEMANTIC_FEATURE_REQUIRED,
+    EMPTY_SELECTION,
+    PATH_NOT_IN_DIFF,
+    REVSET_UNRESOLVED,
+    REVSET_AMBIGUOUS,
+    TRUNCATED_SPEC_TEMPLATE,
+    PATH_OUTSIDE_WORKSPACE,
+    UNKNOWN,
+];
+
 /// A failure that knows its own code.
 ///
 /// The alternative was to recognise failures at the top level by their
@@ -281,25 +310,30 @@ mod tests {
 
     /// Two codes that differ only by category would be indistinguishable to a
     /// caller keying on `code` alone, which is what callers are told to do.
+    ///
+    /// Reads [`ALL`] rather than its own copy of the list. The copy it used to
+    /// keep had already gone stale -- `PATH_OUTSIDE_WORKSPACE` was added a
+    /// commit earlier and never reached it -- so the test was silently checking
+    /// fourteen of the fifteen codes it claimed to.
     #[test]
     fn every_code_string_is_distinct() {
-        let all = [
-            PARSE_ERROR,
-            UNKNOWN_FUNCTION,
-            INVALID_ARGUMENT,
-            INVALID_GLOB,
-            INVALID_REGEX,
-            UNKNOWN_ID,
-            AMBIGUOUS_ID,
-            SEMANTIC_FEATURE_REQUIRED,
-            EMPTY_SELECTION,
-            PATH_NOT_IN_DIFF,
-            REVSET_UNRESOLVED,
-            REVSET_AMBIGUOUS,
-            TRUNCATED_SPEC_TEMPLATE,
-            UNKNOWN,
-        ];
-        let unique: std::collections::HashSet<&str> = all.iter().map(|c| c.code).collect();
-        assert_eq!(unique.len(), all.len());
+        let unique: std::collections::HashSet<&str> = ALL.iter().map(|c| c.code).collect();
+        assert_eq!(unique.len(), ALL.len());
+    }
+
+    /// A category is a coarse bucket, not a free-form label. Five spellings of
+    /// "selection" would make the field useless for grouping, which is the only
+    /// thing it is for.
+    #[test]
+    fn categories_come_from_a_small_fixed_set() {
+        const KNOWN: &[&str] = &["parse", "selection", "revset", "usage", "internal"];
+        for code in ALL {
+            assert!(
+                KNOWN.contains(&code.category),
+                "{} has category {:?}, which is not one of {KNOWN:?}",
+                code.code,
+                code.category
+            );
+        }
     }
 }

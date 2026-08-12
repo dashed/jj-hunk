@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 mod absorb;
 mod diff;
@@ -10,6 +10,7 @@ mod glob;
 mod hunkset;
 mod spec;
 mod commands;
+mod schema;
 
 use absorb::{AbsorbOptions, InsertionPolicy};
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
@@ -55,6 +56,17 @@ struct Cli {
 enum Commands {
     /// List hunks in current changes
     List(ListArgs),
+
+    /// Describe the hunkset language, the error codes and the verbs as JSON
+    //
+    // A subcommand rather than a `--describe` flag. The thing being described
+    // is the query language, not any one command, so a flag would have to hang
+    // off the top level -- which means making the subcommand optional, and a
+    // bare `jj-hunk` would stop being a usage error. It is also the spelling an
+    // agent reaches for first, next to `list`, and it can grow its own
+    // arguments later without adding a global flag every subcommand's help has
+    // to carry.
+    Schema,
 
     /// Select hunks (called by jj --tool)
     Select {
@@ -264,6 +276,7 @@ fn run(cli: Cli) -> Result<()> {
 
             commands::list(options)
         }
+        Commands::Schema => schema::schema(&Cli::command()),
         Commands::Select { left, right } => commands::select(&left, &right),
         Commands::Split {
             spec,
