@@ -192,6 +192,28 @@ the whole expression.
 `status()` takes a bare identifier, not a string. A deleted file is `removed` (there is no
 `deleted`); an invalid value is rejected with the list of valid ones.
 
+**A renamed or copied file matches either of its paths.** `file()`, `glob()` and `extension()`
+reach it by where it is now *and* by where it came from, which is what `--include` / `--exclude`
+have always done:
+
+```bash
+jj-hunk list --spec 'file("secret/keys.txt")'   # the path it was renamed from
+jj-hunk list --spec 'file("exposed.txt")'       # the path it has now
+```
+
+The old path is the point: it is the name you have when you are looking for what used to be
+somewhere. Three consequences:
+
+- `~glob("secret/*")` **drops** a file renamed out of `secret/` — the diff still spells
+  `secret/keys.txt` on its left side, so keeping it handed you what you excluded.
+- `extension()` matches both sides of a rename that changed the extension: `mod.txt` → `mod.rs`
+  answers to `extension("rs")` and to `extension("txt")`.
+- Matching only. The spec is still keyed by the **new** path with the old one in `from` — that is
+  the path `select` resolves a file by.
+
+Only when jj reports a rename or copy. A move too large for jj's rename detection is an ordinary
+add plus delete, and each path names its own change.
+
 **Hunk type:**
 
 | Function | Description |
@@ -709,6 +731,9 @@ Key the entry under the **new** name. Using the old one is an error that names t
 Error: spec does not resolve against the diff:
   old.txt: renamed to new.txt in this diff -- file the entry under new.txt instead
 ```
+
+Two names for matching, one for keying: a hunkset expression may *select* the file by its old path,
+but the spec it produces is always keyed by the new one.
 
 ## Direct jj --tool Usage
 

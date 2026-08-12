@@ -648,20 +648,29 @@ pub(crate) fn evaluate_hunkset(
         .map(|(index, fh)| (index, whole_file_stand_in(fh)))
         .collect();
 
+    // The rename source rides along so that `file()`, `glob()` and
+    // `extension()` can name a change by the path it moved *from*, which is
+    // what `--include`/`--exclude` have always done through
+    // `FileHunks::all_paths`. Same accessor on both sides, so the two cannot
+    // answer "which files does this pattern name?" differently again.
     let mut enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
         .flat_map(|fh| {
             fh.hunks
                 .iter()
-                .map(move |hunk| EnrichedHunk::real(&fh.path, &fh.status, hunk))
+                .map(move |hunk| EnrichedHunk::real(&fh.path, fh.rename_source(), &fh.status, hunk))
         })
         .collect();
     // `stand_in`, not `real`, and that is the whole of the content-level
     // guarantee: the evaluator declines to show a stand-in's text to
     // `content()`, `added()`, `removed()`, `lines()` and `id()` because it is
     // told which entries are stand-ins, not because their text is empty.
+    // A pure rename *is* a stand-in -- it produces no hunks at all -- so this
+    // is the entry that has to carry both paths, or `file("<old name>")` still
+    // could not reach the one change where the old name is all you have.
     enriched.extend(stand_ins.iter().map(|(index, hunk)| {
-        EnrichedHunk::stand_in(&file_hunks[*index].path, &file_hunks[*index].status, hunk)
+        let fh = &file_hunks[*index];
+        EnrichedHunk::stand_in(&fh.path, fh.rename_source(), &fh.status, hunk)
     }));
 
     let selected = hunkset::evaluate(&ast, &enriched)
@@ -669,12 +678,7 @@ pub(crate) fn evaluate_hunkset(
 
     let rename_sources: HashMap<&str, &str> = file_hunks
         .iter()
-        .filter_map(|fh| {
-            fh.rename
-                .as_ref()
-                .filter(|r| r.from != fh.path)
-                .map(|r| (fh.path.as_str(), r.from.as_str()))
-        })
+        .filter_map(|fh| fh.rename_source().map(|from| (fh.path.as_str(), from)))
         .collect();
     let mut spec = hunkset::to_spec(&selected, &enriched, &rename_sources);
 
@@ -791,18 +795,30 @@ impl FileHunks {
         self.is_binary
             || self.mode.is_some()
             || self.is_symlink
-            || rename_source(&self.rename, &self.path).is_some()
+            || self.rename_source().is_some()
             || matches!(self.status.as_str(), "added" | "removed")
+    }
+
+    /// The path this file had on the left side of the diff, when a rename or a
+    /// copy moved it. `None` when the two sides agree.
+    ///
+    /// The one definition of "the other name this file goes by", because three
+    /// separate spellings of `rename.from != path` is three chances for them to
+    /// drift: `--include`/`--exclude` filter through `all_paths` below, the
+    /// spec carries it as `from:`, and the hunkset predicates match on it via
+    /// `EnrichedHunk::all_paths`. Those had already drifted once -- the hunkset
+    /// predicates simply did not have it -- which is the gap this closed.
+    pub(crate) fn rename_source(&self) -> Option<&str> {
+        self.rename
+            .as_ref()
+            .filter(|r| r.from != self.path)
+            .map(|r| r.from.as_str())
     }
 
     /// All paths associated with this file entry (primary + rename source).
     pub(crate) fn all_paths(&self) -> Vec<&str> {
         let mut paths = vec![self.path.as_str()];
-        if let Some(rename) = &self.rename {
-            if rename.from != self.path {
-                paths.push(&rename.from);
-            }
-        }
+        paths.extend(self.rename_source());
         paths
     }
 }

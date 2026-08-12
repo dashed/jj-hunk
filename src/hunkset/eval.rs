@@ -16,7 +16,24 @@ use super::pattern::{compile_patterns, CompiledPattern};
 /// what keeps the two apart.
 #[derive(Debug)]
 pub struct EnrichedHunk<'a> {
+    /// Where the file is *now* -- the right-hand side of the diff.
+    ///
+    /// This is the file's identity: it keys the spec, names the file in an
+    /// error message, and is the only path `select` can resolve. A path
+    /// *predicate* matches more broadly than this (see [`Self::all_paths`]),
+    /// but nothing that has to name the file may read anything else.
     pub file_path: &'a str,
+    /// Where the file was on the left-hand side, when a rename or a copy moved
+    /// it. `None` when the two sides agree, which is every other change.
+    ///
+    /// Required rather than defaulted, because the bug this closed was two
+    /// code paths answering "which files does this pattern name?" differently.
+    /// A builder that could be left off would rebuild that gap one new
+    /// construction site later, and it would be invisible: the predicate would
+    /// simply stop matching the old path, at exit 0, and the file would fall
+    /// through to `default: reset`, which for a rename restores the old path
+    /// and deletes the new one.
+    rename_source: Option<&'a str>,
     pub file_status: &'a str,
     /// Private, and reachable only through the accessors below.
     ///
@@ -30,9 +47,15 @@ pub struct EnrichedHunk<'a> {
 
 impl<'a> EnrichedHunk<'a> {
     /// An entry for a hunk the differ really produced.
-    pub fn real(file_path: &'a str, file_status: &'a str, hunk: &'a Hunk) -> Self {
+    pub fn real(
+        file_path: &'a str,
+        rename_source: Option<&'a str>,
+        file_status: &'a str,
+        hunk: &'a Hunk,
+    ) -> Self {
         Self {
             file_path,
+            rename_source,
             file_status,
             hunk,
             is_stand_in: false,
@@ -40,13 +63,43 @@ impl<'a> EnrichedHunk<'a> {
     }
 
     /// An entry for a change with no hunks, standing in for the whole file.
-    pub fn stand_in(file_path: &'a str, file_status: &'a str, hunk: &'a Hunk) -> Self {
+    pub fn stand_in(
+        file_path: &'a str,
+        rename_source: Option<&'a str>,
+        file_status: &'a str,
+        hunk: &'a Hunk,
+    ) -> Self {
         Self {
             file_path,
+            rename_source,
             file_status,
             hunk,
             is_stand_in: true,
         }
+    }
+
+    /// Every path this change may be *matched by*: where the file is now, plus
+    /// where it came from if it was renamed or copied.
+    ///
+    /// The mirror of `FileHunks::all_paths`, which is what `--include` and
+    /// `--exclude` have always filtered through. They and the hunkset path
+    /// predicates are two ways of asking one question -- "which files does this
+    /// pattern name?" -- and they used to answer it differently: the flags read
+    /// both paths, `file()`/`glob()`/`extension()` read only `file_path`, so
+    /// `--include 'secret/*'` found a file renamed out of `secret/` and
+    /// `glob("secret/*")` did not.
+    ///
+    /// The old path is the whole point. It is the name you type when you are
+    /// looking for what *used to be* somewhere, and a rename is exactly the
+    /// case where you cannot know the new name to type instead.
+    ///
+    /// Answered for a stand-in too, and deliberately: a pure rename produces no
+    /// hunks at all, so its stand-in is the only entry there is, and being
+    /// reachable by `file("<old name>")` is precisely what it is for. Paths are
+    /// file-level -- a stand-in carries them legitimately -- which is why this
+    /// is not [`Self::content`], where the answer is withheld.
+    pub fn all_paths(&self) -> impl Iterator<Item = &'a str> {
+        std::iter::once(self.file_path).chain(self.rename_source)
     }
 
     /// The diffed text this entry may be matched *by* -- `None` for a stand-in.
@@ -275,6 +328,10 @@ fn warn_if_nothing_analyzed(func: &str, result: &HashSet<usize>, hunks: &[Enrich
     {
         return;
     }
+    // `file_path`, not `all_paths()`: this names the files whose *content* no
+    // parser could read, and only the right-hand side of a rename has content
+    // to have been parsed. Listing the old path here would tell the user to go
+    // look for a parser for a file that no longer exists.
     let mut files: Vec<&str> = hunks.iter().map(|h| h.file_path).collect();
     files.sort_unstable();
     files.dedup();
@@ -499,23 +556,37 @@ fn extract_ranges(args: &[Arg]) -> Vec<(usize, usize)> {
 
 /// Match a hunk's file path. `file()` and `glob()` are this same filter under
 /// two different defaults, chosen by [`default_kind`].
+///
+/// Either of the change's paths satisfies it -- see [`EnrichedHunk::all_paths`]
+/// for why, and for the `--include`/`--exclude` behaviour it is matching.
 fn eval_path(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    filter_by_field(patterns, hunks, |h| h.file_path)
+    filter_by_bool(hunks, |h| {
+        h.all_paths()
+            .any(|path| patterns.iter().any(|p| p.matches(path)))
+    })
 }
 
+/// Match a change's file extension, on either side of a rename.
+///
+/// `a.txt` renamed to `b.rs` answers to `extension("rs")` *and* to
+/// `extension("txt")`, which is worth stating because it reads oddly at first:
+/// the file is not a .txt file any more. It is right anyway, for two reasons.
+/// The change genuinely removed a .txt file and created a .rs one, and both
+/// halves are in the diff this predicate is selecting from. And `extension(x)`
+/// is `glob("*.x")` with the globbing spelled out for you -- if `glob` reads
+/// both paths and `extension` reads one, the language starts contradicting
+/// itself, which is a worse failure than the surprise. `--include '*.txt'`
+/// already matched such a file, so this is where the flags were all along.
 fn eval_extension(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| {
-            let ext = std::path::Path::new(h.file_path)
+    filter_by_bool(hunks, |h| {
+        h.all_paths().any(|path| {
+            let ext = std::path::Path::new(path)
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             patterns.iter().any(|p| p.matches(ext))
         })
-        .map(|(i, _)| i)
-        .collect()
+    })
 }
 
 fn eval_status(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
@@ -668,6 +739,9 @@ fn eval_id(
         if matched.len() > 1 {
             // Named by their abbreviations: those are long enough to be
             // unambiguous over this diff, so the list is directly usable.
+            //
+            // `file_path`, not `all_paths()`: this tells the user where to look,
+            // and the only path they can look at is the one the file has now.
             let mut which: Vec<String> = matched
                 .iter()
                 .map(|&i| format!("{} ({})", hunks[i].short_id(), hunks[i].file_path))
@@ -806,6 +880,12 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
 /// side of the diff. Hunk ids for a renamed file are computed by diffing the
 /// old path against the new one, so the spec has to carry the old path or
 /// `select` cannot reproduce them.
+///
+/// The old path goes in `from:` and nowhere else. A path predicate may *match*
+/// a rename by either of its names, but the spec key stays the new path,
+/// because that is the one `select` resolves a file by: keyed by the old path,
+/// `select` would find no such file on the right, and the rename the user had
+/// just selected would be undone by `default: reset` instead of committed.
 pub fn to_spec(
     selected: &HashSet<usize>,
     hunks: &[EnrichedHunk],
@@ -879,7 +959,7 @@ mod tests {
         ];
         let enriched: Vec<EnrichedHunk> = hunks_data
             .iter()
-            .map(|h| EnrichedHunk::real("src/lib.rs", "modified", h))
+            .map(|h| EnrichedHunk::real("src/lib.rs", None, "modified", h))
             .collect();
 
         assert_eq!(evaluate(&parse("type(insert)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
@@ -891,8 +971,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("src/lib.rs", "modified", &h1),
-            EnrichedHunk::real("tests/test.rs", "added", &h2),
+            EnrichedHunk::real("src/lib.rs", None, "modified", &h1),
+            EnrichedHunk::real("tests/test.rs", None, "added", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"file("src/lib.rs")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -902,8 +982,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("src/lib.rs", "modified", &h1),
-            EnrichedHunk::real("tests/test.rs", "added", &h2),
+            EnrichedHunk::real("src/lib.rs", None, "modified", &h1),
+            EnrichedHunk::real("tests/test.rs", None, "added", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"glob("src/**/*.rs")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -913,8 +993,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "TODO: fix this\n");
         let h2 = make_hunk(1, "replace", "old code\n", "new code\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"added("TODO")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse(r#"removed("old")"#).unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -926,9 +1006,9 @@ mod tests {
         let h2 = make_hunk(1, "insert", "", "also new\n");
         let h3 = make_hunk(2, "delete", "gone\n", "");
         let enriched = vec![
-            EnrichedHunk::real("src/a.rs", "modified", &h1),
-            EnrichedHunk::real("src/b.rs", "modified", &h2),
-            EnrichedHunk::real("tests/c.rs", "modified", &h3),
+            EnrichedHunk::real("src/a.rs", None, "modified", &h1),
+            EnrichedHunk::real("src/b.rs", None, "modified", &h2),
+            EnrichedHunk::real("tests/c.rs", None, "modified", &h3),
         ];
         assert_eq!(evaluate(&parse(r#"type(insert) & glob("src/**")"#).unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
         assert_eq!(evaluate(&parse("all() ~ type(delete)").unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
@@ -943,8 +1023,8 @@ mod tests {
         h2.before_range.start = 25;
         h2.before_range.length = 0;
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("a.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("a.rs", None, "modified", &h2),
         ];
         assert_eq!(evaluate(&parse("lines(1..10)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("lines(20..30)").unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -955,8 +1035,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "delete", "y\n", "");
         let enriched = vec![
-            EnrichedHunk::real("src/a.rs", "modified", &h1),
-            EnrichedHunk::real("src/b.rs", "modified", &h2),
+            EnrichedHunk::real("src/a.rs", None, "modified", &h1),
+            EnrichedHunk::real("src/b.rs", None, "modified", &h2),
         ];
         let selected = HashSet::from([0]);
         let spec = to_spec(&selected, &enriched, &HashMap::new());
@@ -969,16 +1049,125 @@ mod tests {
     #[test]
     fn to_spec_carries_the_rename_source() {
         let h = make_hunk(0, "replace", "old\n", "new\n");
-        let enriched = vec![EnrichedHunk::real("dst.rs", "renamed", &h)];
+        let enriched = vec![EnrichedHunk::real("dst.rs", None, "renamed", &h)];
         let renames = HashMap::from([("dst.rs", "src.rs")]);
         let spec = to_spec(&HashSet::from([0]), &enriched, &renames);
+        assert_eq!(spec.files["dst.rs"].source_path(), Some("src.rs"));
+    }
+
+    /// A renamed file answers to the path it came from, which is what
+    /// `--include`/`--exclude` had always done through `FileHunks::all_paths`
+    /// and the hunkset predicates did not. Without this, `glob("secret/*")`
+    /// silently found nothing on a diff where `--include 'secret/*'` found the
+    /// file -- and a hunk the expression cannot name takes `default: reset`.
+    #[test]
+    fn a_path_predicate_matches_a_rename_by_the_path_it_came_from() {
+        let h1 = make_hunk(0, "replace", "old\n", "new\n");
+        let h2 = make_hunk(1, "replace", "p\n", "q\n");
+        let enriched = vec![
+            EnrichedHunk::real("exposed.txt", Some("secret/keys.txt"), "renamed", &h1),
+            EnrichedHunk::real("public.txt", None, "modified", &h2),
+        ];
+
+        for expr in [r#"glob("secret/*")"#, r#"file("secret/keys.txt")"#] {
+            assert_eq!(
+                evaluate(&parse(expr).unwrap(), &enriched).unwrap(),
+                HashSet::from([0]),
+                "{expr} did not reach the path the file was renamed from"
+            );
+        }
+        // The new path keeps working: "either" must not have become "instead".
+        assert_eq!(
+            evaluate(&parse(r#"file("exposed.txt")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([0]),
+        );
+    }
+
+    /// The consequence of matching either path, stated where it can be seen:
+    /// negation now *drops* a file renamed out of the excluded directory. That
+    /// is the safe direction -- the diff still spells `secret/keys.txt` on its
+    /// left side, so keeping it handed the user the thing they excluded -- and
+    /// it is the reading `--exclude` has always had.
+    #[test]
+    fn negating_a_path_predicate_drops_a_rename_out_of_that_path() {
+        let h1 = make_hunk(0, "replace", "old\n", "new\n");
+        let h2 = make_hunk(1, "replace", "p\n", "q\n");
+        let enriched = vec![
+            EnrichedHunk::real("exposed.txt", Some("secret/keys.txt"), "renamed", &h1),
+            EnrichedHunk::real("public.txt", None, "modified", &h2),
+        ];
+        assert_eq!(
+            evaluate(&parse(r#"~glob("secret/*")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([1]),
+        );
+    }
+
+    /// A rename that changes the extension answers to both extensions. See
+    /// `eval_extension` for why that is deliberate: `extension(x)` is
+    /// `glob("*.x")` spelled out, so it has to read the paths `glob` reads or
+    /// the two predicates start contradicting each other.
+    #[test]
+    fn extension_matches_either_side_of_a_rename_that_changed_it() {
+        let h = make_hunk(0, "replace", "old\n", "new\n");
+        let enriched = vec![EnrichedHunk::real("mod.rs", Some("mod.txt"), "renamed", &h)];
+        assert_eq!(
+            evaluate(&parse(r#"extension("rs")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([0]),
+        );
+        assert_eq!(
+            evaluate(&parse(r#"extension("txt")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([0]),
+        );
+    }
+
+    /// A pure rename produces no hunks, so its stand-in is the only entry there
+    /// is -- and the old name is the only name a user could reasonably type for
+    /// it. Paths are file-level, so a stand-in carries them; this is the case
+    /// that would break if the "either path" lookup were ever put behind
+    /// `content()`, which withholds a stand-in's answer on purpose.
+    #[test]
+    fn a_stand_in_is_reachable_by_the_path_its_rename_came_from() {
+        let h = make_hunk(0, "replace", "", "");
+        let enriched = vec![EnrichedHunk::stand_in(
+            "dst.txt",
+            Some("src.txt"),
+            "renamed",
+            &h,
+        )];
+        assert_eq!(
+            evaluate(&parse(r#"file("src.txt")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([0]),
+        );
+        // ...and still unmatchable by content, which this must not have loosened.
+        assert!(evaluate(&parse(r#"content("")"#).unwrap(), &enriched)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Matched by the old path, keyed by the new one. The spec key is what
+    /// `select` resolves a file by: keyed by `src.rs`, `select` finds no such
+    /// file on the right-hand side and the rename the user just selected is
+    /// undone by `default: reset` instead of committed. The old path belongs in
+    /// `from:` and nowhere else.
+    #[test]
+    fn to_spec_keys_a_rename_by_its_new_path_when_matched_by_the_old_one() {
+        let h = make_hunk(0, "replace", "old\n", "new\n");
+        let enriched = vec![EnrichedHunk::real("dst.rs", Some("src.rs"), "renamed", &h)];
+        let selected = evaluate(&parse(r#"file("src.rs")"#).unwrap(), &enriched).unwrap();
+        let spec = to_spec(&selected, &enriched, &HashMap::from([("dst.rs", "src.rs")]));
+
+        assert_eq!(
+            spec.files.keys().collect::<Vec<_>>(),
+            vec!["dst.rs"],
+            "the old path leaked into the spec key"
+        );
         assert_eq!(spec.files["dst.rs"].source_path(), Some("src.rs"));
     }
 
     #[test]
     fn unknown_function_is_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         let expr = parse("functon(\"foo\")").unwrap();
         assert!(matches!(evaluate(&expr, &enriched).unwrap_err(), HunksetError::UnknownFunction { .. }));
     }
@@ -986,7 +1175,7 @@ mod tests {
     #[test]
     fn invalid_regex_is_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         let expr = parse(r#"added(regex:"(unclosed")"#).unwrap();
         assert!(matches!(evaluate(&expr, &enriched).unwrap_err(), HunksetError::InvalidRegex { .. }));
     }
@@ -995,7 +1184,7 @@ mod tests {
     #[cfg(not(feature = "semantic"))]
     fn semantic_functions_require_feature() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         for func in &["scope(\"Foo\")", "function(\"bar\")", "doc()", "import()", "toplevel()", "depth(0)", "annotation(\"test\")"] {
             let expr = parse(func).unwrap();
             let err = evaluate(&expr, &enriched).unwrap_err();
@@ -1016,8 +1205,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("src/lib.rs", "modified", &h1),
-            EnrichedHunk::real("src/lib.py", "modified", &h2),
+            EnrichedHunk::real("src/lib.rs", None, "modified", &h1),
+            EnrichedHunk::real("src/lib.py", None, "modified", &h2),
         ];
         assert_eq!(evaluate(&parse("extension(rs)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -1027,8 +1216,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "added", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "added", &h2),
         ];
         assert_eq!(evaluate(&parse("status(added)").unwrap(), &enriched).unwrap(), HashSet::from([1]));
     }
@@ -1043,9 +1232,9 @@ mod tests {
         let mut h3 = make_hunk(2, "insert", "", "const X: i32 = 1;\n");
         h3.semantic.is_toplevel = true;
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("a.rs", "modified", &h2),
-            EnrichedHunk::real("a.rs", "modified", &h3),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("a.rs", None, "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h3),
         ];
         assert_eq!(evaluate(&parse("doc()").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("import()").unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -1060,7 +1249,7 @@ mod tests {
         // while toplevel() does not.
         let mut h = make_hunk(0, "insert", "", "hello\n");
         h.semantic.is_analyzed = false;
-        let enriched = vec![EnrichedHunk::real("notes.txt", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("notes.txt", None, "modified", &h)];
 
         assert!(
             evaluate(&parse("toplevel()").unwrap(), &enriched).unwrap().is_empty(),
@@ -1082,9 +1271,9 @@ mod tests {
         let mut h3 = make_hunk(2, "insert", "", "z\n");
         h3.semantic.nesting_depth = 2;
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("a.rs", "modified", &h2),
-            EnrichedHunk::real("a.rs", "modified", &h3),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("a.rs", None, "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h3),
         ];
         assert_eq!(evaluate(&parse("depth(0)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("depth(0..1)").unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
@@ -1097,8 +1286,8 @@ mod tests {
         h1.semantic.annotations = vec!["#[test]".to_string()];
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("a.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("a.rs", None, "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"annotation("test")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("annotation()").unwrap(), &enriched).unwrap(), HashSet::from([0]));
@@ -1110,8 +1299,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "fn hello_world() {\n");
         let h2 = make_hunk(1, "insert", "", "let x = 1;\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("a.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("a.rs", None, "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"added(regex:"fn\s+\w+")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -1129,8 +1318,8 @@ mod tests {
 
     fn enrich<'a>(src: &'a Hunk, vendor: &'a Hunk) -> Vec<EnrichedHunk<'a>> {
         vec![
-            EnrichedHunk::real("src.txt", "modified", src),
-            EnrichedHunk::real("vendor/lib.txt", "modified", vendor),
+            EnrichedHunk::real("src.txt", None, "modified", src),
+            EnrichedHunk::real("vendor/lib.txt", None, "modified", vendor),
         ]
     }
 
@@ -1222,7 +1411,7 @@ mod tests {
     #[test]
     fn an_abbreviated_id_resolves_whether_or_not_it_is_quoted() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         // `hunk-00000000...`: any prefix of it names this hunk.
         let prefix = &h.id[..12];
         let quoted = format!(r#"id("{prefix}")"#);
@@ -1285,8 +1474,8 @@ mod tests {
         let real = make_hunk(0, "replace", "old\n", "new\n");
         let stand_in = make_stand_in("blob.bin");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &real),
-            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+            EnrichedHunk::real("a.rs", None, "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", None, "modified", &stand_in),
         ];
 
         for spec in [
@@ -1326,8 +1515,8 @@ mod tests {
         let insert = make_hunk(0, "insert", "", "added only\n");
         let delete = make_hunk(1, "delete", "removed only\n", "");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &insert),
-            EnrichedHunk::real("b.rs", "modified", &delete),
+            EnrichedHunk::real("a.rs", None, "modified", &insert),
+            EnrichedHunk::real("b.rs", None, "modified", &delete),
         ];
 
         for spec in [
@@ -1353,8 +1542,8 @@ mod tests {
         let real = make_hunk(0, "replace", "old\n", "new\n");
         let stand_in = make_stand_in("blob.bin");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &real),
-            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+            EnrichedHunk::real("a.rs", None, "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", None, "modified", &stand_in),
         ];
 
         for spec in [
@@ -1394,8 +1583,8 @@ mod tests {
         stand_in.id = format!("hunk-{}", "b".repeat(64));
         stand_in.short_id = format!("hunk-{}", "b".repeat(8));
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &real),
-            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+            EnrichedHunk::real("a.rs", None, "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", None, "modified", &stand_in),
         ];
 
         for spec in [
@@ -1424,8 +1613,8 @@ mod tests {
         let h1 = make_hunk_with_distinct_id(0, 'a');
         let h2 = make_hunk_with_distinct_id(1, 'b');
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "modified", &h2),
         ];
         assert_eq!(
             evaluate(&parse("~id(hunk-aaaa)").unwrap(), &enriched).unwrap(),
@@ -1445,8 +1634,8 @@ mod tests {
         let mut h2 = make_hunk_with_distinct_id(1, 'a');
         h2.id.replace_range(60.., "bbbb");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "modified", &h2),
         ];
         assert!(matches!(
             eval_err("id(hunk-aaaa)", &enriched),
@@ -1459,7 +1648,7 @@ mod tests {
     #[test]
     fn explicit_exact_still_rules_out_abbreviation() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
 
         for spec in [
             format!(r#"id(exact:"{}")"#, h.id),
@@ -1486,7 +1675,7 @@ mod tests {
     #[test]
     fn an_id_that_names_no_hunk_is_an_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         for spec in [
             r#"id("hunk-ffffffff")"#,
             r#"~id("hunk-ffffffff")"#,
@@ -1508,7 +1697,7 @@ mod tests {
     fn id_rejects_a_pattern_kind_it_cannot_honour() {
         let mut h = make_hunk(0, "insert", "", "x\n");
         h.id = format!("hunk-{}", "abcdef01".repeat(8));
-        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
+        let enriched = vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
         // A real substring of the id, but not a prefix: substring matching
         // would have found it and prefix matching cannot, so honouring the
         // prefix the user wrote is the difference between a hit and a miss.
@@ -1533,8 +1722,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "// TODO: fix this\n");
         let h2 = make_hunk(1, "replace", "old code\n", "new code\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "modified", &h2),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(selects("added(TODO)"), HashSet::from([0]));
@@ -1553,8 +1742,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rss", "modified", &h2),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rss", None, "modified", &h2),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(selects("extension(rs)"), HashSet::from([0]));
@@ -1581,7 +1770,7 @@ mod tests {
             .spawn(move || {
                 let h = make_hunk(0, "insert", "", "x\n");
                 let enriched =
-                    vec![EnrichedHunk::real("a.rs", "modified", &h)];
+                    vec![EnrichedHunk::real("a.rs", None, "modified", &h)];
                 let expr = parse(&spec).expect("chain should parse");
                 let selected = evaluate(&expr, &enriched).expect("chain should evaluate");
                 drop(expr);
@@ -1651,9 +1840,9 @@ mod tests {
         let h2 = make_hunk(1, "delete", "y\n", "");
         let h3 = make_hunk(2, "replace", "a\n", "b\n");
         let enriched = vec![
-            EnrichedHunk::real("a.rs", "modified", &h1),
-            EnrichedHunk::real("b.rs", "modified", &h2),
-            EnrichedHunk::real("c.rs", "modified", &h3),
+            EnrichedHunk::real("a.rs", None, "modified", &h1),
+            EnrichedHunk::real("b.rs", None, "modified", &h2),
+            EnrichedHunk::real("c.rs", None, "modified", &h3),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(
@@ -1676,9 +1865,9 @@ mod tests {
         let h2 = make_hunk(1, "insert", "", "y\n");
         let h3 = make_hunk(2, "delete", "z\n", "");
         let enriched = vec![
-            EnrichedHunk::real("src/a.rs", "modified", &h1),
-            EnrichedHunk::real("src/a.rs", "modified", &h2),
-            EnrichedHunk::real("src/b.rs", "modified", &h3),
+            EnrichedHunk::real("src/a.rs", None, "modified", &h1),
+            EnrichedHunk::real("src/a.rs", None, "modified", &h2),
+            EnrichedHunk::real("src/b.rs", None, "modified", &h3),
         ];
         let selected = HashSet::from([0, 2]);
         let spec = to_spec(&selected, &enriched, &HashMap::new());

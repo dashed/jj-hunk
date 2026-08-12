@@ -6810,3 +6810,275 @@ fn spec_template_file_order_is_deterministic_and_sorted() {
         assert_eq!(first, again, "template key order changed on run {run}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A renamed file has two names, and a path predicate has to answer to both.
+//
+// `--include`/`--exclude` filter through `FileHunks::all_paths()`, which is the
+// primary path *plus* the rename source, so `--include 'secret/*'` finds a file
+// that has since been renamed out of `secret/`. The hunkset predicates saw only
+// `EnrichedHunk::file_path` -- the new path -- so `glob("secret/*")` came back
+// empty on the same diff. Two ways of asking the same question, two answers.
+//
+// The direction the disagreement failed in is the bad one: the old path is the
+// one you type when you are looking for what *used to be* somewhere, and the
+// rename is exactly the case where you cannot know the new name to type
+// instead. `~glob("secret/*")` had the mirror problem -- it claimed to exclude
+// the secret directory while keeping a hunk whose diff still spells
+// `secret/keys.txt` on its left side.
+// ---------------------------------------------------------------------------
+
+/// A repo that renames `secret/keys.txt` to `exposed.txt` and edits one line of
+/// it, alongside an unrelated edit to `public.txt`.
+///
+/// Forty lines with a single changed one, because jj's rename detection is a
+/// similarity threshold: a short file with a proportionally large edit degrades
+/// into separate `D` + `A` entries, which take completely different code paths
+/// and would leave these tests quietly asserting nothing. The `R {...}` check
+/// below is a precondition, not an assertion about the fix -- if a jj upgrade
+/// moves the threshold, every test built on this helper fails loudly instead of
+/// turning into a test of add-plus-delete.
+fn renamed_out_of_dir_repo(name: &str) -> TestRepo {
+    let base: String = (1..=40).map(|i| format!("secret line {i}\n")).collect();
+    let edited = base.replace("secret line 7\n", "secret line 7 EDITED\n");
+    let public: String = (1..=40).map(|i| format!("public line {i}\n")).collect();
+    let public_edited = public.replace("public line 3\n", "public line 3 EDITED\n");
+
+    let repo = TestRepo::new(name);
+    repo.write_file("secret/keys.txt", &base);
+    repo.write_file("public.txt", &public);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("secret/keys.txt")).unwrap();
+    repo.write_file("exposed.txt", &edited);
+    repo.write_file("public.txt", &public_edited);
+
+    let summary = repo.changed_files("@");
+    assert!(
+        reports_rename(&summary, "secret/keys.txt", "exposed.txt"),
+        "jj reported no rename, so this fixture tests something else entirely: {summary:?}"
+    );
+
+    repo
+}
+
+/// Whether a `jj diff --summary` listing reports `from` renamed to `to`.
+///
+/// `R `, not just "both names appear": a degraded rename shows up as separate
+/// `D` and `A` lines that also mention both paths, which is the exact shape
+/// these tests must not silently become.
+fn reports_rename(summary: &[String], from: &str, to: &str) -> bool {
+    summary
+        .iter()
+        .any(|l| l.starts_with("R ") && l.contains(from) && l.contains(to))
+}
+
+/// Paths `list` reports, in the order it reports them.
+fn listed_paths(repo: &TestRepo, args: &[&str]) -> Vec<String> {
+    let out = repo.hunk_ok(args);
+    let json: serde_json::Value = serde_json::from_str(&out).expect("list did not emit JSON");
+    json["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .map(|f| f["path"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_hunkset_path_predicate_finds_a_renamed_file_by_its_old_path() {
+    // The gap this whole change closes. `--include 'secret/*'` finds the file;
+    // `glob("secret/*")` used to come back empty and `file("secret/keys.txt")`
+    // with it, so the hunkset language could not name a change that the flag
+    // filtering right next to it could.
+    let repo = renamed_out_of_dir_repo("rename-oldpath-glob");
+
+    let by_flag = listed_paths(&repo, &["list", "--include", "secret/*"]);
+    assert_eq!(
+        by_flag,
+        vec!["exposed.txt"],
+        "--include lost its old-path match"
+    );
+
+    let by_glob = listed_paths(&repo, &["list", "--spec", r#"glob("secret/*")"#]);
+    assert_eq!(
+        by_glob, by_flag,
+        "glob() disagreed with --include about a renamed file"
+    );
+
+    let by_file = listed_paths(&repo, &["list", "--spec", r#"file("secret/keys.txt")"#]);
+    assert_eq!(
+        by_file, by_flag,
+        "file() could not name a renamed file by the path it was renamed from"
+    );
+}
+
+#[test]
+fn a_hunkset_path_predicate_still_finds_a_renamed_file_by_its_new_path() {
+    // A preservation guard: this passed before the old-path lookup was added
+    // and cannot be made to fail by reverting it, so it proves nothing about
+    // the fix. It is here for the other direction -- "match either path" is one
+    // `||` away from "match the old path *instead of* the new one", which would
+    // break every ordinary use of `file()` on a renamed file while leaving the
+    // test above green.
+    let repo = renamed_out_of_dir_repo("rename-newpath-glob");
+
+    assert_eq!(
+        listed_paths(&repo, &["list", "--spec", r#"glob("exposed*")"#]),
+        vec!["exposed.txt"],
+    );
+    assert_eq!(
+        listed_paths(&repo, &["list", "--spec", r#"file("exposed.txt")"#]),
+        vec!["exposed.txt"],
+    );
+}
+
+#[test]
+fn negating_a_path_predicate_excludes_a_file_renamed_out_of_that_path() {
+    // The consequence of matching either path, and the one worth stating out
+    // loud because it *removes* a file from a selection that used to contain
+    // it. It is the safe direction: the diff for this change still spells
+    // `secret/keys.txt` on its left side, so a user who asked for "everything
+    // except secret/" and got the rename anyway was handed the thing they
+    // excluded. `--exclude` had always read it this way; `~glob()` now agrees.
+    let repo = renamed_out_of_dir_repo("rename-oldpath-negation");
+
+    let by_flag = listed_paths(&repo, &["list", "--exclude", "secret/*"]);
+    assert_eq!(
+        by_flag,
+        vec!["public.txt"],
+        "--exclude lost its old-path match"
+    );
+
+    let by_negation = listed_paths(&repo, &["list", "--spec", r#"~glob("secret/*")"#]);
+    assert_eq!(
+        by_negation, by_flag,
+        "~glob() disagreed with --exclude about a renamed file"
+    );
+}
+
+#[test]
+fn a_rename_matches_the_extension_on_either_side_of_the_rename() {
+    // A deliberate choice, not a side effect. `a.txt` renamed to `b.rs` is a
+    // change that removed a .txt file and created a .rs one, and `extension()`
+    // is `glob("*.<ext>")` with the globbing spelled out -- so if `glob` reads
+    // both paths and `extension` reads one, the language contradicts itself
+    // rather than the flags. Both must match, and the cost is understood:
+    // `extension(txt)` reaches a file that is no longer a .txt file.
+    let base: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let edited = base.replace("line 7\n", "line 7 EDITED\n");
+
+    let repo = TestRepo::new("rename-extension-change");
+    repo.write_file("mod.txt", &base);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("mod.txt")).unwrap();
+    repo.write_file("mod.rs", &edited);
+
+    let summary = repo.changed_files("@");
+    assert!(
+        reports_rename(&summary, "mod.txt", "mod.rs"),
+        "jj reported no rename, so this fixture tests something else entirely: {summary:?}"
+    );
+
+    assert_eq!(
+        listed_paths(&repo, &["list", "--spec", r#"extension("rs")"#]),
+        vec!["mod.rs"],
+        "extension() lost the side of the rename the file now has"
+    );
+    assert_eq!(
+        listed_paths(&repo, &["list", "--spec", r#"extension("txt")"#]),
+        vec!["mod.rs"],
+        "extension() did not reach the side of the rename the file came from"
+    );
+}
+
+#[test]
+fn selecting_a_rename_by_its_old_path_commits_it_under_the_new_one() {
+    // Matching by the old path must not leak the old path into the spec. The
+    // spec key is what `select` resolves a file by, and the rename source rides
+    // along in `from:` -- swap the two and `select` looks under the old name on
+    // the right-hand side, finds nothing, and the rename is undone by
+    // `default: reset` instead of committed. So this asserts the whole round
+    // trip: named by `secret/keys.txt`, keyed by `exposed.txt`, committed as a
+    // rename with the edit intact and the unselected file left behind.
+    //
+    // (`to_spec` keying by the new path is asserted directly in the unit test
+    // `to_spec_keys_a_rename_by_its_new_path_when_matched_by_the_old_one`; this
+    // is the end-to-end half, which is what actually notices if `select` cannot
+    // resolve the key.)
+    let repo = renamed_out_of_dir_repo("rename-oldpath-commit");
+    let expected = repo.file_at("@", "exposed.txt");
+
+    let template = repo.hunk_ok(&["list", "--spec", r#"glob("secret/*")"#, "--spec-template"]);
+    let parsed: serde_json::Value = serde_json::from_str(&template).expect("spec is not JSON");
+    let keys: Vec<&str> = parsed["files"]
+        .as_object()
+        .expect("spec has no files")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["exposed.txt"],
+        "the spec was keyed by the path the file was renamed from, which `select` cannot resolve"
+    );
+    assert_eq!(
+        parsed["files"]["exposed.txt"]["from"], "secret/keys.txt",
+        "the spec dropped the rename source"
+    );
+
+    repo.hunk_ok(&["commit", r#"glob("secret/*")"#, "keep the rename"]);
+
+    let committed = repo.changed_files("@-");
+    assert!(
+        reports_rename(&committed, "secret/keys.txt", "exposed.txt"),
+        "the commit did not carry the rename: {committed:?}"
+    );
+    assert_eq!(
+        repo.file_at("@-", "exposed.txt"),
+        expected,
+        "the renamed file was committed with the wrong content"
+    );
+    assert!(
+        !committed.iter().any(|l| l.contains("public.txt")),
+        "an unselected file rode along with the rename: {committed:?}"
+    );
+}
+
+#[test]
+fn a_copy_is_matched_by_the_path_it_was_copied_from() {
+    // Copies take the same route as renames -- `FileHunks::rename_source` is
+    // filled in for both -- so the gap was the same and so is the fix. Worth
+    // testing on its own because it is *not* untestable here: jj 0.44 on the
+    // git backend does detect a copy, as long as the source is also modified
+    // (git only considers modified files as copy sources). A copy whose source
+    // is untouched degrades to a plain `A`, which is a different shape.
+    //
+    // The answer has two entries on purpose: `orig.txt` matches by its own path
+    // and `copy.txt` by the path it was copied from, which is what "changes
+    // involving orig.txt" should mean -- and exactly what `--include` returns.
+    let base: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let repo = TestRepo::new("copy-source-path");
+    repo.write_file("orig.txt", &base);
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("copy.txt", &base);
+    repo.write_file("orig.txt", &base.replace("line 3\n", "line 3 EDITED\n"));
+
+    let summary = repo.changed_files("@");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with("C ") && l.contains("orig.txt") && l.contains("copy.txt")),
+        "jj reported no copy, so this fixture tests something else entirely: {summary:?}"
+    );
+
+    let by_flag = listed_paths(&repo, &["list", "--include", "orig.txt"]);
+    assert_eq!(by_flag, vec!["copy.txt", "orig.txt"]);
+    assert_eq!(
+        listed_paths(&repo, &["list", "--spec", r#"file("orig.txt")"#]),
+        by_flag,
+        "file() did not reach the copy made from orig.txt"
+    );
+}

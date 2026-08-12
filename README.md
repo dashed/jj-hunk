@@ -467,6 +467,14 @@ Note that `from` only appears when jj itself reports the file as renamed or copi
 changes the file too much for jj's rename detection is reported as an ordinary add plus delete, and
 the spec names both paths separately.
 
+A renamed file therefore has two names for *matching* and one for *keying*. A hunkset expression
+may name it by either path — `glob("secret/*")` reaches a file renamed out of `secret/` — but the
+spec that comes back is always keyed under the new path, with the old one in `from`. Selecting by
+the old path and keying by it are different things, and only the first is allowed: keyed by the old
+path, `select` finds no such file on the right-hand side and the rename you just selected is undone
+by `default: reset` instead of committed. See
+[Renamed and copied files match either path](#renamed-and-copied-files-match-either-path).
+
 ## Hunk IDs
 
 A hunk id is `hunk-` followed by a SHA-256 over the hunk's **path**, its type, its removed and added
@@ -639,6 +647,40 @@ written bare, without parentheses, when they are the whole expression.
 `status()` takes a bare identifier rather than a string. A deleted file is `removed`; there is no
 `deleted`. An unrecognised value is rejected with the list of valid ones.
 
+##### Renamed and copied files match either path
+
+`file()`, `glob()` and `extension()` match a renamed or copied file by **either** of its paths —
+where it is now, and where it came from. Both of these select the same change:
+
+```bash
+jj-hunk list --spec 'file("secret/keys.txt")'   # the path it was renamed from
+jj-hunk list --spec 'file("exposed.txt")'       # the path it has now
+```
+
+The old path is the point. It is the name you type when you are looking for what *used to be*
+somewhere, and a rename is exactly the case where you cannot know the new name to type instead.
+This is what `--include` / `--exclude` have always done, so the flags and the predicates now agree
+on one question — "which files does this pattern name?" — instead of answering it differently.
+
+Three consequences worth knowing:
+
+- **Negation excludes it too.** `~glob("secret/*")` drops a file that was renamed *out* of
+  `secret/`. That is deliberate: the change's diff still spells `secret/keys.txt` on its left
+  side, so keeping it handed you the thing you excluded. `--exclude 'secret/*'` has always read
+  it this way.
+- **`extension()` matches both extensions across a rename that changed it.** `mod.txt` renamed to
+  `mod.rs` answers to `extension("rs")` *and* to `extension("txt")`. The change really did remove a
+  `.txt` file and create a `.rs` one, and `extension(x)` is `glob("*.x")` with the globbing spelled
+  out — reading fewer paths than `glob` would make the two predicates contradict each other.
+- **Only matching is affected.** The spec is still keyed by the **new** path, with the old one in
+  `from` (see [Renamed files](#renamed-files-the-from-field)) — that is the path `select` resolves
+  a file by.
+
+This applies only when jj itself reports a rename or copy. A move too large for jj's rename
+detection is an ordinary add plus delete, and each path names its own separate change. A copy is
+only reported as one when its source is also modified in the same diff — copying a file and leaving
+the original alone is reported as a plain add, with no source path to match on.
+
 ##### Glob patterns
 
 `glob()` follows jj's [fileset](https://docs.jj-vcs.dev/latest/filesets/) rules exactly, so a
@@ -674,7 +716,8 @@ Details worth knowing:
   *everything*. `~glob("[abc")` raises the same error rather than selecting the whole diff.
 
 The same matcher backs `file(glob:"...")` and the `--include` / `--exclude` flags, and rejects a
-malformed pattern the same way in all four places.
+malformed pattern the same way in all four places. All four also match a renamed file by either of
+its paths — see [Renamed and copied files match either path](#renamed-and-copied-files-match-either-path).
 
 #### Hunk type
 
@@ -971,7 +1014,8 @@ jj-hunk list --include 'src/**' --exclude '**/*.test.rs' --group directory
 ```
 
 `--include` and `--exclude` take one pattern per occurrence and use the same glob rules as
-`glob()` above.
+`glob()` above, including matching a renamed file by
+[either of its paths](#renamed-and-copied-files-match-either-path).
 
 ## How It Works
 
