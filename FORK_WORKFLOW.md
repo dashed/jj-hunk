@@ -1,23 +1,47 @@
 # jj-hunk Fork Workflow
 
-This document describes the branch structure and workflow for maintaining a custom
-`jj-hunk` fork with independent feature branches that can be selectively combined.
+This document describes what this fork of `jj-hunk` is, where its code came from,
+what was fixed along the way, and how to work on it.
 
 ## Overview
 
-This fork uses a **modular feature branch strategy** where:
+`jj-hunk` selects diff hunks programmatically — for `split`, `commit`, `squash`,
+`diffedit`, `restore` and `absorb` — with no interactive UI, so a script or an
+agent can drive it. This fork is a **permanent divergence** from
+[`laulauland/jj-hunk`](https://github.com/laulauland/jj-hunk). It adds the
+hunkset query language, tree-sitter semantic predicates, three verbs upstream
+lacks, test CI, and 528 tests where upstream has 17.
 
-- `main` tracks upstream [`laulauland/jj-hunk`](https://github.com/laulauland/jj-hunk)
-- Each feature lives in its own independent branch based on `main`
-- `alberto/my-jj-hunk` is a merge commit that combines all desired features
-- `alberto/fork-customizations` holds fork-specific additions (version, docs)
-- Jujutsu (jj) is used for version control alongside Git
+There is one branch, `main`. It is the default branch and the only place work
+lands. Jujutsu (jj) drives it in colocated mode, so `git` works too.
 
-This approach allows:
-- Easy updates when upstream releases new versions
-- Selective feature inclusion (enable/disable features by changing the merge)
-- Clean separation of concerns
-- Simple conflict resolution per-feature
+### The four-branch era, and why it ended
+
+Until 2026-08-11 the fork was four feature branches — `alberto/hunkset-lang`,
+`alberto/tree-sitter-semantic`, `alberto/fork-customizations`, `alberto/test-ci`
+— each based directly on a `main` pinned to the pristine upstream base
+(`3643ee8`, v0.4.1), and combined by a four-parent integration merge on
+`alberto/my-jj-hunk`. Every branch built and tested green on its own.
+
+That structure existed to make **upstream rebases cheap**: rebase and validate
+one branch at a time instead of debugging a four-way merge, and drop a feature
+from the merge to turn it off. It was the right shape for a fork that expected to
+track upstream.
+
+It stopped being the right shape once the fork stopped expecting that. Upstream
+has not moved since `3643ee8`; this fork is 45 commits past it, has rewritten
+`src/commands.rs` in 24 of them, and has a verb set and a query language upstream
+does not have. There is no rebase left to be cheap, and no PR that lands this
+back. What remained was only the cost: every change had to be filed onto the
+branch that owned its files, the merge rebuilt by hand afterwards, and a change
+filed onto the wrong branch — or onto the right one without rebuilding the merge
+— silently did nothing, with a test count that failed to go up as the only
+symptom.
+
+So `main` was fast-forwarded to the integration merge and is now the mainline;
+the four pull requests closed as merged, and the branches are retired. The merge
+commit `0a796e2` is still in the history and still names its four parents, which
+is what keeps **Provenance** below attributable.
 
 ## Why This Fork Exists
 
@@ -31,8 +55,9 @@ the tool this fork wants to be:
 | [`mvzink/jj-hunk-tool`](https://github.com/mvzink/jj-hunk-tool) | Best engineering: 125 tests, `absorb`/`diffedit`/`restore`, sub-hunk line ranges, short IDs. | Different architecture; coarser git-style hunks; **no CI at all**; rejects renamed files outright. Its ID algorithm and patch slicer live in the `git-surgeon` crate, floated as `"0.1.14"` (i.e. `^0.1.14`) — and its documented install path, `cargo install --git`, re-resolves dependencies unless `--locked` is passed, so an upstream patch release could silently change every hunk ID. Also shells out to `patch(1)` at runtime. |
 
 This fork takes `laulauland/jj-hunk` as its base — it keeps the distribution
-channels and the community listing — then lands sigma's unmerged work as
-independent feature branches and ports the best of `jj-hunk-tool`'s ideas on top.
+channels and the community listing — then lands sigma's unmerged work, ports the
+best of `jj-hunk-tool`'s ideas on top, and puts the result under test. What that
+actually produced, and who is owed for which part of it, is **Provenance** below.
 
 ### Why this base, concretely
 
@@ -52,90 +77,80 @@ and then needs sub-hunk line ranges to undo the damage. For splitting commits by
 
 ## Branch Structure
 
-```
-main (upstream v0.4.1, 3643ee8)
-│
-├── alberto/fork-customizations
-│   └── Version suffix, README banner, this doc
-│
-├── alberto/tree-sitter-semantic
-│   └── src/semantic.rs — tree-sitter analyzer for 20 languages
-│
-├── alberto/hunkset-lang
-│   └── Algebraic hunk query language + semantic feature contract
-│
-├── alberto/test-ci
-│   └── .github/workflows/ci.yml
-│
-└── alberto/my-jj-hunk (4-way merge)
-    └── Integration branch combining all features + customizations
-```
-
-### Branch Descriptions
-
-| Branch | Purpose | Base | Standalone build |
-|--------|---------|------|:----------------:|
-| `main` | Tracks upstream `laulauland/jj-hunk` | — | yes |
-| `alberto/fork-customizations` | Version, README banner, this doc | `main` | yes |
-| `alberto/tree-sitter-semantic` | Semantic analyzer (20 grammars) + 13 bug fixes | `main` | yes |
-| `alberto/hunkset-lang` | Hunkset query language + 12 bug fixes + docs | `main` | yes |
-| `alberto/test-ci` | Test workflow (Linux + macOS, both feature modes) | `main` | yes |
-| `alberto/my-jj-hunk` | Combined features | merge | yes |
-
-Every feature branch is based directly on `main` and **builds and tests green on
-its own**. That is the invariant that keeps rebases cheap — if a branch only
-compiles as part of the merge, it is not a feature branch, it is a fragment.
-
-### Visual DAG
+One branch: `main`.
 
 ```
-◆  main (upstream v0.4.1, 3643ee8)
+◆  main — the whole fork: 8 verbs, 528 tests, CI
 │
-├── ○ alberto/fork-customizations
-│   │  - Version: 0.4.1-my-jj-hunk
-│   │  - README fork banner
-│   │  - FORK_WORKFLOW.md
-│
-├── ○ alberto/tree-sitter-semantic
-│   │  - src/semantic.rs (2179 lines, 86 tests)
-│   │  - 20 tree-sitter grammars behind the `semantic` feature
-│   │  - enclosing function/scope, annotations, doc/import flags, depth
-│
-├── ○ alberto/hunkset-lang
-│   │  - src/hunkset/{ast,error,eval,parser,pattern}.rs
-│   │  - src/glob.rs, src/absorb.rs
-│   │  - Declares the `semantic` feature *contract*
-│   │  - The command surface: 8 verbs
-│
-├── ○ alberto/test-ci
-│   │  - .github/workflows/ci.yml
-│
-└── ○ alberto/my-jj-hunk (merge of all four)
-       - Includes all features + fork customizations
+◇  3643ee8 — laulauland/jj-hunk v0.4.1, the base
 ```
 
-## The `semantic` Feature Contract
+`main` is the fast-forwarded integration merge, so the whole history is here:
+the four retired branches' commits, the merge that combined them, and the
+imports at the root. What that structure was and why it ended is under
+**Overview** above.
 
-`hunkset-lang` and `tree-sitter-semantic` are deliberately **independent**, not
-stacked. The seam between them is the `semantic` cargo feature:
+Their names still appear in **Provenance** and **Fixed** below, where they say
+*which commits* a piece of work shipped in. Those commits are all on `main`; the
+branches are not — do not go looking for them.
 
-- **`alberto/hunkset-lang`** declares `semantic = []` — an empty feature. Its
-  semantic predicates (`function()`, `scope()`, `annotation()`, `doc()`,
-  `import()`, `toplevel()`, `depth()`) compile against the flag and return
-  `function() requires the 'semantic' feature` when it is off.
-- **`alberto/tree-sitter-semantic`** *redefines* the same feature with the 20
-  grammar dependencies and supplies `src/semantic.rs` to populate the data.
+## The `semantic` Feature
 
-So either branch is useful alone, and the integration merge simply takes the
-grammar-bearing definition of the feature. If you ever want the query language
-without a 21-crate build, drop `tree-sitter-semantic` from the merge and
-everything still compiles.
+The tree-sitter analyzer is an ordinary **optional cargo feature, on by
+default**:
+
+```toml
+[features]
+default = ["semantic"]
+semantic = ["dep:tree-sitter", "dep:tree-sitter-rust", …]   # 21 entries
+```
+
+Building with `--no-default-features` drops it. What that costs:
+
+| | default | `--no-default-features` |
+|---|---|---|
+| crates in the dependency graph | 74 | 51 |
+| tests | 528 | 435 |
+| `function()` `scope()` `annotation()` `doc()` `import()` `toplevel()` `depth()` | evaluate | error |
+
+The 23-crate difference is the `tree-sitter` runtime, its `tree-sitter-language`
+shim, 20 grammar crates, and `streaming-iterator`. Everything else — the whole
+query language, all eight verbs, and every file, line, content and identity
+predicate — is unaffected.
+
+The seven semantic predicates do **not** quietly return nothing when the feature
+is off. They fail:
+
+```
+$ jj-hunk list --spec 'function("x")'      # binary built --no-default-features
+Error: hunkset evaluation error: function() requires the 'semantic' feature (build with --features semantic)
+```
+
+That is the entire point of the `require_semantic` gate in
+`src/hunkset/eval.rs`, and it is why CI runs both modes as first-class builds
+rather than treating the second as a smoke test. Silently returning nothing is
+the failure mode this fork has spent the most effort removing; a build flag is
+not an excuse to reintroduce it.
+
+**Historical note.** This feature used to be a *contract between branches*:
+`alberto/hunkset-lang` declared `semantic = []`, an empty feature, while
+`alberto/tree-sitter-semantic` redefined the same name with the grammar
+dependencies. That let each branch build alone, and the integration merge simply
+took the grammar-bearing definition. The split definition had no other purpose,
+and with one branch it is gone — `Cargo.toml` now carries one definition, the
+real one. What survives is the `#[cfg]` seam, which earns its place on the
+merits above rather than as a packaging trick.
 
 ## Provenance
 
-Most of what is on the feature branches is imported, reorganized, and verified
-rather than original. The base for everything is `laulauland/jj-hunk` at
-`3643ee8` (v0.4.1) — which is also `upstream/main` and `sigma/main`.
+Most of what this fork carries is imported, reorganized, and verified rather
+than original. The base for everything is `laulauland/jj-hunk` at `3643ee8`
+(v0.4.1) — which is also `upstream/main` and `sigma/main`.
+
+The fork branch names below are **retired**; they say which commits carried
+which work, and every one of those commits is on `main` now. The commit ids
+that live outside this repo resolve only while the remotes described under
+**Remotes** below stay configured.
 
 **The import copied trees, not commits.** There are exactly two import commits,
 both rooted directly at `3643ee8`, and their files are byte-identical to the
@@ -230,13 +245,12 @@ for it in error.)
 | `src/` production lines | 1,896 | 3,737 | 8,745 |
 | test CI | none | none | yes |
 
-On the integration merge `default = ["semantic"]`, so `--all-features` and the
-default build are the same thing; 528 is simply the default. 435 is the
-semantic-off build.
+On `main` `default = ["semantic"]`, so `--all-features` and the default build
+are the same thing; 528 is simply the default. 435 is the semantic-off build.
 
-Commits over base: 44 across four branches — `hunkset-lang` 34 (23 fix, 5 docs,
-3 feat, 2 test, 1 chore), `tree-sitter-semantic` 5, `fork-customizations` 3,
-`test-ci` 2.
+Commits over base: 45, as merged — `hunkset-lang` 34 (23 fix, 5 docs, 3 feat,
+2 test, 1 chore), `tree-sitter-semantic` 5, `fork-customizations` 4, `test-ci` 2,
+plus the integration merge itself.
 
 **"Bugs fixed" is deliberately not reported.** 14 of those subjects bundle
 several independent repairs — `fix: symlink corruption, argument validation, id
@@ -247,19 +261,39 @@ Commit counts are what can be checked, so commit counts are what appear here.
 
 ```bash
 git remote -v
-# upstream  git@github.com:laulauland/jj-hunk.git   ← main tracks this
-# sigma     https://github.com/sigma/jj-hunk.git    ← source of imported features
+# origin    https://github.com/dashed/jj-hunk.git      ← this fork
+# upstream  git@github.com:laulauland/jj-hunk.git      ← the base, v0.4.1
+# sigma     https://github.com/sigma/jj-hunk.git       ← source of the imported features
 # mvzink    https://github.com/mvzink/jj-hunk-tool.git ← reference for ported ideas
 ```
 
-`mvzink` is an unrelated codebase fetched into the same object store purely so its
-history is greppable when porting ideas. Nothing merges from it directly.
+`upstream`, `sigma` and `mvzink` are kept deliberately, as **read-only
+reference**. Nothing tracks them, nothing merges from them, and no bookmark here
+follows one. Before anyone tidies them away, the reason they are still
+configured:
 
-When you create your own GitHub fork, add it as `origin` and push there:
+**Provenance above is only checkable while they exist.** Every commit it cites —
+`59143b6`, `6844166`, `3fafa16`, `8decd9d`, `558f184`, `4e3b820` on sigma,
+`6d7d44e` on upstream — is reachable from **no branch in this repo**. The only
+refs carrying them are these remotes' remote-tracking refs, plus a handful of
+`refs/jj/keep/*` pins jj created when it imported them, which are an
+implementation detail rather than a record to rely on. That section's claim
+that `mvzink/jj-hunk-tool` shares no history with this repo is likewise checked
+by `git merge-base main mvzink/main` exiting 1, which needs the remote to mean
+anything at all.
+
+Remove the remotes and that section degrades into a list of hashes nobody can
+look up. Re-adding and re-fetching would restore it — but only for as long as
+those repositories exist and still carry those refs, which is not a guarantee
+anyone here controls.
+
+`mvzink` in particular is an unrelated codebase fetched into the same object
+store purely so its history is greppable when porting ideas.
+
+Pushing:
 
 ```bash
-git remote add origin git@github.com:<you>/jj-hunk.git
-jj git push --remote origin --bookmark 'glob:alberto/*'
+jj git push --remote origin --bookmark main
 ```
 
 ## Jujutsu (jj) Setup
@@ -272,7 +306,6 @@ This repo uses jj in colocated mode, meaning both `jj` and `git` commands work.
 - **First-class conflicts**: Conflicts are stored in commits, resolve when convenient
 - **Operation log**: Every operation can be undone with `jj undo`
 - **Change IDs**: Stable identifiers that survive rebases (unlike git commit hashes)
-- **Multi-parent commits**: Native support for merge commits with 4+ parents
 
 ### Key jj Concepts
 
@@ -289,105 +322,41 @@ jj diff                             # See changes in working copy
 # - Commit ID (e.g., 1a739d9b): changes when commit is modified
 ```
 
-## Updating from Upstream
-
-### Step 1: Fetch
-
-```bash
-jj git fetch --all-remotes
-```
-
-### Step 2: Update main
-
-```bash
-jj bookmark set main -r main@upstream
-```
-
-### Step 3: Rebase feature branches onto new main
-
-Rebase in order of conflict risk (lowest first). `old_main` is the previous main
-commit id.
-
-```bash
-# Lowest risk — touches only Cargo.toml version + docs
-jj rebase -s 'roots(old_main..alberto/fork-customizations)' -d main
-
-# Low risk — adds a self-contained module
-jj rebase -s 'roots(old_main..alberto/tree-sitter-semantic)' -d main
-
-# Highest risk — rewrites commands.rs, diff.rs, spec.rs
-jj rebase -s 'roots(old_main..alberto/hunkset-lang)' -d main
-```
-
-### Step 4: Resolve conflicts
-
-```bash
-jj log -r 'conflicts()'
-
-# For each conflicted commit:
-jj new <conflicted-commit-id>
-# edit files to resolve
-jj squash -u                      # move resolution into parent, keep its message
-```
-
-**Tip:** resolve the earliest conflicted commit first — descendants often
-auto-resolve.
-
-### Step 5: Rebuild the integration branch
-
-```bash
-jj new alberto/tree-sitter-semantic alberto/hunkset-lang alberto/fork-customizations \
-  alberto/test-ci -m "integration: combine all feature branches"
-jj bookmark set alberto/my-jj-hunk --allow-backwards
-```
-
-### Step 6: Verify
-
-Do not skip this — a merge that compiles is not a merge that works.
-
-```bash
-cargo build --all-features
-cargo test --all-features          # expect all green
-cargo build --no-default-features  # hunkset must still build without tree-sitter
-```
-
-## Known Upstream Conflict
-
-Upstream has an unmerged fix worth taking when it lands:
-
-| Upstream branch | Commit | What it does | Conflict |
-|---|---|---|---|
-| `codex/fix-merge-list` | `6d7d44e` | Handle merge commits in `list` | Conflicts with `hunkset-lang` in `src/commands.rs` |
-
-Both rewrite large parts of `src/commands.rs`. Only that one file conflicts;
-`src/main.rs` and `tests/integration.rs` merge cleanly. Take upstream's
-restructuring of `read_diff_summary` and re-apply the hunkset filter call on top.
-
 ## Adding a New Feature
 
-```bash
-# 1. Branch from main
-jj new main -m "feat: description of feature"
-jj bookmark create alberto/new-feature
+Work on `main`. There is no integration merge to fold anything into, and no
+branch that owns a particular file.
 
-# 2. Develop. Changes are auto-tracked; start a new commit per logical unit:
+```bash
+# jj auto-tracks the working copy; start a new commit per logical unit
+# rather than growing one large one.
+jj new main -m "feat: description of feature"
 jj new -m "next part of feature"
 
-# 3. Verify it stands alone
-cargo build && cargo test
+# Verify. Both modes, because they are genuinely different builds.
+cargo test
+cargo test --no-default-features
+cargo clippy --locked --all-targets      # currently clean; keep it that way
 
-# 4. Fold into the integration branch
-jj new alberto/tree-sitter-semantic alberto/hunkset-lang \
-       alberto/fork-customizations alberto/test-ci alberto/new-feature \
-  -m "integration: combine all feature branches"
-jj bookmark set alberto/my-jj-hunk --allow-backwards
+jj bookmark set main -r @-                # @ is the empty working copy on top
+jj git push --remote origin --bookmark main
 ```
 
-**Do not create empty placeholder commits for planned branches.** A bookmark on an
+A short-lived branch off `main` is fine when the work wants reviewing in
+isolation — rebase it onto `main` and move `main` forward when it lands. What is
+not fine is re-growing a long-lived parallel line by habit: that is the structure
+this fork just retired, and it costs the same thing it cost before.
+
+**Do not create empty placeholder commits for planned work.** A bookmark on an
 empty commit looks like work that exists. Track intent in the roadmap below and
-create the branch when you have code for it.
+create the commit when you have code for it.
 
 ## Fixed
+
+Each entry names the branch and commit subject the work shipped under. Those
+branches are retired and the commits are all on `main`; the names are kept
+because they are how you find the commit, not because there is anywhere left to
+check out.
 
 ### `--format diff` produced patches that could not be applied
 
@@ -504,7 +473,7 @@ really is top level — that guards every config against the root-node mistake
 rather than just fixing the one instance.
 
 This also restored the **warning the README always promised**. sigma
-implemented one on `origin/diff-output-format` and dropped it in the refactor
+implemented one on `sigma/diff-output-format` and dropped it in the refactor
 into `src/hunkset/`; this version keys off `is_analyzed` instead of guessing
 from absent metadata, and covers every semantic predicate rather than just
 `function()` and `scope()`:
@@ -518,11 +487,15 @@ of matches.
 It stays quiet when any file was analyzed, since an empty result is then a real
 answer about real metadata.
 
-Note the test-visibility trap this exposed: `alberto/hunkset-lang` declares
-`semantic = []`, so it *cannot* observe semantic behaviour. The four
-integration tests here are `#[cfg(feature = "semantic")]`-gated — inert on that
-branch, live in the merge. A semantic change that is only tested on
-`hunkset-lang` is not tested at all.
+Note the test-visibility trap this exposed. The four integration tests here are
+`#[cfg(feature = "semantic")]`-gated, so they compile away entirely under
+`--no-default-features`. When the query language and the analyzer lived on
+separate branches this was a cross-branch trap — the branch declaring
+`semantic = []` could not observe semantic behaviour at all, so a semantic
+change tested only there was not tested. One branch retires that particular
+shape of it, but not the underlying one: a green `--no-default-features` run
+says nothing about any of these tests, which is why CI runs both modes rather
+than picking one.
 
 ### Nothing ran the tests
 
@@ -720,11 +693,11 @@ walks are now iterative.
 
 A systematic bug hunt across the diff core, the query language, the semantic
 configs and the jj integration produced 38 findings; fixing them surfaced 6
-more. All but three are now fixed and on the feature branches — see **Fixed**
-above for the ones with lasting lessons, and the PR descriptions for the full
-inventory. A later independent review of the whole branch found 15 more, also
-fixed; that round is the reason the feature roadmap below is empty and the
-lesson section above has grown.
+more. All but three are now fixed and on `main` — see **Fixed** above for the
+ones with lasting lessons, and the PR descriptions for the full inventory. A
+later independent review of the whole tree found 15 more, also fixed; that round
+is the reason the feature roadmap below is empty and the lesson section above
+has grown.
 
 ### Still open
 
@@ -732,19 +705,26 @@ Nothing on the feature roadmap. `alberto/short-ids` and `alberto/jj-verbs` were
 the last two entries here and both shipped — see **Fixed** above. What is left
 is hygiene.
 
-**Clippy is still advisory.** `cargo clippy --locked --all-targets` reports 11
-warnings on the integration merge: one `too many arguments`, four derivable
-`impl`s, two collapsible `if`s, a manual `Iterator::find`, a no-op `as_ref`, a
-field assignment outside a `Default::default()` initializer, and a `vec!` in a
-test. None is a correctness claim, and the CI job's own comment promises to
-promote it to a gate once the backlog is cleared. Clear it and promote it, or
-drop the promise — a comment that has been about to happen for a while is worth
-less than either.
+**Clippy is still advisory, and no longer has a reason to be.**
+`cargo clippy --locked --all-targets` now reports **zero** warnings on `main` in
+all three feature modes — default, `--no-default-features`, `--all-features`.
+The 11 that used to sit here were cleared by two `chore(clippy)` commits.
 
-**Agent worktrees accumulate.** At last count 18 directories under
-`.claude/worktrees/` and 11 `worktree-agent-*` branches were still on disk, and
-that accumulation filled the disk mid-session once already. Nothing removes them
-on its own, and the branch outlives the worktree:
+The CI job stayed advisory because gating it would have failed the *other*
+branches, which carried upstream's `src/` unchanged and its nine warnings with
+it; `ci.yml`'s comment says so, and names main-being-clean as the real trigger.
+That blocker died with the branches. `main` is now the only branch CI runs on
+and it is clean, so the gate can be turned on by deleting `continue-on-error`
+and restoring `RUSTFLAGS` on that step. Do it, or drop the comment — the promise
+has been about to come due for long enough.
+
+`ci.yml` also still triggers on `push: branches: [main, "alberto/**"]`. The
+second pattern matches nothing now.
+
+**Agent worktrees accumulate.** At last count 9 `worktree-agent-*` branches
+existed against 2 live worktrees — so 8 branches outliving the directory they
+were made for — and this accumulation filled the disk mid-session once already.
+Nothing removes them on its own, and the branch outlives the worktree:
 
 ```bash
 git worktree list                  # what actually exists
@@ -899,52 +879,6 @@ jj op revert <op-id>                # Revert a specific operation
 Prefer `jj op revert` over `jj op restore`: restore rewinds the whole repo state
 and will discard work done in other workspaces since that operation.
 
-## Workflow Tips
-
-### Moving a bookmark does not re-parent the integration merge
-
-jj auto-rebases descendants when you *rewrite* a commit — edit
-`fork-customizations` and the merge follows automatically. But adding a **new**
-commit to a feature branch and moving the bookmark to it does not: the merge
-still lists the old commit as its parent, and silently keeps building the old
-code. The symptom is a test count that does not go up.
-
-```bash
-jj log -r 'alberto/my-jj-hunk-'   # what the merge is actually built from
-jj log -r 'alberto/hunkset-lang'  # where the bookmark now points
-```
-
-If those disagree, rebuild the merge (see "Rebuild the integration branch") and
-`jj abandon` the stale one.
-
-### Keep every feature branch independently green
-
-Before folding anything into `alberto/my-jj-hunk`, check out the branch alone and
-run `cargo build && cargo test`. This is what makes upstream rebases cheap — you
-can rebase and validate one branch at a time instead of debugging a four-way merge.
-
-### Cargo.toml is the recurring conflict
-
-`fork-customizations` owns `[package] version`, `hunkset-lang` owns the `[features]
-contract` plus `regex`/`thiserror`, and `tree-sitter-semantic` owns the grammar
-deps and the real `[features]` definition. On conflict, keep all three regions —
-they touch different parts of the file. The `[features]` block should end up with
-`tree-sitter-semantic`'s grammar-bearing definition, not `hunkset-lang`'s empty one.
-
-### Cargo.lock conflicts
-
-Take main's version, then let cargo regenerate:
-
-```bash
-jj restore --from main Cargo.lock
-cargo build
-```
-
-### Version suffix after upstream bumps
-
-`fork-customizations` sets `version = "X.Y.Z-my-jj-hunk"`. After rebasing onto a
-new upstream release, update the `X.Y.Z` prefix to match.
-
 ## File Locations
 
 | File | Purpose |
@@ -957,27 +891,19 @@ new upstream release, update the `X.Y.Z` prefix to match.
 | `src/absorb.rs` | Blame-based routing, context-free fingerprints, squash plan |
 | `src/semantic.rs` | tree-sitter analyzer, 20 language configs |
 | `src/glob.rs` | Glob matching for path predicates |
-| `FORK_WORKFLOW.md` | This documentation (on `fork-customizations`) |
+| `FORK_WORKFLOW.md` | This documentation |
 
 ## Version Scheme
 
 - Upstream: `0.4.1`
-- Integration: `0.4.1-my-jj-hunk`
+- This fork: `0.4.1-my-jj-hunk`
 
 The `-my-jj-hunk` suffix identifies which build is running. Note it sorts as a
 semver *prerelease*, i.e. below plain `0.4.1` — fine for a local fork, but do not
 publish it to crates.io under that scheme.
 
-## Rebase History
-
-| Date | Upstream Range | New Commits | Conflicts | Notes |
-|------|---------------|:-----------:|-----------|-------|
-| 2026-08-08 | — → 3643ee8 | — | — | Fork created at upstream v0.4.1; imported sigma's hunkset + semantic work as two independent branches |
-| 2026-08-09 | (no upstream move) | 17 | — | Bug hunt across four areas: 38 findings, 6 more surfaced while fixing. All but three fixed. Test count 17 → 314 |
-| 2026-08-10 | (no upstream move) | 10 | — | Short ids and the `diffedit`/`restore`/`absorb` verbs shipped, closing the roadmap; independent multi-agent review then found 15 correctness bugs, all fixed. Test count 314 → 478 |
-
 ---
 
 *Last updated: 2026-08-11*
-*478 tests green on the integration merge (`cargo test --all-features`, jj 0.44.0)*
+*528 tests green on `main` (`cargo test`, jj 0.44.0); 435 with `--no-default-features`*
 *Command surface complete at 8 verbs; feature roadmap empty, hygiene backlog open*
