@@ -1,5 +1,6 @@
 use crate::diff::{self, apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::errors::{self, CodedError};
+use crate::fields::FieldMask;
 use serde_json::{Map, Value};
 use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
@@ -135,6 +136,9 @@ pub struct ListOptions {
     pub spec_file: Option<String>,
     pub binary: BinaryMode,
     pub truncation: Truncation,
+    /// Which fields of the listing to emit. `None` is every field, which is
+    /// what every caller that has never heard of `--fields` gets.
+    pub fields: Option<FieldMask>,
 }
 
 impl Default for ListOptions {
@@ -152,6 +156,7 @@ impl Default for ListOptions {
             spec_file: None,
             binary: BinaryMode::default(),
             truncation: Truncation::NONE,
+            fields: None,
         }
     }
 }
@@ -335,6 +340,12 @@ where
 {
     let options = options.into();
     let target = list_target(&options)?;
+    // Before the revision is resolved and before jj is run: this is a fact
+    // about the argv alone, and a caller that asked for an impossible shape
+    // should not pay for a diff to be told so.
+    if options.fields.is_some() {
+        check_fields_apply(&options)?;
+    }
     let resolved_spec_input = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
     let spec = match &resolved_spec_input {
         Some(content) if hunkset::is_hunkset(content) => {
@@ -440,13 +451,21 @@ where
                 }
             };
 
+            let masked = options
+                .fields
+                .as_ref()
+                .map(|mask| mask.apply(&output))
+                .transpose()?;
+
             match options.format {
-                ListFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                }
-                ListFormat::Yaml => {
-                    println!("{}", serde_yaml::to_string(&output)?);
-                }
+                ListFormat::Json => match &masked {
+                    Some(node) => println!("{}", serde_json::to_string_pretty(node)?),
+                    None => println!("{}", serde_json::to_string_pretty(&output)?),
+                },
+                ListFormat::Yaml => match &masked {
+                    Some(node) => println!("{}", serde_yaml::to_string(node)?),
+                    None => println!("{}", serde_yaml::to_string(&output)?),
+                },
                 ListFormat::Text => {
                     print!("{}", render_text_output(&output));
                 }
@@ -471,7 +490,16 @@ where
         }
         ListMode::SpecTemplate => {
             if matches!(options.format, ListFormat::Text | ListFormat::Diff) {
-                anyhow::bail!("--spec-template does not support text output (use json or yaml)");
+                // Was uncoded, and is the precedent `--fields` follows: two
+                // options that cannot both be honoured. Leaving one of the two
+                // on UNKNOWN would have made the code useless to branch on --
+                // a caller would still need a prose fallback for exactly this
+                // class of mistake.
+                return Err(incompatible(
+                    "--spec-template",
+                    &format!("--format {}", format_name(options.format)),
+                    "--spec-template does not support text output (use json or yaml)",
+                ));
             }
             let template = build_spec_template(files)?;
             match options.format {
@@ -487,6 +515,75 @@ where
     }
 
     Ok(())
+}
+
+/// `--fields` prunes one shape: the full listing, as JSON or YAML. Every other
+/// output mode is refused rather than served unmasked.
+///
+/// A silent no-op is the one answer that cannot be right. A caller passes
+/// `--fields` to make a response smaller, and getting the whole thing back at
+/// exit 0 looks exactly like a mask that had nothing to drop.
+///
+/// - `--files` already omits every hunk, and its entries carry `hunk_count`
+///   where a listing carries `hunks`. Half the names in a mask do not exist
+///   there, and the flag it would duplicate is the one already being used.
+/// - `--spec-template` emits a *spec*, which is an input to the writing verbs.
+///   A pruned one is not a smaller spec, it is an invalid one.
+/// - `--format text` and `--format diff` are renderings, not serialisations:
+///   they choose their own fields, and `render_diff_output` is made of the
+///   `removed`/`added` text a mask exists to drop.
+fn check_fields_apply(options: &ListOptions) -> Result<()> {
+    match options.mode {
+        ListMode::Files => {
+            return Err(incompatible(
+                "--fields",
+                "--files",
+                "--fields does not apply to --files, whose summary carries hunk counts \
+                 rather than hunks (drop --files, or drop --fields)",
+            ))
+        }
+        ListMode::SpecTemplate => {
+            return Err(incompatible(
+                "--fields",
+                "--spec-template",
+                "--fields does not apply to --spec-template, whose output is a spec to \
+                 hand back to a command rather than a listing to read",
+            ))
+        }
+        ListMode::Full => {}
+    }
+
+    if matches!(options.format, ListFormat::Text | ListFormat::Diff) {
+        return Err(incompatible(
+            "--fields",
+            &format!("--format {}", format_name(options.format)),
+            format!(
+                "--fields does not apply to {} output, which renders its own fields \
+                 (use --format json or --format yaml)",
+                format_name(options.format)
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn format_name(format: ListFormat) -> &'static str {
+    match format {
+        ListFormat::Json => "json",
+        ListFormat::Yaml => "yaml",
+        ListFormat::Text => "text",
+        ListFormat::Diff => "diff",
+    }
+}
+
+/// Two options that cannot both be honoured, named so a caller can tell which
+/// of the two to drop without reading the sentence.
+fn incompatible(option: &str, conflict: &str, message: impl Into<String>) -> anyhow::Error {
+    CodedError::new(errors::INCOMPATIBLE_OPTIONS, message)
+        .with("option", option)
+        .with("incompatible_with", conflict)
+        .into()
 }
 
 /// Which diff `list` was asked for.
@@ -3937,6 +4034,176 @@ mod tests {
         assert_eq!(
             frame_at(&[]).to_root(r"sub/back\slash.txt").as_deref(),
             Some(r"sub/back\slash.txt")
+        );
+    }
+
+    // -- `--fields` ---------------------------------------------------------
+
+    /// A listing with every optional key present, so a test can see the whole
+    /// serialised shape at once. Deliberately built from the real types rather
+    /// than from a JSON literal: a literal would go on describing last year's
+    /// shape no matter what anyone added to `FileEntry` or `Hunk`.
+    fn every_field_listing() -> ListOutput {
+        let hunk = Hunk {
+            index: 0,
+            id: "hunk-0123456789abcdef".to_string(),
+            short_id: "hunk-01234567".to_string(),
+            hunk_type: "replace".to_string(),
+            removed: "was\n".to_string(),
+            added: "is\n".to_string(),
+            before_range: crate::diff::LineRange { start: 1, length: 1 },
+            after_range: crate::diff::LineRange { start: 1, length: 1 },
+            context: Some(crate::diff::HunkContext {
+                before: "pre\n".to_string(),
+                after: "post\n".to_string(),
+            }),
+            semantic: crate::diff::SemanticInfo {
+                enclosing_function: Some("f".to_string()),
+                enclosing_scope: Some("S".to_string()),
+                annotations: vec!["#[test]".to_string()],
+                is_doc_comment: true,
+                is_import: true,
+                is_toplevel: true,
+                nesting_depth: 2,
+                is_analyzed: true,
+            },
+        };
+
+        ListOutput {
+            files: Some(vec![FileEntry {
+                path: "new.txt".to_string(),
+                status: "renamed".to_string(),
+                rename: Some(RenameInfo {
+                    from: "old.txt".to_string(),
+                    to: "new.txt".to_string(),
+                }),
+                hunks: vec![hunk],
+                binary: Some(true),
+                mode: Some(ModeChange {
+                    from: "100644",
+                    to: "100755",
+                }),
+                symlink: Some(true),
+                truncated: Some(true),
+            }]),
+            groups: None,
+        }
+    }
+
+    /// The keys of an object, alphabetically -- `serde_json::Value` is a
+    /// `BTreeMap`, so this says nothing about the order they were emitted in.
+    /// `masking_everything_reproduces_the_unmasked_bytes` is what covers that.
+    fn keys_of(value: &Value) -> Vec<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// `--fields` is an allow-list, so a key the registry has never heard of
+    /// is a key nobody can ask for. The fallback in `keep_file_key` keeps such
+    /// a field *visible* rather than dropping it silently, but visible and
+    /// unmaskable is still wrong -- and only this test says so out loud.
+    ///
+    /// It is built from the serialiser rather than from a list because the
+    /// keys that matter most are the ones no struct declares: `Hunk` flattens
+    /// `SemanticInfo`, so eight of the seventeen hunk names exist only in the
+    /// output.
+    #[test]
+    fn the_registry_covers_every_serialised_key() {
+        let value = serde_json::to_value(every_field_listing()).expect("serialises");
+        let file = &value["files"][0];
+
+        for key in keys_of(file) {
+            assert!(
+                crate::fields::registered_file_keys().contains(&key.as_str()),
+                "'{key}' is serialised on a file entry but --fields cannot name it"
+            );
+        }
+        for key in keys_of(&file["hunks"][0]) {
+            assert!(
+                crate::fields::registered_hunk_keys().contains(&key.as_str()),
+                "'{key}' is serialised on a hunk but --fields cannot name it"
+            );
+        }
+    }
+
+    /// The masked path re-emits a listing from scratch, so it can differ from
+    /// the unmasked one in ways nobody intended -- above all in key order,
+    /// which `serde_json::Value` alphabetises at every depth. A mask naming
+    /// everything must therefore be a no-op down to the byte, in both formats
+    /// and both groupings, or a caller that adds `--fields` to an existing
+    /// call gets a differently shaped answer for reasons unrelated to the
+    /// fields it named.
+    #[test]
+    fn masking_everything_reproduces_the_unmasked_bytes() {
+        let everything = FieldMask::parse(&[
+            "path".to_string(),
+            "status".to_string(),
+            "hunks".to_string(),
+        ])
+        .expect("mask parses");
+
+        for output in [
+            every_field_listing(),
+            ListOutput {
+                files: None,
+                groups: Some(vec![ListGroup {
+                    name: "src".to_string(),
+                    files: every_field_listing().files.unwrap(),
+                }]),
+            },
+        ] {
+            let masked = everything.apply(&output).expect("mask applies");
+            assert_eq!(
+                serde_json::to_string_pretty(&output).unwrap(),
+                serde_json::to_string_pretty(&masked).unwrap(),
+                "json differs under a mask that names every field"
+            );
+            assert_eq!(
+                serde_yaml::to_string(&output).unwrap(),
+                serde_yaml::to_string(&masked).unwrap(),
+                "yaml differs under a mask that names every field"
+            );
+        }
+    }
+
+    /// The flags that say "this entry carries a change no hunk expresses" and
+    /// "this listing is not the whole diff" survive a mask that names neither
+    /// them nor anything else at the file level. Their absence already means
+    /// something, so a mask able to suppress them would be able to forge it.
+    #[test]
+    fn the_file_level_flags_survive_a_mask_that_omits_them() {
+        let mask = FieldMask::parse(&["hunks.id".to_string()]).expect("mask parses");
+        let masked = mask.apply(&every_field_listing()).expect("mask applies");
+        let value: Value =
+            serde_json::from_str(&serde_json::to_string(&masked).unwrap()).expect("json");
+        let file = &value["files"][0];
+
+        assert_eq!(
+            keys_of(file),
+            ["binary", "hunks", "mode", "rename", "symlink", "truncated"]
+        );
+        assert_eq!(file["rename"]["from"], "old.txt");
+        assert_eq!(file["truncated"], true);
+        // ... while the hunk really does keep only what was asked for.
+        assert_eq!(keys_of(&file["hunks"][0]), ["id"]);
+    }
+
+    /// `"hunks": []` is a statement -- this file has no hunks -- and a mask
+    /// that names no hunk field must not make it. The key goes away entirely
+    /// instead, which is the honest way to say "not asked for".
+    #[test]
+    fn a_mask_with_no_hunk_field_drops_the_hunks_key_rather_than_emptying_it() {
+        let mask = FieldMask::parse(&["path".to_string()]).expect("mask parses");
+        let masked = mask.apply(&every_field_listing()).expect("mask applies");
+        let value: Value =
+            serde_json::from_str(&serde_json::to_string(&masked).unwrap()).expect("json");
+        assert!(
+            !keys_of(&value["files"][0]).contains(&"hunks".to_string()),
+            "{value}"
         );
     }
 }

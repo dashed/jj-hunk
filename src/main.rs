@@ -6,6 +6,7 @@ mod diff;
 #[cfg(feature = "semantic")]
 mod semantic;
 mod errors;
+mod fields;
 mod glob;
 mod hunkset;
 mod spec;
@@ -15,6 +16,7 @@ mod schema;
 use absorb::{AbsorbOptions, InsertionPolicy};
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
 use errors::ErrorFormat;
+use fields::FieldMask;
 
 #[derive(Parser)]
 #[command(name = "jj-hunk")]
@@ -230,6 +232,16 @@ struct ListArgs {
     /// Output a spec template instead of hunks
     #[arg(long = "spec-template", conflicts_with = "files")]
     spec_template: bool,
+    /// Limit json/yaml output to these fields, e.g. "path,hunks.id,hunks.type"
+    /// (repeatable; the file flags rename/binary/mode/symlink/truncated are
+    /// always kept)
+    //
+    // Not `conflicts_with` the modes and formats it does not apply to: clap
+    // would exit 2 with prose, and this is precisely the class of mistake an
+    // agent has to be able to branch on. The check lives in `list`, where it
+    // can raise INCOMPATIBLE_OPTIONS like every other refusal.
+    #[arg(long, value_delimiter = ',', value_name = "FIELDS")]
+    fields: Vec<String>,
 }
 
 fn main() {
@@ -271,6 +283,14 @@ fn run(cli: Cli) -> Result<()> {
                 truncation: Truncation {
                     max_bytes: args.max_bytes,
                     max_lines: args.max_lines,
+                },
+                // An absent flag is not an empty mask: one means every field,
+                // the other means none, and clap cannot tell them apart from
+                // the vector alone.
+                fields: if args.fields.is_empty() {
+                    None
+                } else {
+                    Some(FieldMask::parse(&args.fields)?)
                 },
             };
 

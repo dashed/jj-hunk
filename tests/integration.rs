@@ -8112,3 +8112,321 @@ fn the_schema_publishes_the_argument_facts_that_are_silent_when_guessed_wrong() 
     let json = error_json(&repo, &["list", "--spec", r#"id(substring:"abcd")"#]);
     assert_eq!(json["code"], "INVALID_ARGUMENT");
 }
+// ---------------------------------------------------------------------------
+// list --fields: masking the output
+// ---------------------------------------------------------------------------
+
+/// A diff whose text dwarfs its structure, which is the case `--fields` is
+/// for: every hunk carries its own `removed`/`added` and three lines of
+/// context on each side, and none of it is read by an agent that lists, picks
+/// an id, and acts.
+fn mask_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    let before: String = (1..=200).map(|i| format!("line {i:03} of the file\n")).collect();
+    repo.write_file("wide.txt", &before);
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    // Twenty edits spread far enough apart to stay twenty separate hunks.
+    let after: String = (1..=200)
+        .map(|i| {
+            if i % 10 == 0 {
+                format!("LINE {i:03} was rewritten by an agent\n")
+            } else {
+                format!("line {i:03} of the file\n")
+            }
+        })
+        .collect();
+    repo.write_file("wide.txt", &after);
+    repo
+}
+
+/// A repo holding one of every shape whose change no hunk can express, plus a
+/// rename, so a mask can be watched around all of them at once.
+fn hunkless_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("old.txt", "keep\nchange me\nkeep\n");
+    repo.write_file("bin.dat", "plain\n");
+    repo.write_file("target.txt", "a target\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt")).unwrap();
+    repo.write_file("new.txt", "keep\nchanged\nkeep\n");
+    std::fs::write(repo.path().join("bin.dat"), [0x00u8, 0x01, 0xff, 0xfe]).unwrap();
+    std::fs::remove_file(repo.path().join("target.txt")).unwrap();
+    std::os::unix::fs::symlink("new.txt", repo.path().join("target.txt")).unwrap();
+    repo
+}
+
+fn parse(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not json ({e}): {text}"))
+}
+
+/// **The regression that would break every existing caller.**
+///
+/// `--fields` re-emits a listing through a second serialiser, so the risk is
+/// not that the masked form is wrong -- it is that the *unmasked* one quietly
+/// changes shape along with it. A caller that never passes the flag must get
+/// byte-for-byte what it got before this existed, in every format and
+/// grouping.
+///
+/// This is a preservation guard: it passes before the change as well as after,
+/// which is the whole point of it.
+#[test]
+fn a_listing_without_fields_is_exactly_what_it_always_was() {
+    let repo = hunkless_repo("fields-untouched");
+
+    for args in [
+        vec!["list"],
+        vec!["list", "--format", "yaml"],
+        vec!["list", "--format", "text"],
+        vec!["list", "--format", "diff"],
+        vec!["list", "--group", "status"],
+        vec!["list", "--files"],
+        vec!["list", "--spec-template"],
+    ] {
+        let out = repo.hunk(&args);
+        assert!(out.status.success(), "{args:?} must still succeed");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).is_empty(),
+            "{args:?} must still print something"
+        );
+    }
+
+    // The shape a caller actually parses, spelled out rather than merely
+    // non-empty: the mask must not have moved a key or dropped an optional.
+    let json = parse(&repo.hunk_ok(&["list"]));
+    let files = json["files"].as_array().unwrap();
+    let renamed = files.iter().find(|f| f["path"] == "new.txt").unwrap();
+    assert_eq!(renamed["rename"]["from"], "old.txt");
+    assert!(renamed["hunks"][0]["removed"].is_string(), "{renamed}");
+    assert!(renamed["hunks"][0]["context"].is_object(), "{renamed}");
+}
+
+/// The point of the feature, measured rather than asserted. The mask an agent
+/// running list -> preview -> act by id actually wants keeps four keys and
+/// drops the diff text, and the response has to get dramatically smaller --
+/// this is a token-cost feature, so a mask that saved a little would not be
+/// worth the flag.
+#[test]
+fn a_mask_drops_the_diff_text_and_keeps_what_a_selection_needs() {
+    let repo = mask_repo("fields-size");
+
+    let full = repo.hunk_ok(&["list"]);
+    let masked = repo.hunk_ok(&["list", "--fields", "path,hunks.id,hunks.type"]);
+
+    assert!(
+        masked.len() * 4 < full.len(),
+        "a mask that keeps only paths, ids and types must be far smaller: \
+         {} bytes masked vs {} bytes full",
+        masked.len(),
+        full.len()
+    );
+
+    let json = parse(&masked);
+    let file = &json["files"][0];
+    assert_eq!(file["path"], "wide.txt");
+    assert!(file["status"].is_null(), "status was not asked for: {file}");
+
+    let hunks = file["hunks"].as_array().unwrap();
+    assert_eq!(hunks.len(), 20, "the hunks themselves must all still be there");
+    for hunk in hunks {
+        assert!(hunk["id"].as_str().unwrap().starts_with("hunk-"), "{hunk}");
+        assert!(hunk["type"].is_string(), "{hunk}");
+        assert!(hunk["removed"].is_null(), "the diff text must be gone: {hunk}");
+        assert!(hunk["added"].is_null(), "the diff text must be gone: {hunk}");
+        assert!(hunk["context"].is_null(), "the context must be gone: {hunk}");
+    }
+
+    // The line ranges are maskable too, and are the one part of a hunk an
+    // agent may still want -- they are what says *where* to look before it
+    // opens the file.
+    let with_ranges = parse(&repo.hunk_ok(&["list", "--fields", "path,hunks.id,hunks.before"]));
+    let hunk = &with_ranges["files"][0]["hunks"][0];
+    assert!(hunk["before"]["start"].is_number(), "{hunk}");
+    assert!(hunk["after"].is_null(), "only `before` was asked for: {hunk}");
+}
+
+/// An id read out of a masked listing has to be the same id. Nothing in the
+/// mask touches how ids are computed, but that is exactly the sort of thing a
+/// re-serialisation quietly breaks -- and an id that no longer resolves turns
+/// a cheaper listing into a useless one.
+#[test]
+fn ids_from_a_masked_listing_still_select() {
+    let repo = mask_repo("fields-roundtrip");
+    let json = parse(&repo.hunk_ok(&["list", "--fields", "path,hunks.id"]));
+    let id = json["files"][0]["hunks"][0]["id"].as_str().unwrap().to_string();
+
+    repo.hunk_ok(&["commit", &format!(r#"id("{id}")"#), "one hunk, chosen blind"]);
+
+    let summary = repo.changed_files("@-");
+    assert!(
+        summary.iter().any(|line| line.contains("wide.txt")),
+        "the hunk named by a masked id did not land: {summary:?}"
+    );
+    // And only that one: 19 of the 20 hunks are still in the working copy.
+    let left = parse(&repo.hunk_ok(&["list"]));
+    assert_eq!(left["files"][0]["hunks"].as_array().unwrap().len(), 19);
+}
+
+/// The two spellings are one feature. `hunks.id` says where the field lives
+/// and is what the error message hands back; `id` is what an agent types. If
+/// they ever disagreed, the shorthand would be a second, subtly different
+/// flag.
+#[test]
+fn the_bare_and_dotted_spellings_produce_the_same_listing() {
+    let repo = mask_repo("fields-spelling");
+    assert_eq!(
+        repo.hunk_ok(&["list", "--fields", "path,id,type"]),
+        repo.hunk_ok(&["list", "--fields", "path,hunks.id,hunks.type"])
+    );
+    // And `hunks` alone is every hunk field, not a hunk field called "hunks".
+    assert_eq!(
+        repo.hunk_ok(&["list", "--fields", "path,status,hunks"]),
+        repo.hunk_ok(&["list"])
+    );
+}
+
+/// A typo in a mask is indistinguishable from a deliberate omission: ask for
+/// `paht` and every entry comes back without a `path`, which reads as a diff
+/// of files that have no path. So it is refused, and `details.valid_fields`
+/// carries the whole list so the caller can correct itself rather than ask a
+/// human what the fields are called.
+#[test]
+fn an_unknown_field_name_is_refused_with_the_list_to_correct_it_from() {
+    let repo = mask_repo("fields-typo");
+    let json = error_json(&repo, &["list", "--fields", "paht,id"]);
+
+    assert_eq!(json["error"], "usage");
+    assert_eq!(json["code"], "INVALID_FIELDS");
+    assert_eq!(json["details"]["fields"], serde_json::json!(["paht"]));
+
+    let valid = json["details"]["valid_fields"].as_array().unwrap();
+    assert!(valid.iter().any(|name| name == "path"), "{valid:?}");
+    assert!(valid.iter().any(|name| name == "hunks.removed"), "{valid:?}");
+    assert_eq!(
+        json["details"]["always_included"],
+        serde_json::json!(["rename", "binary", "mode", "symlink", "truncated"])
+    );
+
+    // A mask that names nothing at all is the same refusal: an empty listing
+    // is not what "--fields ''" was reaching for either.
+    assert_eq!(
+        error_json(&repo, &["list", "--fields", ""])["code"],
+        "INVALID_FIELDS"
+    );
+}
+
+/// The five file-level flags survive a mask that names none of them, because
+/// each is serialised only when it is true -- so a mask able to drop one could
+/// forge "this file is not a rename", "this listing is not truncated". The two
+/// that carry more than information are `rename`, whose `from` is what makes a
+/// renamed file selectable on the raw `jj --tool=jj-hunk` path, and
+/// `truncated`, which is the only sign that the hunks listed are a prefix of
+/// the real diff.
+#[test]
+fn a_mask_cannot_hide_that_something_happened() {
+    let repo = hunkless_repo("fields-flags");
+    let json = parse(&repo.hunk_ok(&["list", "--fields", "hunks.id"]));
+    let files = json["files"].as_array().unwrap();
+
+    let by = |path: &str| {
+        // `path` itself was not asked for, so entries are found by the flag
+        // that survived -- which is the property under test.
+        files
+            .iter()
+            .find(|f| f["rename"]["from"] == path || f["rename"]["to"] == path)
+            .cloned()
+    };
+
+    let renamed = by("old.txt").expect("the rename must still be visible");
+    assert_eq!(renamed["rename"]["from"], "old.txt");
+    assert!(renamed["path"].is_null(), "path was not asked for: {renamed}");
+
+    assert!(
+        files.iter().any(|f| f["binary"] == true),
+        "the binary marker did not survive: {json}"
+    );
+    assert!(
+        files.iter().any(|f| f["symlink"] == true),
+        "the symlink marker did not survive: {json}"
+    );
+
+    // Truncation is the one whose absence is a correctness claim.
+    let truncated = parse(&repo.hunk_ok(&[
+        "list",
+        "--max-lines",
+        "1",
+        "--fields",
+        "hunks.id",
+    ]));
+    assert!(
+        truncated["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["truncated"] == true),
+        "a masked listing must still say it was cut short: {truncated}"
+    );
+}
+
+/// A mask names fields of a listing, and three of `list`'s output modes are
+/// not listings. Serving them unmasked at exit 0 is the one answer that cannot
+/// be right: a caller passes `--fields` to make a response smaller, and the
+/// whole thing coming back looks exactly like a mask with nothing to drop.
+#[test]
+fn fields_is_refused_by_the_output_modes_it_cannot_shape() {
+    let repo = mask_repo("fields-modes");
+
+    for (args, conflict) in [
+        (vec!["list", "--fields", "path", "--files"], "--files"),
+        (
+            vec!["list", "--fields", "path", "--spec-template"],
+            "--spec-template",
+        ),
+        (
+            vec!["list", "--fields", "path", "--format", "text"],
+            "--format text",
+        ),
+        (
+            vec!["list", "--fields", "path", "--format", "diff"],
+            "--format diff",
+        ),
+    ] {
+        let json = error_json(&repo, &args);
+        assert_eq!(json["code"], "INCOMPATIBLE_OPTIONS", "{args:?}");
+        assert_eq!(json["details"]["option"], "--fields", "{args:?}");
+        assert_eq!(json["details"]["incompatible_with"], conflict, "{args:?}");
+    }
+
+    // The refusal that set the precedent, which had been falling through to
+    // UNKNOWN. Leaving it there would have made the code useless to branch on:
+    // a caller would still need a prose fallback for this very class.
+    let json = error_json(&repo, &["list", "--spec-template", "--format", "text"]);
+    assert_eq!(json["code"], "INCOMPATIBLE_OPTIONS");
+    assert_eq!(json["details"]["option"], "--spec-template");
+}
+
+/// Grouping and masking are orthogonal, and the group's own `name` is not a
+/// field of anything -- masking it away would leave the files in an
+/// unlabelled bag, which is worse than not grouping at all.
+#[test]
+fn a_mask_applies_inside_groups_without_unlabelling_them() {
+    let repo = hunkless_repo("fields-groups");
+    let json = parse(&repo.hunk_ok(&[
+        "list",
+        "--group",
+        "status",
+        "--fields",
+        "path,hunks.id",
+    ]));
+
+    let groups = json["groups"].as_array().unwrap();
+    assert!(!groups.is_empty(), "{json}");
+    for group in groups {
+        assert!(group["name"].is_string(), "a group lost its name: {group}");
+        for file in group["files"].as_array().unwrap() {
+            assert!(file["path"].is_string(), "{file}");
+            assert!(file["status"].is_null(), "status was not asked for: {file}");
+        }
+    }
+}

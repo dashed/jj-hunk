@@ -621,6 +621,40 @@ $ jj-hunk list --spec 'id(hunk-25117ece)' --format diff
  L20
 ```
 
+### Trimming the listing: `--fields`
+
+A JSON listing is mostly `removed`, `added` and `context`, and the loop you are running — list,
+pick an id, act on it — reads none of them. You will read that text again anyway when you open the
+file. Ask for the skeleton instead:
+
+```bash
+jj-hunk list --format json --fields 'path,hunks.id,hunks.type'
+```
+
+On a 138-line diff across three source files (69 hunks) that is 9,719 bytes instead of 66,248 —
+**6.8x smaller**. `hunks.short_id` in place of `hunks.id` makes it 10.5x; both resolve in `id()`
+and in a spec's `ids`. Add `hunks.before` when you need to know *where* a hunk is without reading
+it.
+
+Names: file fields bare — `path`, `status`, `rename`, `binary`, `mode`, `symlink`, `truncated` —
+and hunk fields as `hunks.<name>` — `index`, `id`, `short_id`, `type`, `removed`, `added`,
+`before`, `after`, `context`, `enclosing_function`, `enclosing_scope`, `annotations`,
+`is_doc_comment`, `is_import`, `is_toplevel`, `nesting_depth`, `is_analyzed`. `hunks` alone means
+every hunk field and `hunks.semantic` the eight semantic ones. The `hunks.` prefix is optional, so
+`--fields 'path,id,type'` works. Repeatable and comma-separated.
+
+Three things to know:
+
+- **Five file flags come back whether you ask or not**: `rename`, `binary`, `mode`, `symlink`,
+  `truncated`. Each appears only when it is true, so a mask that could hide one would let you read
+  "not truncated" off a truncated listing. `truncated` means the hunks you are looking at are a
+  prefix of the real diff; `rename.from` is what the raw `jj --tool=jj-hunk` path needs to not lose
+  the file.
+- **A misspelled name is an error, not an omission.** `--fields 'paht,id'` exits 1 with
+  `INVALID_FIELDS` and `details.valid_fields`; it does not hand you entries with no `path`.
+- **It is json/yaml only.** With `--format text`, `--format diff`, `--files` or `--spec-template`
+  it exits 1 with `INCOMPATIBLE_OPTIONS` rather than quietly ignoring you.
+
 **Applying a `--format diff` patch: use `git apply`, not `git am`.** The output is a bare unified
 diff with no mail headers, so `git am` rejects it outright (`Patch format detection failed`).
 `git apply` handles it, including added files, deleted files, CRLF line endings, and missing
@@ -702,6 +736,8 @@ jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
 | `REVSET_UNRESOLVED` | jj could not resolve the revset, or it named no revision | `revset`, `resolved` (always `0`), `jj_stderr` (only when jj itself rejected it) | Fix the revset. `jj_stderr` is jj's own explanation of why |
 | `REVSET_AMBIGUOUS` | The revset resolved to more than one revision | `revset`, `resolved` (the true count), `revisions[]` (the first few) | Narrow it. A hunk is only defined between one revision and its parent |
 | `TRUNCATED_SPEC_TEMPLATE` | `--spec-template` over files `--max-bytes`/`--max-lines` cut short | `paths[]` | Drop the limits for those files. Ids from a truncated file are hashes of text the real diff does not have |
+| `INVALID_FIELDS` | `--fields` named something that is not an output field, or named nothing at all | `fields[]` (the names refused), `valid_fields[]` (every name accepted, hunk fields in their dotted form), `always_included[]` (the file flags no mask can drop) | Re-issue with names from `valid_fields`. Nothing was printed: stdout is empty, so a missing key means a refused run, not a missing value |
+| `INCOMPATIBLE_OPTIONS` | Two options that cannot both be honoured: `--fields` with `--files`, `--spec-template`, `--format text` or `--format diff`; or `--spec-template` with a text format | `option`, `incompatible_with` | Drop one of the two it names |
 | `UNKNOWN` | Anything not yet classified — I/O errors, failed `jj` invocations | `{}` | Read `message`. Do not build behaviour on `UNKNOWN`: a failure may be given a real code in a later release |
 
 `PATH_NOT_IN_DIFF` reports the spec as a whole, so `details.problems` has one entry per failed
@@ -846,6 +882,8 @@ Other `list` options:
 - `--max-bytes <n>` / `--max-lines <n>` — truncate file contents before diffing
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit an ID-based starting spec (JSON/YAML only; `text` and `diff` are rejected)
+- `--fields <names>` — emit only these fields of a JSON/YAML listing. **Use it.** See
+  [Trimming the listing](#trimming-the-listing---fields)
 
 `list` shows changes that have no hunks at all — binaries, symlinks, pure renames and copies,
 mode-only changes, and empty-file adds and removes. `--spec-template` emits `{"action": "keep"}`

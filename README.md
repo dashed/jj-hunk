@@ -180,6 +180,7 @@ silent no-op.
 - `--spec <hunkset|json|yaml>` / `--spec-file <path>` — filter output with a hunkset expression or JSON/YAML spec
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit a spec template (JSON/YAML only)
+- `--fields <names>` — emit only these fields of a JSON/YAML listing (repeatable, comma-separated) — see [Field masking](#field-masking---fields)
 
 `<spec>` may be a hunkset expression (e.g. `'type(insert) & file("src/*.rs")'`), an inline JSON/YAML string, or `-` to read from stdin. The format is auto-detected. Use `--spec-file <path>` to read a JSON/YAML file (omit `<spec>` when using `--spec-file`).
 
@@ -1105,7 +1106,79 @@ $ jj-hunk list --format json
 - Each hunk includes `index`, the full `id` (sha256), its abbreviated `short_id`, line ranges (`before`/`after`), and optional `context`. `--format text`, `--format diff`, and `--spec-template` print the short form; see [Hunk IDs](#hunk-ids).
 - When grouped (`--group`), output uses `groups: [{name, files}]` instead of `files`.
 - With `--files`, entries carry `hunk_count` instead of a `hunks` array.
-- In a `semantic`-enabled build, hunks also carry `enclosing_function`, `enclosing_scope`, `annotations`, `nesting_depth`, and `is_analyzed` where the language could be parsed.
+- In a `semantic`-enabled build, hunks also carry `enclosing_function`, `enclosing_scope`, `annotations`, `is_doc_comment`, `is_import`, `is_toplevel`, `nesting_depth`, and `is_analyzed` where the language could be parsed. Each is omitted when it is empty, zero, or false.
+
+### Field masking: `--fields`
+
+`removed`, `added` and `context` are most of a listing's bytes, and the usual loop — list, pick an
+id, act on it — reads none of them. `--fields` keeps only the named fields:
+
+```bash
+$ jj-hunk list --format json --fields 'path,hunks.id,hunks.type'
+{
+  "files": [
+    {
+      "path": "src/lib.rs",
+      "hunks": [
+        {
+          "id": "hunk-8a30a9af59936de30a9a364b3bce467052dfc7a0a12c52f106410b04723417ef",
+          "type": "replace"
+        }
+      ]
+    }
+  ]
+}
+```
+
+On a 138-line diff across three source files (69 hunks) that mask cuts the response from **66,248
+bytes to 9,719** — 6.8x. Swapping `hunks.id` for `hunks.short_id` makes it 10.5x; both forms
+resolve in `id()` and in a spec's `ids`.
+
+**Names.** File fields are bare (`path`, `status`, `rename`, `binary`, `mode`, `symlink`,
+`truncated`) and hunk fields are written `hunks.<name>`: `hunks.index`, `hunks.id`,
+`hunks.short_id`, `hunks.type`, `hunks.removed`, `hunks.added`, `hunks.before`, `hunks.after`,
+`hunks.context`, and the semantic ones `hunks.enclosing_function`, `hunks.enclosing_scope`,
+`hunks.annotations`, `hunks.is_doc_comment`, `hunks.is_import`, `hunks.is_toplevel`,
+`hunks.nesting_depth`, `hunks.is_analyzed`. Two group names: `hunks` is every hunk field, and
+`hunks.semantic` is the eight semantic ones. The `hunks.` prefix may be dropped —
+`--fields 'path,id,type'` is the same mask — because no name means one thing on a file and another
+on a hunk. The dotted form is canonical and is what the error message hands back.
+
+`--fields` is repeatable and comma-separated; `--fields path --fields hunks.id` and
+`--fields path,hunks.id` are the same mask. Naming no hunk field omits the `hunks` key entirely
+rather than emitting `"hunks": []`, which would claim the file has none.
+
+**Five file flags are never dropped**, whether or not you name them: `rename`, `binary`, `mode`,
+`symlink` and `truncated`. Each is emitted only when it is *true*, so their absence already carries
+meaning, and a mask able to suppress one could forge it — "not a rename", "not truncated", "no
+change here". Two of the five are load-bearing rather than merely informative:
+
+- `truncated` is the only sign that the hunks listed for a file describe just its opening slice.
+- `rename.from` is the pre-image path, which the raw `jj --tool=jj-hunk` path needs and does not
+  re-derive; a spec that omits it drops the renamed file from the commit (see
+  [Renamed files](#renamed-files-the-from-field)).
+
+They cost nothing on the ordinary entries where nothing happened, which is nearly all of them.
+Naming one is accepted and redundant.
+
+**An unknown name is refused**, never ignored. `--fields 'paht,id'` would otherwise answer with
+entries that have no `path`, which reads as a diff of files that have no path. The refusal is
+`INVALID_FIELDS` and carries `valid_fields` so a caller can correct itself:
+
+```bash
+$ jj-hunk --error-format json list --fields 'paht,id'
+{"error":"usage","code":"INVALID_FIELDS","message":"...","details":{
+  "fields":["paht"],
+  "valid_fields":["path","status","rename","hunks",...,"hunks.semantic"],
+  "always_included":["rename","binary","mode","symlink","truncated"]}}
+```
+
+**It applies to `--format json` and `--format yaml` only.** `--format text` and `--format diff` are
+renderings that choose their own fields; `--files` already omits every hunk and carries
+`hunk_count` where a listing carries `hunks`; `--spec-template` emits a spec to hand back to a
+command, and a pruned spec is not a smaller spec but an invalid one. Each combination is
+`INCOMPATIBLE_OPTIONS` rather than a silent no-op — served unmasked at exit 0, a mask that was
+never applied looks exactly like a mask with nothing to drop.
 
 ### List Modes
 
@@ -1237,6 +1310,8 @@ jj-hunk schema | jq -r '.errors[] | "\(.category)\t\(.code)"'
 | `REVSET_UNRESOLVED` | jj could not resolve the revset, or it named no revision | `revset`, `resolved` (always `0`), `jj_stderr` (only when jj itself rejected it) | Fix the revset. `jj_stderr` is jj's own explanation of why |
 | `REVSET_AMBIGUOUS` | The revset resolved to more than one revision | `revset`, `resolved` (the true count), `revisions[]` (the first few) | Narrow it. A hunk is only defined between one revision and its parent |
 | `TRUNCATED_SPEC_TEMPLATE` | `--spec-template` over files `--max-bytes`/`--max-lines` cut short | `paths[]` | Drop the limits for those files. Ids from a truncated file are hashes of text the real diff does not have |
+| `INVALID_FIELDS` | `--fields` named something that is not an output field, or named nothing at all | `fields[]` (the names refused), `valid_fields[]` (every name accepted, hunk fields in their dotted form), `always_included[]` (the file flags no mask can drop) | Re-issue with names from `valid_fields`. Nothing was printed: stdout is empty, so a missing key means a refused run, not a missing value |
+| `INCOMPATIBLE_OPTIONS` | Two options that cannot both be honoured: `--fields` with `--files`, `--spec-template`, `--format text` or `--format diff`; or `--spec-template` with a text format | `option`, `incompatible_with` | Drop one of the two it names |
 | `UNKNOWN` | Anything not yet classified — I/O errors, failed `jj` invocations | `{}` | Read `message`. Do not build behaviour on `UNKNOWN`: a failure may be given a real code in a later release |
 
 `PATH_NOT_IN_DIFF` reports the spec as a whole, so `details.problems` has one entry per failed

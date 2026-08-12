@@ -93,6 +93,13 @@ pub const TRUNCATED_SPEC_TEMPLATE: ErrorCode =
 /// contain: absolute, control-character-bearing, or climbing past the root.
 pub const PATH_OUTSIDE_WORKSPACE: ErrorCode =
     ErrorCode::new("usage", "PATH_OUTSIDE_WORKSPACE");
+/// `--fields` named something that is not an output field, or named nothing at
+/// all. `details.valid_fields` is the list to correct it from.
+pub const INVALID_FIELDS: ErrorCode = ErrorCode::new("usage", "INVALID_FIELDS");
+/// Two options that cannot both be honoured: a flag that shapes a listing,
+/// asked for alongside an output mode that has no such shape.
+pub const INCOMPATIBLE_OPTIONS: ErrorCode =
+    ErrorCode::new("usage", "INCOMPATIBLE_OPTIONS");
 /// Anything not yet given a code. Its `message` is still the full prose, so a
 /// caller loses nothing it had before -- but it should not branch on this.
 pub const UNKNOWN: ErrorCode = ErrorCode::new("internal", "UNKNOWN");
@@ -123,6 +130,8 @@ pub const ALL: &[ErrorCode] = &[
     REVSET_AMBIGUOUS,
     TRUNCATED_SPEC_TEMPLATE,
     PATH_OUTSIDE_WORKSPACE,
+    INVALID_FIELDS,
+    INCOMPATIBLE_OPTIONS,
     UNKNOWN,
 ];
 
@@ -160,6 +169,13 @@ impl CodedError {
     pub fn with_details(mut self, details: Map<String, Value>) -> Self {
         self.details = details;
         self
+    }
+
+    /// The facts this error carries, for a unit test that would otherwise have
+    /// to go through `report` and re-parse its own output to see them.
+    #[cfg(test)]
+    pub(crate) fn details(&self) -> &Map<String, Value> {
+        &self.details
     }
 }
 
