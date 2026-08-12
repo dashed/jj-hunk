@@ -108,6 +108,26 @@ impl TestRepo {
             .expect("failed to run jj-hunk")
     }
 
+    /// Run with extra environment variables set on top of the usual ones.
+    ///
+    /// `JJ_HUNK_ERROR_FORMAT` is the only way to opt a *nested* invocation into
+    /// structured errors — the mutating verbs re-enter this binary through
+    /// `jj --tool=jj-hunk`, which no flag reaches — so it has to be testable.
+    fn hunk_with_env(&self, env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(jj_hunk_bin());
+        command
+            .args(args)
+            .current_dir(&self.dir)
+            .env("JJ_USER", "Test User")
+            .env("JJ_EMAIL", "test@example.com")
+            .env("JJ_CONFIG", &self.config_path)
+            .env("PATH", path_with_jj_hunk());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().expect("failed to run jj-hunk")
+    }
+
     fn hunk_with_empty_config(&self, args: &[&str]) -> std::process::Output {
         let config = self.dir.join("empty-jj-config.toml");
         std::fs::write(&config, "").unwrap();
@@ -7117,7 +7137,6 @@ fn version_flag_reports_the_built_version() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // The shape of a spec key.
 //
@@ -7393,4 +7412,370 @@ fn a_pattern_reaching_outside_the_workspace_matches_nothing_rather_than_failing(
         assert_eq!(files.len(), 1, "{args:?} stopped matching the file above sub/");
         assert_eq!(files[0]["path"].as_str().unwrap(), "../top.txt");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured errors: --error-format json / JJ_HUNK_ERROR_FORMAT
+// ---------------------------------------------------------------------------
+
+/// Run a command that must fail, and parse the JSON object it writes to
+/// stderr.
+///
+/// Asserts the two invariants that hold for every structured failure: exit 1,
+/// and *nothing* on stdout. Stdout is where `list --format json` puts its
+/// result, so an error object leaking there would look to a caller like a
+/// successful run carrying unexpected fields.
+fn error_json(repo: &TestRepo, args: &[&str]) -> serde_json::Value {
+    let mut argv = vec!["--error-format", "json"];
+    argv.extend_from_slice(args);
+    let out = repo.hunk(&argv);
+
+    assert_eq!(out.status.code(), Some(1), "every failure exits 1");
+    assert!(
+        out.stdout.is_empty(),
+        "an error must not write to stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    serde_json::from_str(&stderr)
+        .unwrap_or_else(|e| panic!("stderr is not one JSON object ({e}): {stderr}"))
+}
+
+/// A repo with two well-separated hunks in one file.
+fn error_repo(name: &str) -> TestRepo {
+    let repo = TestRepo::new(name);
+    repo.write_file("a.txt", "a\nb\nc\nd\ne\nf\ng\nh\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "a\nB\nc\nd\ne\nf\ng\nH\n");
+    repo
+}
+
+/// **The regression that would silently break every existing caller.**
+///
+/// `list --format json` writes to stdout and callers read non-empty stdout as
+/// "here are the hunks". If a failure ever started writing its object there,
+/// or if the prose on stderr changed shape, every script and agent driving
+/// this binary today would misread a failed run as a successful one.
+///
+/// So the default is asserted to be exactly what it always was: exit 1, empty
+/// stdout, prose beginning `Error: ` on stderr -- and *not* JSON, since a
+/// caller sniffing "does stderr parse as an object?" to decide whether the new
+/// format is in use must get a straight no.
+///
+/// This is a preservation guard: it passes before the change as well as after,
+/// which is the whole point of it.
+#[test]
+fn without_opting_in_failures_look_exactly_as_they_always_did() {
+    let repo = error_repo("errfmt-default");
+
+    for args in [
+        vec!["list", "--spec", "id(hunk-deadbeef)"],
+        vec!["list", "--spec", "type(insert"],
+        vec!["list", "--spec", "nosuchpred()"],
+        vec!["list", "--rev", "bogus"],
+        vec!["commit", r#"file("nope.txt")"#, "msg"],
+    ] {
+        let out = repo.hunk(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?} must still exit 1");
+        assert!(out.stdout.is_empty(), "{args:?} must write nothing to stdout");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with("Error: "),
+            "{args:?} must still print prose: {stderr}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&stderr).is_err(),
+            "{args:?} must not emit JSON unless asked: {stderr}"
+        );
+    }
+}
+
+/// Opting in must not disturb the success path either. `list` writes its
+/// result to stdout and exits 0 whether or not the flag is present -- the flag
+/// only ever governs how a *failure* is rendered.
+#[test]
+fn opting_in_does_not_change_successful_output() {
+    let repo = error_repo("errfmt-success");
+
+    let plain = repo.hunk_ok(&["list"]);
+    let opted_in = repo.hunk_ok(&["--error-format", "json", "list"]);
+    assert_eq!(plain, opted_in, "the flag must not touch a successful run");
+
+    let via_env = repo.hunk_with_env(&[("JJ_HUNK_ERROR_FORMAT", "json")], &["list"]);
+    assert!(via_env.status.success());
+    assert_eq!(String::from_utf8_lossy(&via_env.stdout), plain);
+}
+
+/// A stale id is the single most common thing an agent hits: ids are computed
+/// from file content, so one copied from a listing taken before an edit names
+/// nothing. `details.id` hands back the id that failed, so the agent can tell
+/// "I used a stale id" from "I mistyped a predicate" without reading prose.
+#[test]
+fn an_unknown_id_reports_the_id_it_could_not_find() {
+    let repo = error_repo("errfmt-unknown-id");
+    let json = error_json(&repo, &["list", "--spec", r#"id("hunk-deadbeef")"#]);
+
+    assert_eq!(json["error"], "selection");
+    assert_eq!(json["code"], "UNKNOWN_ID");
+    assert_eq!(json["details"]["id"], "hunk-deadbeef");
+}
+
+/// The payload that justifies the whole `details` field: the ids to retry
+/// with. Recovering them used to mean splitting the rendered message on `", "`
+/// and stripping the parenthesised path off each piece -- and the wording of
+/// that message has already changed once.
+#[test]
+fn an_ambiguous_id_reports_the_candidates_to_retry_with() {
+    let repo = many_hunk_repo("errfmt-ambiguous");
+    let listed = listed_ids(&repo, &[]);
+    let prefix = ambiguous_prefix(&listed);
+
+    let json = error_json(&repo, &["list", "--spec", &format!(r#"id("{prefix}")"#)]);
+    assert_eq!(json["code"], "AMBIGUOUS_ID");
+    assert_eq!(json["details"]["prefix"], prefix);
+
+    let candidates = json["details"]["candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("candidates must be an array: {json}"));
+    assert!(candidates.len() > 1, "{json}");
+    assert_eq!(json["details"]["count"], candidates.len());
+
+    // Each candidate must be usable as-is: it is an id the very next call can
+    // pass to `id()` and get exactly one hunk back.
+    for candidate in candidates {
+        let id = candidate["short_id"].as_str().expect("short_id");
+        assert_eq!(candidate["path"], "many.txt", "{json}");
+        let listing =
+            repo.hunk_ok(&["list", "--format", "text", "--spec", &format!(r#"id("{id}")"#)]);
+        assert_eq!(listing.matches("  hunk ").count(), 1, "{listing}");
+    }
+}
+
+/// A syntax error is the one failure where the actionable fact is a *position*
+/// rather than a name. Human mode draws a caret; structured mode has to hand
+/// over the offset the caret was drawn from, or a caller has to count the
+/// spaces in front of a `^`.
+#[test]
+fn a_syntax_error_reports_where_the_caret_points() {
+    let repo = error_repo("errfmt-parse");
+    let json = error_json(&repo, &["list", "--spec", "type(insert"]);
+
+    assert_eq!(json["error"], "parse");
+    assert_eq!(json["code"], "PARSE_ERROR");
+    assert_eq!(json["details"]["input"], "type(insert");
+    assert_eq!(json["details"]["position"], 11);
+    assert_eq!(json["details"]["line"], 1);
+    assert_eq!(json["details"]["column"], 11);
+
+    // A multi-line expression: `position` is an offset into the whole input,
+    // `column` is within the offending line. Reporting only the first would
+    // put the caret in the wrong place on every expression but a one-liner.
+    let json = error_json(&repo, &["list", "--spec", "type(insert)\n  | file(\"a\""]);
+    assert_eq!(json["details"]["line"], 2, "{json}");
+    assert_ne!(json["details"]["column"], json["details"]["position"], "{json}");
+}
+
+/// A malformed glob is refused rather than left to match nothing, because
+/// `~glob("vendor/**")` with a typo means "keep everything". The pattern comes
+/// back verbatim so the caller can see which of several patterns was rejected.
+#[test]
+fn an_invalid_glob_reports_the_pattern_and_the_reason() {
+    let repo = error_repo("errfmt-glob");
+    let json = error_json(&repo, &["list", "--spec", r#"glob("[")"#]);
+
+    assert_eq!(json["code"], "INVALID_GLOB");
+    assert_eq!(json["details"]["pattern"], "[");
+    assert!(
+        json["details"]["reason"].as_str().unwrap().contains("unclosed"),
+        "{json}"
+    );
+
+    // Same shape for the other pattern language, so a caller handling one
+    // handles both.
+    let json = error_json(&repo, &["list", "--spec", r#"content(regex:"[")"#]);
+    assert_eq!(json["code"], "INVALID_REGEX");
+    assert_eq!(json["details"]["pattern"], "[");
+}
+
+/// Told apart from a *stale* selector, which is the distinction that decides
+/// what an agent does next: a misspelled predicate is fixed by rewriting the
+/// query, a stale id by re-listing. Both used to be one exit code and a
+/// paragraph.
+#[test]
+fn an_unknown_predicate_and_a_bad_argument_report_what_was_wrong_with_them() {
+    let repo = error_repo("errfmt-predicate");
+
+    let json = error_json(&repo, &["list", "--spec", "nosuchpred()"]);
+    assert_eq!(json["code"], "UNKNOWN_FUNCTION");
+    assert_eq!(json["details"]["function"], "nosuchpred");
+
+    let json = error_json(&repo, &["list", "--spec", "type(nope)"]);
+    assert_eq!(json["code"], "INVALID_ARGUMENT");
+    assert_eq!(json["details"]["function"], "type");
+    assert_eq!(json["details"]["value"], "nope");
+    assert!(
+        json["details"]["valid"].as_str().unwrap().contains("insert"),
+        "the accepted values are the actionable part: {json}"
+    );
+}
+
+/// "jj cannot resolve this" and "this names several revisions" want opposite
+/// responses -- fix the revset, versus narrow it -- and both used to arrive as
+/// exit 1 with a paragraph. `resolved` is the count either way, so a caller
+/// can branch on the number rather than on the code alone.
+#[test]
+fn an_unresolvable_revset_is_told_apart_from_one_naming_several() {
+    let repo = error_repo("errfmt-revset");
+
+    let json = error_json(&repo, &["list", "--rev", "bogus"]);
+    assert_eq!(json["error"], "revset");
+    assert_eq!(json["code"], "REVSET_UNRESOLVED");
+    assert_eq!(json["details"]["revset"], "bogus");
+    assert_eq!(json["details"]["resolved"], 0);
+    // jj's own explanation, passed through: it is the only thing that says why.
+    assert!(json["details"]["jj_stderr"].is_string(), "{json}");
+
+    let json = error_json(&repo, &["list", "--rev", "all()"]);
+    assert_eq!(json["code"], "REVSET_AMBIGUOUS");
+    let resolved = json["details"]["resolved"].as_u64().expect("resolved");
+    assert!(resolved > 1, "{json}");
+    assert!(
+        !json["details"]["revisions"].as_array().expect("revisions").is_empty(),
+        "{json}"
+    );
+}
+
+/// An empty selection is refused rather than committed, and the selector that
+/// matched nothing comes back so the caller can retry a widened version of it
+/// without having to remember what it sent.
+#[test]
+fn an_empty_selection_reports_the_selector_that_matched_nothing() {
+    let repo = error_repo("errfmt-empty");
+    let json = error_json(&repo, &["commit", r#"file("nope.txt")"#, "msg"]);
+
+    assert_eq!(json["code"], "EMPTY_SELECTION");
+    assert_eq!(json["details"]["selector"], r#"file("nope.txt")"#);
+    // Which listing to check it against -- `restore` reads its ids from the
+    // reversed diff, so this is not always plain `jj-hunk list`.
+    assert_eq!(json["details"]["listing_command"], "jj-hunk list");
+}
+
+/// A spec fails as a whole document, and every entry that did not resolve is
+/// named. `path` is on each problem because that is what the caller has to
+/// edit; `kind` says whether the path, the id or the index was the wrong part.
+#[test]
+fn a_spec_that_does_not_resolve_names_every_entry_that_failed() {
+    let repo = error_repo("errfmt-unresolved-spec");
+    let listed = listed_ids(&repo, &[]);
+    let (_, good_id, _) = &listed[0];
+
+    let spec = format!(
+        r#"{{"files": {{"nope.txt": {{"ids": ["hunk-aaaaaaaa"]}},
+                       "a.txt": {{"hunks": [0, 99], "ids": ["{good_id}"]}}}}}}"#
+    );
+    let json = error_json(&repo, &["commit", &spec, "msg"]);
+
+    assert_eq!(json["code"], "PATH_NOT_IN_DIFF");
+    let problems = json["details"]["problems"].as_array().expect("problems");
+
+    let absent = problems
+        .iter()
+        .find(|p| p["kind"] == "no-such-path")
+        .unwrap_or_else(|| panic!("{json}"));
+    assert_eq!(absent["path"], "nope.txt");
+
+    let bad_index = problems
+        .iter()
+        .find(|p| p["kind"] == "no-such-index")
+        .unwrap_or_else(|| panic!("{json}"));
+    assert_eq!(bad_index["path"], "a.txt");
+    assert_eq!(bad_index["index"], 99);
+    assert_eq!(bad_index["hunk_count"], 2);
+}
+
+/// Ids are hashes of the text they were diffed from, so a template built over
+/// a file `--max-bytes` cut short would name hunks the real diff does not
+/// have. The refusal lists the files to drop the limit for.
+#[test]
+fn a_spec_template_over_truncated_files_names_the_files() {
+    let repo = error_repo("errfmt-truncated");
+    let json = error_json(&repo, &["list", "--spec-template", "--max-bytes", "4"]);
+
+    assert_eq!(json["error"], "usage");
+    assert_eq!(json["code"], "TRUNCATED_SPEC_TEMPLATE");
+    assert_eq!(json["details"]["paths"], serde_json::json!(["a.txt"]));
+}
+
+/// Not every failure has a code yet -- an I/O error opening a spec file has
+/// none. Those must still arrive as a parseable object carrying the full
+/// prose, or a caller that opted in has to keep a second, text-scraping code
+/// path for exactly the failures nobody has classified, which is the fallback
+/// this feature exists to retire.
+#[test]
+fn an_uncoded_failure_is_still_a_parseable_object() {
+    let repo = error_repo("errfmt-uncoded");
+    let json = error_json(&repo, &["list", "--spec-file", "/nonexistent/spec.json"]);
+
+    assert_eq!(json["error"], "internal");
+    assert_eq!(json["code"], "UNKNOWN");
+    assert_eq!(json["details"], serde_json::json!({}));
+    // The whole chain, exactly as human mode prints it, so nothing is lost.
+    let message = json["message"].as_str().expect("message");
+    assert!(message.contains("/nonexistent/spec.json"), "{message}");
+    assert!(message.contains("Caused by"), "{message}");
+}
+
+/// The environment variable exists because the flag cannot reach everywhere it
+/// is needed: the mutating verbs re-enter this binary as `jj-hunk select`
+/// through `jj --tool=jj-hunk`, and nothing threads an argv across that hop.
+/// An agent driving many invocations also sets it once rather than per call.
+///
+/// The flag wins when both are given, so a single call can opt back out of a
+/// session-wide setting.
+#[test]
+fn the_env_var_opts_in_and_the_flag_overrides_it() {
+    let repo = error_repo("errfmt-env");
+    let args = ["list", "--spec", "nosuchpred()"];
+
+    let via_env = repo.hunk_with_env(&[("JJ_HUNK_ERROR_FORMAT", "json")], &args);
+    assert_eq!(via_env.status.code(), Some(1));
+    assert!(via_env.stdout.is_empty());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&via_env.stderr)).expect("JSON on stderr");
+    assert_eq!(json["code"], "UNKNOWN_FUNCTION");
+
+    // Case is forgiven. An agent that exports JSON rather than json has still
+    // opted in, and silently handing it prose instead is the worst outcome:
+    // it would parse the prose as JSON forever.
+    let upper = repo.hunk_with_env(&[("JJ_HUNK_ERROR_FORMAT", "JSON")], &args);
+    assert_eq!(
+        String::from_utf8_lossy(&upper.stderr),
+        String::from_utf8_lossy(&via_env.stderr)
+    );
+
+    let mut with_flag = vec!["--error-format", "human"];
+    with_flag.extend_from_slice(&args);
+    let overridden = repo.hunk_with_env(&[("JJ_HUNK_ERROR_FORMAT", "json")], &with_flag);
+    let stderr = String::from_utf8_lossy(&overridden.stderr);
+    assert!(stderr.starts_with("Error: "), "the flag must win: {stderr}");
+}
+
+/// The flag is global, so it may be written before or after the subcommand.
+/// An agent assembling an argv should not have to know which position clap
+/// wants, and getting it wrong would exit 2 with a usage error rather than the
+/// structured object it asked for.
+#[test]
+fn the_flag_is_accepted_on_either_side_of_the_subcommand() {
+    let repo = error_repo("errfmt-position");
+
+    let before = repo.hunk(&["--error-format", "json", "list", "--spec", "nosuchpred()"]);
+    let after = repo.hunk(&["list", "--spec", "nosuchpred()", "--error-format", "json"]);
+
+    assert_eq!(before.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&before.stderr),
+        String::from_utf8_lossy(&after.stderr)
+    );
 }

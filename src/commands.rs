@@ -1,4 +1,5 @@
 use crate::diff::{self, apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::errors::{self, CodedError};
 use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
 #[cfg(feature = "semantic")]
@@ -106,7 +107,7 @@ impl DiffTarget {
 
     /// The `jj-hunk list` invocation that shows exactly this diff, so an error
     /// about an id that did not resolve can name the listing it came from.
-    fn listing_command(&self) -> String {
+    pub(crate) fn listing_command(&self) -> String {
         match self {
             DiffTarget::Rev(None) => "jj-hunk list".to_string(),
             DiffTarget::Rev(Some(rev)) => format!("jj-hunk list -r {rev}"),
@@ -611,7 +612,7 @@ pub(crate) fn evaluate_hunkset(
     truncation: Truncation,
 ) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
-        .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
+        .map_err(|e| e.coded(format!("failed to parse hunkset:\n{}", e.display_with_context())))?;
 
     // `Mark`, not `Skip`. Skipping meant no expression could so much as name a
     // binary file, while the spec that came back still said `default: reset` --
@@ -662,7 +663,7 @@ pub(crate) fn evaluate_hunkset(
     }));
 
     let selected = hunkset::evaluate(&ast, &enriched)
-        .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e.display_with_context()))?;
+        .map_err(|e| e.coded(format!("hunkset evaluation error: {}", e.display_with_context())))?;
 
     let rename_sources: HashMap<&str, &str> = file_hunks
         .iter()
@@ -922,7 +923,16 @@ pub(crate) fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to resolve revset `{}`: {}", revset, stderr.trim());
+        return Err(CodedError::new(
+            errors::REVSET_UNRESOLVED,
+            format!("failed to resolve revset `{}`: {}", revset, stderr.trim()),
+        )
+        .with("revset", revset)
+        .with("resolved", 0)
+        // jj's own wording, passed through rather than re-read: it is the only
+        // thing that says *why* the revset did not resolve.
+        .with("jj_stderr", stderr.trim())
+        .into());
     }
 
     Ok(String::from_utf8_lossy(&output.stdout)
@@ -946,25 +956,53 @@ pub(crate) fn resolve_revset(revset: &str) -> Result<Vec<ResolvedRevision>> {
 fn resolve_single_revision(revset: &str) -> Result<ResolvedRevision> {
     let mut resolved = resolve_revset(revset)?;
     match resolved.len() {
-        0 => anyhow::bail!("revset `{}` did not resolve to any revision", revset),
+        // Same code as a revset jj rejected outright: from the caller's side
+        // both mean "this names no revision to diff", and the distinction --
+        // whether jj could parse it -- is in `jj_stderr`, present only when it
+        // could not.
+        0 => Err(CodedError::new(
+            errors::REVSET_UNRESOLVED,
+            format!("revset `{}` did not resolve to any revision", revset),
+        )
+        .with("revset", revset)
+        .with("resolved", 0)
+        .into()),
         1 => Ok(resolved.remove(0)),
-        n => anyhow::bail!(
-            "revset `{}` resolved to {} revisions, but jj-hunk needs exactly one.\n\
-             Hunks are only defined between a single revision and its parent.\n\
-             Resolved to: {}",
-            revset,
-            n,
-            preview_ids(resolved.iter().map(|r| r.id.as_str()))
-        ),
+        n => {
+            let ids: Vec<&str> = resolved.iter().map(|r| r.id.as_str()).collect();
+            Err(CodedError::new(
+                errors::REVSET_AMBIGUOUS,
+                format!(
+                    "revset `{}` resolved to {} revisions, but jj-hunk needs exactly one.\n\
+                     Hunks are only defined between a single revision and its parent.\n\
+                     Resolved to: {}",
+                    revset,
+                    n,
+                    preview_ids(ids.iter().copied())
+                ),
+            )
+            .with("revset", revset)
+            .with("resolved", n)
+            // Capped at the same width the prose previews, so the two cannot
+            // disagree and a revset matching a whole repo does not turn one
+            // error line into megabytes. `resolved` is the true count.
+            .with(
+                "revisions",
+                ids.iter().take(PREVIEW_IDS).copied().collect::<Vec<_>>(),
+            )
+            .into())
+        }
     }
 }
 
+/// How many ids an error names before it stops counting.
+const PREVIEW_IDS: usize = 5;
+
 fn preview_ids<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> String {
-    const MAX: usize = 5;
     let total = ids.len();
-    let mut shown: Vec<String> = ids.take(MAX).map(str::to_string).collect();
-    if total > MAX {
-        shown.push(format!("... and {} more", total - MAX));
+    let mut shown: Vec<String> = ids.take(PREVIEW_IDS).map(str::to_string).collect();
+    if total > PREVIEW_IDS {
+        shown.push(format!("... and {} more", total - PREVIEW_IDS));
     }
     shown.join(", ")
 }
@@ -1419,13 +1457,18 @@ fn build_spec_template(files: Vec<FileEntry>) -> Result<SpecTemplateOutput> {
         .map(|file| file.path.as_str())
         .collect();
     if !cut.is_empty() {
-        anyhow::bail!(
-            "cannot build a spec template from truncated files:\n  {}\n\
-             Hunk ids are computed from the file contents, so ids taken from a \
-             truncated file will not match the real diff.\n\
-             Drop --max-bytes/--max-lines to template these files.",
-            cut.join("\n  ")
-        );
+        return Err(CodedError::new(
+            errors::TRUNCATED_SPEC_TEMPLATE,
+            format!(
+                "cannot build a spec template from truncated files:\n  {}\n\
+                 Hunk ids are computed from the file contents, so ids taken from a \
+                 truncated file will not match the real diff.\n\
+                 Drop --max-bytes/--max-lines to template these files.",
+                cut.join("\n  ")
+            ),
+        )
+        .with("paths", cut)
+        .into());
     }
 
     let mut output = BTreeMap::new();
@@ -2608,6 +2651,61 @@ pub(crate) fn validate_spec_paths(spec: &Spec) -> Result<()> {
     );
 }
 
+/// One way a spec entry failed to name something the diff contains.
+///
+/// Held as a value rather than a formatted line so the same finding can be
+/// both read aloud and handed over structured. Rendering it to a string first
+/// and recovering the path afterwards would mean parsing our own prose, which
+/// is what the error codes exist to spare a caller.
+enum SpecProblem {
+    RenamedTo { path: String, new_path: String },
+    NoSuchPath { path: String },
+    NoSuchId { path: String, id: String },
+    AmbiguousId { path: String, id: String, count: usize },
+    NoSuchIndex { path: String, index: usize, hunk_count: usize },
+}
+
+impl SpecProblem {
+    /// The line this problem contributes to the human message. Unchanged from
+    /// when these were built as strings in place.
+    fn message(&self) -> String {
+        match self {
+            SpecProblem::RenamedTo { path, new_path } => format!(
+                "{path}: renamed to {new_path} in this diff -- \
+                 file the entry under {new_path} instead"
+            ),
+            SpecProblem::NoSuchPath { path } => format!("{path}: no such path in the diff"),
+            SpecProblem::NoSuchId { path, id } => format!("{path}: no hunk with id {id}"),
+            SpecProblem::AmbiguousId { path, id, count } => format!(
+                "{path}: id {id} is ambiguous, it names {count} hunks -- use a longer prefix"
+            ),
+            SpecProblem::NoSuchIndex { path, index, hunk_count } => {
+                format!("{path}: no hunk with index {index} (file has {hunk_count})")
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            SpecProblem::RenamedTo { path, new_path } => {
+                serde_json::json!({"kind": "renamed", "path": path, "renamed_to": new_path})
+            }
+            SpecProblem::NoSuchPath { path } => {
+                serde_json::json!({"kind": "no-such-path", "path": path})
+            }
+            SpecProblem::NoSuchId { path, id } => {
+                serde_json::json!({"kind": "no-such-id", "path": path, "id": id})
+            }
+            SpecProblem::AmbiguousId { path, id, count } => {
+                serde_json::json!({"kind": "ambiguous-id", "path": path, "id": id, "count": count})
+            }
+            SpecProblem::NoSuchIndex { path, index, hunk_count } => serde_json::json!({
+                "kind": "no-such-index", "path": path, "index": index, "hunk_count": hunk_count
+            }),
+        }
+    }
+}
+
 /// Check that a spec actually refers to the diff it will be applied to.
 ///
 /// `Spec::selects_nothing` is structural: a non-empty id list satisfies it even
@@ -2661,10 +2759,10 @@ fn validate_spec_resolves(
         }
     }
 
-    let mut problems: Vec<String> = Vec::new();
+    let mut problems: Vec<SpecProblem> = Vec::new();
     // Held back until the whole spec has been walked: whether an absent path
     // matters depends on what the rest of the spec turned out to name.
-    let mut unresolved: Vec<String> = Vec::new();
+    let mut unresolved: Vec<SpecProblem> = Vec::new();
     // Whether any entry that means to keep something names a path this diff
     // actually contains.
     let mut keeps_a_real_path = false;
@@ -2686,10 +2784,10 @@ fn validate_spec_resolves(
                 // this key: it matches nothing on the right, and resetting it
                 // would resurrect the file the rename moved away. The hunk ids
                 // are printed under the new path, so that is the key to use.
-                Some(new_path) => problems.push(format!(
-                    "{path}: renamed to {new_path} in this diff -- \
-                     file the entry under {new_path} instead"
-                )),
+                Some(new_path) => problems.push(SpecProblem::RenamedTo {
+                    path: path.clone(),
+                    new_path: new_path.to_string(),
+                }),
                 None if intends_to_keep => match file_spec {
                     // Ids and indices are read off a real diff, so an entry
                     // carrying them is not a stable allowlist that has gone
@@ -2699,10 +2797,10 @@ fn validate_spec_resolves(
                     // still matches mask every entry that no longer does, and
                     // the commit then held a subset of what the spec asked for.
                     FileSpec::Selection(_) => {
-                        problems.push(format!("{path}: no such path in the diff"))
+                        problems.push(SpecProblem::NoSuchPath { path: path.clone() })
                     }
                     FileSpec::Action { .. } => {
-                        unresolved.push(format!("{path}: no such path in the diff"))
+                        unresolved.push(SpecProblem::NoSuchPath { path: path.clone() })
                     }
                 },
                 None => {}
@@ -2730,11 +2828,16 @@ fn validate_spec_resolves(
             // `select`, which sees one file at a time and would just keep both.
             let matched = fh.hunks.iter().filter(|hunk| diff::id_matches(id, &hunk.id)).count();
             match matched {
-                0 => problems.push(format!("{path}: no hunk with id {id}")),
+                0 => problems.push(SpecProblem::NoSuchId {
+                    path: path.clone(),
+                    id: id.to_string(),
+                }),
                 1 => {}
-                n => problems.push(format!(
-                    "{path}: id {id} is ambiguous, it names {n} hunks -- use a longer prefix"
-                )),
+                n => problems.push(SpecProblem::AmbiguousId {
+                    path: path.clone(),
+                    id: id.to_string(),
+                    count: n,
+                }),
             }
         }
 
@@ -2743,10 +2846,11 @@ fn validate_spec_resolves(
                 continue;
             };
             if !fh.hunks.iter().any(|hunk| hunk.index == *index) {
-                problems.push(format!(
-                    "{path}: no hunk with index {index} (file has {})",
-                    fh.hunks.len()
-                ));
+                problems.push(SpecProblem::NoSuchIndex {
+                    path: path.clone(),
+                    index: *index,
+                    hunk_count: fh.hunks.len(),
+                });
             }
         }
     }
@@ -2762,7 +2866,9 @@ fn validate_spec_resolves(
     }
 
     if !problems.is_empty() {
-        problems.sort();
+        // By the rendered line, which is what this sorted before the findings
+        // became values -- so the message reads in exactly the order it did.
+        problems.sort_by_key(SpecProblem::message);
         // The listing is named after the target rather than hardcoded, because
         // `restore` edits the diff the other way round: an id copied from
         // `list -r REV` cannot resolve there, and a fixed hint would send the
@@ -2772,13 +2878,23 @@ fn validate_spec_resolves(
         // empty result is acceptable, not that the names in the spec need not
         // exist, and suggesting it here is what taught people to silence this
         // check instead of fixing the spec.
-        anyhow::bail!(
-            "spec does not resolve against the diff:\n  {}\n\
-             Those entries do not name exactly what they meant to. Check them \
-             against `{} --spec-template`.",
-            problems.join("\n  "),
-            target.listing_command()
-        );
+        let lines: Vec<String> = problems.iter().map(SpecProblem::message).collect();
+        return Err(CodedError::new(
+            errors::PATH_NOT_IN_DIFF,
+            format!(
+                "spec does not resolve against the diff:\n  {}\n\
+                 Those entries do not name exactly what they meant to. Check them \
+                 against `{} --spec-template`.",
+                lines.join("\n  "),
+                target.listing_command()
+            ),
+        )
+        .with(
+            "problems",
+            problems.iter().map(SpecProblem::to_json).collect::<Vec<_>>(),
+        )
+        .with("listing_command", target.listing_command())
+        .into());
     }
 
     Ok(())
@@ -2946,15 +3062,21 @@ fn run_jj_with_selection_on(
         // all for `restore` -- so the message below stops at the one thing that
         // holds everywhere.
         if !allow_empty && parsed.selects_nothing() {
-            anyhow::bail!(
-                "selection matched no hunks: {}\n\
-                 An empty selection is nearly always a mistyped selector \
-                 rather than an intent, so it is refused.\n\
-                 Check it against `{} --spec ...`, or pass --allow-empty if \
-                 that is what you meant.",
-                raw_spec.trim(),
-                target.listing_command()
-            );
+            return Err(CodedError::new(
+                errors::EMPTY_SELECTION,
+                format!(
+                    "selection matched no hunks: {}\n\
+                     An empty selection is nearly always a mistyped selector \
+                     rather than an intent, so it is refused.\n\
+                     Check it against `{} --spec ...`, or pass --allow-empty if \
+                     that is what you meant.",
+                    raw_spec.trim(),
+                    target.listing_command()
+                ),
+            )
+            .with("selector", raw_spec.trim())
+            .with("listing_command", target.listing_command())
+            .into());
         }
 
         // A hunkset spec is built from the diff it was evaluated against, so

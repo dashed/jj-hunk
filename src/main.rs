@@ -5,6 +5,7 @@ mod absorb;
 mod diff;
 #[cfg(feature = "semantic")]
 mod semantic;
+mod errors;
 mod glob;
 mod hunkset;
 mod spec;
@@ -12,6 +13,7 @@ mod commands;
 
 use absorb::{AbsorbOptions, InsertionPolicy};
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Truncation};
+use errors::ErrorFormat;
 
 #[derive(Parser)]
 #[command(name = "jj-hunk")]
@@ -21,6 +23,30 @@ use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions, Trun
 // upstream's at a glance.
 #[command(version)]
 struct Cli {
+    /// How failures are reported on stderr: human prose, or one JSON object
+    /// carrying a stable error code
+    //
+    // `global`, so it may be written before or after the subcommand -- an
+    // agent building an argv does not have to know which.
+    //
+    // `env`, because the flag cannot reach every process that needs it. The
+    // mutating verbs run `jj ... --tool=jj-hunk`, and jj re-executes this
+    // binary as `jj-hunk select`; nothing threads a flag through that hop,
+    // and an environment variable is inherited by it for free.
+    //
+    // `ignore_case`, so `JJ_HUNK_ERROR_FORMAT=JSON` works. An unrecognised
+    // value is a usage error rather than a silent fallback to prose: a caller
+    // that thinks it opted in and did not would parse prose as JSON forever.
+    #[arg(
+        long = "error-format",
+        value_enum,
+        global = true,
+        ignore_case = true,
+        env = "JJ_HUNK_ERROR_FORMAT",
+        default_value_t = ErrorFormat::Human
+    )]
+    error_format: ErrorFormat,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -194,9 +220,20 @@ struct ListArgs {
     spec_template: bool,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+    let error_format = cli.error_format;
 
+    if let Err(err) = run(cli) {
+        errors::report(&err, error_format);
+        // One exit code for every failure. The class lives in the JSON `code`
+        // field instead, so adding a class cannot break a caller that is
+        // already branching on the status.
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::List(args) => {
             let mode = if args.files {

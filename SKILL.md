@@ -26,6 +26,15 @@ cargo install --git https://github.com/dashed/jj-hunk --locked
 query language. Installing it gives you a binary that cannot run most of what is
 documented here.
 
+**Set `JJ_HUNK_ERROR_FORMAT=json` before you start.** Every failure then arrives as one JSON object
+on stderr with a stable `code` to branch on, instead of a paragraph of prose you would have to
+pattern-match. Exit code, stdout and the wording all stay as they are, so it costs nothing. See
+[Errors](#errors).
+
+```bash
+export JJ_HUNK_ERROR_FORMAT=json
+```
+
 **No jj config is required.** Every `jj-hunk` verb pins `merge-tools.jj-hunk.program` to the
 executable that is running and passes it to `jj` on the command line, so a `[merge-tools.jj-hunk]`
 block in `~/.jjconfig.toml` is ignored by them — a stale or wrong one cannot break them either.
@@ -515,6 +524,104 @@ diff with no mail headers, so `git am` rejects it outright (`Patch format detect
 `git apply` handles it, including added files, deleted files, CRLF line endings, and missing
 trailing newlines. Renames are the exception — the patch records a rename as a plain modification
 of the new path, so it will not apply against a tree that still has the old path.
+
+## Errors
+
+Every failure exits **1**, writes prose to **stderr**, and leaves **stdout empty**. That is the
+default and it is not changing: `list --format json` writes its result to stdout, so a caller reads
+non-empty stdout as "here are the hunks", and an error object arriving there would make a failed run
+look like a successful one carrying unexpected fields.
+
+For a caller that needs to branch on *what* went wrong, opt into the structured form:
+
+```bash
+# per call
+jj-hunk --error-format json list --spec 'id(hunk-deadbeef)'
+
+# or once, for a whole session -- this also reaches the nested `jj-hunk select`
+# that the mutating verbs run through `jj --tool=jj-hunk`, which no flag can
+export JJ_HUNK_ERROR_FORMAT=json
+```
+
+Still exit 1, still nothing on stdout, still stderr — but one JSON object on one line:
+
+```json
+{
+  "error": "selection",
+  "code": "UNKNOWN_ID",
+  "message": "hunkset evaluation error: hunk id 'hunk-deadbeef' matches no hunk in this diff -- ids change when the hunk's content or its file changes, so one copied from an earlier listing may be stale. Run 'list' again for the current ids.",
+  "details": { "id": "hunk-deadbeef" }
+}
+```
+
+| Field | |
+|-------|--|
+| `error` | Coarse category: `parse`, `selection`, `revset`, `usage`, `internal` |
+| `code` | The stable identifier to branch on |
+| `message` | Exactly the text human mode prints, `Caused by:` chain included — nothing is lost by opting in |
+| `details` | The machine-actionable facts, keyed per code |
+
+The flag beats the environment variable, so one call can opt back out of a session-wide setting.
+Both accept `human` and `json`, case-insensitively. An unrecognised value is a usage error rather
+than a silent fallback to prose — a caller that believes it opted in and did not would parse prose
+as JSON forever.
+
+**Not covered:** argument errors caught by the argument parser itself — an unknown flag, a missing
+subcommand, `--rev` together with `--from` — exit **2** with prose on stderr, whatever
+`--error-format` says. They are raised before the setting is known, and they already exited 2 before
+this feature existed.
+
+### Codes
+
+**The codes are a public contract.** Renaming one is a breaking change; adding one is not. Branch on
+`code`, never on `message`: the ambiguity, empty-selection and unresolved-path wordings have each
+been rewritten within the last few releases, and a caller matching their text would have broken
+three times.
+
+| `code` | Raised when | `details` carries | What to do about it |
+|--------|-------------|-------------------|---------------------|
+| `PARSE_ERROR` | The expression is not syntactically a hunkset | `input`, `position` (character offset into the whole expression), `line` (1-based), `column` (0-based, within that line) | Fix the syntax at `position`; the same offset the `^` is drawn from. Not retryable as sent |
+| `UNKNOWN_FUNCTION` | No predicate by that name | `function` | A typo or an invented predicate. Check it against the predicate list; do not retry unchanged |
+| `INVALID_ARGUMENT` | A predicate rejected the value or the argument shape | `function`, `value`, `valid` | Re-issue with one of the values named in `valid` |
+| `INVALID_GLOB` | A glob pattern does not compile | `pattern`, `reason` | Fix the pattern. Do not treat it as "matched nothing": under `~` that inverts to "keep everything" |
+| `INVALID_REGEX` | A regex pattern does not compile | `pattern`, `reason` | Same |
+| `UNKNOWN_ID` | `id()` named a hunk this diff does not contain | `id` | Almost always a stale id — they are hashes of the hunk's content and context. Re-run `list` and use an id from that run |
+| `AMBIGUOUS_ID` | An abbreviation reaches more than one hunk | `prefix`, `count`, `candidates[]` of `{short_id, path}` | Retry with one of `candidates[].short_id`. Each is already unambiguous over this diff, so no lengthening loop is needed |
+| `SEMANTIC_FEATURE_REQUIRED` | A semantic predicate in a build without the `semantic` feature | `predicate` | Rewrite without semantic predicates, or install a default build. Cannot occur in a default build, where `semantic` is on |
+| `EMPTY_SELECTION` | The selection resolved and keeps nothing | `selector` (`null` when it came from `--spec-file`), `listing_command` | Widen the selector, or pass `--allow-empty` if empty really was the intent. `listing_command --spec <selector>` shows what it matched |
+| `PATH_NOT_IN_DIFF` | A JSON/YAML spec names a path, id or index the diff does not contain | `problems[]` (see below), `listing_command` | Fix the named entries. Every problem carries the `path` to edit |
+| `REVSET_UNRESOLVED` | jj could not resolve the revset, or it named no revision | `revset`, `resolved` (always `0`), `jj_stderr` (only when jj itself rejected it) | Fix the revset. `jj_stderr` is jj's own explanation of why |
+| `REVSET_AMBIGUOUS` | The revset resolved to more than one revision | `revset`, `resolved` (the true count), `revisions[]` (the first few) | Narrow it. A hunk is only defined between one revision and its parent |
+| `TRUNCATED_SPEC_TEMPLATE` | `--spec-template` over files `--max-bytes`/`--max-lines` cut short | `paths[]` | Drop the limits for those files. Ids from a truncated file are hashes of text the real diff does not have |
+| `UNKNOWN` | Anything not yet classified — I/O errors, failed `jj` invocations | `{}` | Read `message`. Do not build behaviour on `UNKNOWN`: a failure may be given a real code in a later release |
+
+`PATH_NOT_IN_DIFF` reports the spec as a whole, so `details.problems` has one entry per failed
+reference. Every entry has a `path` and a `kind`:
+
+| `kind` | Also carries | Means |
+|--------|--------------|-------|
+| `no-such-path` | — | The diff contains no such file |
+| `renamed` | `renamed_to` | The entry is keyed by a rename's old path; file it under `renamed_to` |
+| `no-such-id` | `id` | That file has no hunk with that id — usually stale |
+| `ambiguous-id` | `id`, `count` | The prefix names `count` hunks in that file; use a longer one |
+| `no-such-index` | `index`, `hunk_count` | `index` is out of range; the file has `hunk_count` hunks |
+
+`AMBIGUOUS_ID` and `ambiguous-id` are the same fault at two layers, and both appear because a
+hunkset fails per predicate while a spec fails as a whole document: `id("hunk-2")` in a hunkset
+raises `AMBIGUOUS_ID`, and `{"ids": ["hunk-2"]}` in a spec raises `PATH_NOT_IN_DIFF` with an
+`ambiguous-id` problem naming the file.
+
+A worked retry, which is the shape most of these take:
+
+```bash
+$ jj-hunk --error-format json list --spec 'id("hunk-2")'
+{"error":"selection","code":"AMBIGUOUS_ID","message":"...","details":{
+  "prefix":"hunk-2","count":2,
+  "candidates":[{"short_id":"hunk-21748da5","path":"many.txt"},
+                {"short_id":"hunk-253c1b1c","path":"many.txt"}]}}
+
+$ jj-hunk list --spec 'id("hunk-21748da5")'   # one hunk, no guessing
+```
 
 ## Hunk IDs
 

@@ -3,7 +3,7 @@ use crate::spec::{DefaultAction, FileSpec, HunkSpec, Spec};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ast::{Arg, Expr, PatternKind, StringPattern};
-use super::error::HunksetError;
+use super::error::{HunksetError, IdCandidate};
 use super::pattern::{compile_patterns, CompiledPattern};
 
 /// A hunk with its file-level context, used during evaluation.
@@ -742,15 +742,19 @@ fn eval_id(
             //
             // `file_path`, not `all_paths()`: this tells the user where to look,
             // and the only path they can look at is the one the file has now.
-            let mut which: Vec<String> = matched
+            let mut which: Vec<IdCandidate> = matched
                 .iter()
-                .map(|&i| format!("{} ({})", hunks[i].short_id(), hunks[i].file_path))
+                .map(|&i| IdCandidate {
+                    short_id: hunks[i].short_id().to_string(),
+                    path: hunks[i].file_path.to_string(),
+                })
                 .collect();
-            which.sort();
+            // By the rendered form, so the message reads in the same order it
+            // always has now that the candidates are carried structured.
+            which.sort_by_key(ToString::to_string);
             return Err(HunksetError::AmbiguousId {
                 prefix: p.value().to_string(),
-                count: matched.len(),
-                candidates: which.join(", "),
+                candidates: which,
             });
         }
         if matched.is_empty() {

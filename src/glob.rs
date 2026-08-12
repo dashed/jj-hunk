@@ -67,6 +67,19 @@ pub struct GlobError {
     reason: &'static str,
 }
 
+impl GlobError {
+    /// The pattern as written. Exposed so a structured error can hand it back
+    /// instead of making a caller cut it out of the rendered message.
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Why it does not compile, without the `invalid glob '...':` preamble.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
 impl std::fmt::Display for GlobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "invalid glob '{}': {}", self.pattern, self.reason)

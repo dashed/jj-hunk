@@ -38,11 +38,13 @@
 
 use crate::commands::{self, BinaryMode, SpecDecision, Truncation};
 use crate::diff::Hunk;
+use crate::errors::{self, CodedError};
 use crate::hunkset;
 use crate::spec::Spec;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -338,12 +340,27 @@ fn build_plan(options: &AbsorbOptions) -> Result<Plan> {
             format!("\n  {}", notes.join("\n  "))
         };
         if spec.is_some() {
-            anyhow::bail!(
-                "the selection matched no hunks in {}, so there is nothing to \
-                 absorb.{unroutable}\n\
-                 Check it with `jj-hunk list --spec ...`.",
-                source.short
-            );
+            return Err(CodedError::new(
+                errors::EMPTY_SELECTION,
+                format!(
+                    "the selection matched no hunks in {}, so there is nothing to \
+                     absorb.{unroutable}\n\
+                     Check it with `jj-hunk list --spec ...`.",
+                    source.short
+                ),
+            )
+            // Absent when the spec came from `--spec-file`: what was read is
+            // a file the caller already holds, and inlining it here would put
+            // an arbitrary amount of JSON in an error payload.
+            .with(
+                "selector",
+                options.spec.as_deref().map(Value::from).unwrap_or(Value::Null),
+            )
+            .with(
+                "listing_command",
+                commands::DiffTarget::rev(rev).listing_command(),
+            )
+            .into());
         }
         anyhow::bail!(
             "{} changes no lines that absorb can route, so there is nothing to \

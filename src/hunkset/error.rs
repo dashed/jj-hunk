@@ -1,4 +1,33 @@
+use crate::errors::{self, CodedError, ErrorCode};
+use serde_json::{Map, Value};
 use thiserror::Error;
+
+/// One of the hunks an abbreviated id reached.
+///
+/// Structured rather than pre-joined so that [`HunksetError::details`] can
+/// hand a caller the ids to retry with. Before this, the only way to recover
+/// them was to split the rendered message on `", "`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdCandidate {
+    /// The abbreviation `list` prints, which is unambiguous over this diff.
+    pub short_id: String,
+    /// The path the hunk's file has now.
+    pub path: String,
+}
+
+impl std::fmt::Display for IdCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.short_id, self.path)
+    }
+}
+
+fn render_candidates(candidates: &[IdCandidate]) -> String {
+    candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[derive(Debug, Error)]
 pub enum HunksetError {
@@ -21,11 +50,12 @@ pub enum HunksetError {
     InvalidGlob { source: crate::glob::GlobError },
     #[error("hunk id '{id}' matches no hunk in this diff -- ids change when the hunk's content or its file changes, so one copied from an earlier listing may be stale. Run 'list' again for the current ids.")]
     UnknownId { id: String },
-    #[error("hunk id '{prefix}' is ambiguous -- it matches {count} hunks: {candidates}. Use more characters, or exact:\"<full-id>\".")]
+    #[error("hunk id '{prefix}' is ambiguous -- it matches {} hunks: {}. Use more characters, or exact:\"<full-id>\".", .candidates.len(), render_candidates(.candidates))]
     AmbiguousId {
         prefix: String,
-        count: usize,
-        candidates: String,
+        /// Sorted by their rendered form, so the message and the details agree
+        /// on an order and neither depends on hash iteration.
+        candidates: Vec<IdCandidate>,
     },
     #[error("{func}() does not accept '{value}' -- valid values are: {valid}")]
     InvalidArgument {
@@ -48,6 +78,92 @@ const MAX_CONTEXT_WIDTH: usize = 100;
 const ELLIPSIS: &str = "...";
 
 impl HunksetError {
+    /// The stable code a caller branches on.
+    ///
+    /// Total by construction: adding a variant without giving it a code does
+    /// not compile, so the taxonomy cannot quietly grow a hole.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            HunksetError::Parse { .. } => errors::PARSE_ERROR,
+            HunksetError::UnknownFunction { .. } => errors::UNKNOWN_FUNCTION,
+            HunksetError::InvalidRegex { .. } => errors::INVALID_REGEX,
+            HunksetError::InvalidGlob { .. } => errors::INVALID_GLOB,
+            HunksetError::UnknownId { .. } => errors::UNKNOWN_ID,
+            HunksetError::AmbiguousId { .. } => errors::AMBIGUOUS_ID,
+            HunksetError::InvalidArgument { .. } => errors::INVALID_ARGUMENT,
+            HunksetError::SemanticFeatureRequired { .. } => errors::SEMANTIC_FEATURE_REQUIRED,
+        }
+    }
+
+    /// The parts of the failure that were previously readable only by parsing
+    /// the message.
+    pub fn details(&self) -> Map<String, Value> {
+        let mut details = Map::new();
+        let mut put = |key: &str, value: Value| {
+            details.insert(key.to_string(), value);
+        };
+
+        match self {
+            HunksetError::Parse { input, position, .. } => {
+                let (_, column) = locate(input, *position);
+                put("input", Value::from(input.as_str()));
+                // Character offset into the whole expression, which is what
+                // the caret is placed from.
+                put("position", Value::from(*position));
+                put("line", Value::from(line_number(input, *position)));
+                // Zero-based, within the offending line -- an expression may
+                // span several, and `position` alone points past the end of
+                // the first one.
+                put("column", Value::from(column));
+            }
+            HunksetError::UnknownFunction { name } => put("function", Value::from(name.as_str())),
+            HunksetError::InvalidRegex { pattern, source } => {
+                put("pattern", Value::from(pattern.as_str()));
+                put("reason", Value::from(source.to_string()));
+            }
+            HunksetError::InvalidGlob { source } => {
+                put("pattern", Value::from(source.pattern()));
+                put("reason", Value::from(source.reason()));
+            }
+            HunksetError::UnknownId { id } => put("id", Value::from(id.as_str())),
+            HunksetError::AmbiguousId { prefix, candidates } => {
+                put("prefix", Value::from(prefix.as_str()));
+                put("count", Value::from(candidates.len()));
+                put(
+                    "candidates",
+                    Value::Array(
+                        candidates
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({"short_id": c.short_id, "path": c.path})
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            HunksetError::InvalidArgument { func, value, valid } => {
+                put("function", Value::from(func.as_str()));
+                put("value", Value::from(value.as_str()));
+                put("valid", Value::from(valid.as_str()));
+            }
+            HunksetError::SemanticFeatureRequired { name } => {
+                put("predicate", Value::from(name.as_str()))
+            }
+        }
+
+        details
+    }
+
+    /// Carry this error's code and details up under the message the CLI
+    /// prints for it.
+    ///
+    /// The two call sites in `commands.rs` used to render the error into a
+    /// string and drop the value, which left the top level nothing to read but
+    /// the text. The message is unchanged; only the code now survives with it.
+    pub fn coded(&self, message: String) -> CodedError {
+        CodedError::new(self.code(), message).with_details(self.details())
+    }
+
     /// Format the error with a caret pointing at the position in the input.
     pub fn display_with_context(&self) -> String {
         match self {
@@ -89,6 +205,20 @@ fn locate(input: &str, position: usize) -> (&str, usize) {
     (input[line_start..line_end].trim_end_matches('\r'), column)
 }
 
+/// The 1-based line `position` falls on.
+///
+/// Separate from [`locate`], which returns the line's *text*: a caller reading
+/// `details` gets the whole expression and needs a number to index it by, not
+/// a copy of one line it would then have to find again.
+fn line_number(input: &str, position: usize) -> usize {
+    input
+        .chars()
+        .take(position)
+        .filter(|ch| *ch == '\n')
+        .count()
+        + 1
+}
+
 /// Trim `line` to a readable width around `column`, returning the text to show
 /// and the column the caret sits at within it.
 fn window(line: &str, column: usize) -> (String, usize) {
@@ -119,6 +249,9 @@ fn window(line: &str, column: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pattern that is malformed as both a regex and a glob.
+    const UNCLOSED_CLASS: &str = "[";
 
     fn parse_error(input: &str, position: usize) -> HunksetError {
         HunksetError::Parse {
@@ -207,5 +340,113 @@ mod tests {
     fn non_parse_errors_are_shown_plainly() {
         let err = HunksetError::UnknownFunction { name: "nope".into() };
         assert_eq!(err.display_with_context(), "unknown function 'nope'");
+    }
+
+    /// Every variant with the code it maps to, so a variant given the wrong
+    /// code is caught here rather than by an agent branching on it in the
+    /// field. The list is exhaustive on purpose: a new variant that reuses an
+    /// existing code by accident would still compile.
+    // The malformed pattern below is the point of the case; clippy reads the
+    // argument to `Regex::new` and fails the build over exactly the
+    // malformedness being tested.
+    #[allow(clippy::invalid_regex)]
+    #[test]
+    fn every_variant_maps_to_its_own_code() {
+        let cases: Vec<(HunksetError, &str)> = vec![
+            (parse_error("type(insert", 11), "PARSE_ERROR"),
+            (
+                HunksetError::UnknownFunction { name: "nope".into() },
+                "UNKNOWN_FUNCTION",
+            ),
+            (
+                HunksetError::InvalidRegex {
+                    pattern: UNCLOSED_CLASS.to_string(),
+                    source: regex::Regex::new(UNCLOSED_CLASS).unwrap_err(),
+                },
+                "INVALID_REGEX",
+            ),
+            (
+                HunksetError::InvalidGlob {
+                    source: crate::glob::Glob::compile(UNCLOSED_CLASS).unwrap_err(),
+                },
+                "INVALID_GLOB",
+            ),
+            (HunksetError::UnknownId { id: "hunk-dead".into() }, "UNKNOWN_ID"),
+            (
+                HunksetError::AmbiguousId {
+                    prefix: "hunk-a".into(),
+                    candidates: vec![IdCandidate {
+                        short_id: "hunk-abcd1234".into(),
+                        path: "a.txt".into(),
+                    }],
+                },
+                "AMBIGUOUS_ID",
+            ),
+            (
+                HunksetError::InvalidArgument {
+                    func: "type".into(),
+                    value: "nope".into(),
+                    valid: "insert".into(),
+                },
+                "INVALID_ARGUMENT",
+            ),
+            // Only ever constructed in a `--no-default-features` build, so no
+            // integration test can reach it: `semantic` is on by default and
+            // the suite runs against that binary. The mapping is still part of
+            // the contract, so it is asserted where the variant exists.
+            (
+                HunksetError::SemanticFeatureRequired { name: "function".into() },
+                "SEMANTIC_FEATURE_REQUIRED",
+            ),
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for (error, expected) in &cases {
+            assert_eq!(error.code().code, *expected, "{error}");
+            assert!(seen.insert(*expected), "{expected} used twice");
+        }
+    }
+
+    /// The facts a caller acts on, which used to be recoverable only by
+    /// picking the rendered message apart. Each assertion is a piece of prose
+    /// nobody has to parse any more.
+    #[test]
+    fn details_carry_the_facts_the_message_used_to_bury() {
+        let ambiguous = HunksetError::AmbiguousId {
+            prefix: "hunk-a".into(),
+            candidates: vec![
+                IdCandidate { short_id: "hunk-abcd1234".into(), path: "a.txt".into() },
+                IdCandidate { short_id: "hunk-af005ba1".into(), path: "b.txt".into() },
+            ],
+        };
+        let details = ambiguous.details();
+        assert_eq!(details["count"], 2);
+        assert_eq!(details["candidates"][1]["short_id"], "hunk-af005ba1");
+        assert_eq!(details["candidates"][1]["path"], "b.txt");
+        // The message still names them all, so human mode lost nothing.
+        assert!(ambiguous.to_string().contains("hunk-af005ba1 (b.txt)"));
+
+        let glob = HunksetError::InvalidGlob {
+            source: crate::glob::Glob::compile("[").unwrap_err(),
+        };
+        assert_eq!(glob.details()["pattern"], "[");
+
+        let semantic = HunksetError::SemanticFeatureRequired { name: "function".into() };
+        assert_eq!(semantic.details()["predicate"], "function");
+    }
+
+    /// A caret on line three of an expression is at a small column and a large
+    /// offset. Reporting one as the other would send a caller to the wrong
+    /// character every time an expression wrapped.
+    #[test]
+    fn a_parse_error_reports_the_line_and_the_column_separately() {
+        let input = "type(insert)\n  | file(\"a\"\n  | all()";
+        let position = input.chars().take_while(|c| *c != 'f').count();
+        let details = parse_error(input, position).details();
+
+        assert_eq!(details["position"], position);
+        assert_eq!(details["line"], 2);
+        assert_eq!(details["column"], 4);
+        assert_eq!(details["input"], input);
     }
 }
