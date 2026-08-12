@@ -1,5 +1,6 @@
 use crate::diff::{self, apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::errors::{self, CodedError};
+use serde_json::{Map, Value};
 use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
 #[cfg(feature = "semantic")]
@@ -2618,10 +2619,19 @@ pub(crate) fn validate_spec_paths(spec: &Spec) -> Result<()> {
     // ways it can be malformed is by carrying the control characters that would
     // let it rewrite the very line reporting it.
     let show = |path: &str| path.escape_debug().to_string();
+    // Kept beside the rendered lines so the same finding can be both read aloud
+    // and handed over structured -- a caller must not have to parse the prose
+    // back apart to learn which path was refused.
+    let mut structured: Vec<(String, Map<String, Value>)> = Vec::new();
 
     for (key, file_spec) in &spec.files {
         if let Some(reason) = frame.path_problem(key) {
-            problems.push(format!("{}: {reason}", show(key)));
+            let line = format!("{}: {reason}", show(key));
+            let mut d = Map::new();
+            d.insert("path".into(), Value::String(key.clone()));
+            d.insert("reason".into(), Value::String(reason.to_string()));
+            structured.push((line.clone(), d));
+            problems.push(line);
         }
         // A rename's `from` is a spec key in all but position: written by the
         // same hand, in the same frame, and resolved by `select` the same way.
@@ -2629,11 +2639,14 @@ pub(crate) fn validate_spec_paths(spec: &Spec) -> Result<()> {
         // one path in a spec that nothing checks at all.
         if let Some(from) = file_spec.source_path() {
             if let Some(reason) = frame.path_problem(from) {
-                problems.push(format!(
-                    "{}: its `from` {} {reason}",
-                    show(key),
-                    show(from)
-                ));
+                let line = format!("{}: its `from` {} {reason}", show(key), show(from));
+                let mut d = Map::new();
+                d.insert("path".into(), Value::String(from.to_string()));
+                d.insert("reason".into(), Value::String(reason.to_string()));
+                d.insert("key".into(), Value::String(key.clone()));
+                d.insert("field".into(), Value::String("from".into()));
+                structured.push((line.clone(), d));
+                problems.push(line);
             }
         }
     }
@@ -2643,12 +2656,23 @@ pub(crate) fn validate_spec_paths(spec: &Spec) -> Result<()> {
     }
 
     problems.sort();
-    anyhow::bail!(
-        "spec names paths that cannot be in this workspace:\n  {}\n\
-         A spec key is a path the way jj prints one: relative to the directory \
-         the command runs in, and inside the workspace.",
-        problems.join("\n  ")
-    );
+    // Same key as the rendered order, so the JSON list reads in the order the
+    // prose does.
+    structured.sort_by(|a, b| a.0.cmp(&b.0));
+    Err(CodedError::new(
+        errors::PATH_OUTSIDE_WORKSPACE,
+        format!(
+            "spec names paths that cannot be in this workspace:\n  {}\n\
+             A spec key is a path the way jj prints one: relative to the directory \
+             the command runs in, and inside the workspace.",
+            problems.join("\n  ")
+        ),
+    )
+    .with(
+        "paths",
+        Value::Array(structured.into_iter().map(|(_, d)| Value::Object(d)).collect()),
+    )
+    .into())
 }
 
 /// One way a spec entry failed to name something the diff contains.

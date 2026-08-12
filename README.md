@@ -605,9 +605,24 @@ The middle line names the specific problem, one per bad entry:
 **`--allow-empty` does not skip this check.** It permits an empty *result*; every message above is
 still reported with the flag set. See [`--allow-empty`](#--allow-empty).
 
-`jj-hunk list --spec` applies the same resolution rules, so a stale id is reported there too rather
-than silently selecting nothing — which is what makes `list --spec` a safe way to check a selector
-before handing it to a command that writes.
+**`jj-hunk list --spec` does NOT apply these rules to a JSON spec.** The checks above belong to the
+verbs that write. A JSON spec naming a stale id, or a path absent from the diff, returns
+`{"files": []}` at **exit 0** from `list` and is rejected only when you hand it to `commit`,
+`split`, `squash`, `diffedit` or `restore`:
+
+```bash
+$ jj-hunk list --spec '{"files": {"f.txt": {"ids": ["hunk-aaaaaaaa"]}}, "default": "reset"}'
+{"files": []}                                    # exit 0 -- looks like "matched nothing"
+
+$ jj-hunk commit '{"files": {"f.txt": {"ids": ["hunk-aaaaaaaa"]}}, "default": "reset"}' "msg"
+Error: spec does not resolve against the diff:
+  f.txt: no hunk with id hunk-aaaaaaaa           # exit 1
+```
+
+A **hunkset** expression is different: `id()` resolves as it evaluates, so
+`list --spec 'id(hunk-deadbeef)'` *does* error. So `list --spec` validates a hunkset but not a JSON
+spec — to check a JSON spec before writing, run the verb with `--dry-run` where available, or accept
+that an empty listing is ambiguous between "matched nothing" and "names nothing real".
 
 ## Hunkset Query Language
 

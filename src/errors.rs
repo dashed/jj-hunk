@@ -89,6 +89,10 @@ pub const REVSET_AMBIGUOUS: ErrorCode = ErrorCode::new("revset", "REVSET_AMBIGUO
 /// cut short, whose ids would name nothing in the real diff.
 pub const TRUNCATED_SPEC_TEMPLATE: ErrorCode =
     ErrorCode::new("usage", "TRUNCATED_SPEC_TEMPLATE");
+/// A spec key (or a rename `from`) that names a path this workspace cannot
+/// contain: absolute, control-character-bearing, or climbing past the root.
+pub const PATH_OUTSIDE_WORKSPACE: ErrorCode =
+    ErrorCode::new("usage", "PATH_OUTSIDE_WORKSPACE");
 /// Anything not yet given a code. Its `message` is still the full prose, so a
 /// caller loses nothing it had before -- but it should not branch on this.
 pub const UNKNOWN: ErrorCode = ErrorCode::new("internal", "UNKNOWN");
