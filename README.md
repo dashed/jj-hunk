@@ -17,8 +17,13 @@ Select specific diff hunks when splitting, committing, or squashing—without in
 ### 1. Install the binary
 
 ```bash
-cargo install jj-hunk
+cargo install --git https://github.com/dashed/jj-hunk --locked
 ```
+
+**Not `cargo install jj-hunk`.** That name on crates.io is the upstream project
+(`laulauland/jj-hunk`, currently 0.3.0) — a different, older program with no hunkset
+query language. Installing it gives you a binary that cannot run most of what is
+documented here.
 
 ### 2. Verify
 
@@ -37,11 +42,9 @@ explicit error:
 Error: hunkset evaluation error: function() requires the 'semantic' feature (build with --features semantic)
 ```
 
-If you hit that, reinstall with the feature enabled:
-
-```bash
-cargo install jj-hunk --features semantic
-```
+`semantic` is **on by default** here (`default = ["semantic"]`), so a normal install has
+it and `--features semantic` is redundant. You only see that error from a deliberate
+`--no-default-features` build; reinstall without that flag to get it back.
 
 Everything else — `file`, `glob`, `extension`, `status`, `type`, `lines`, `content`, `added`,
 `removed`, `id`, `all`, `none`, and the whole JSON/YAML spec format — works in any build.

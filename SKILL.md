@@ -18,8 +18,13 @@ Use `jj-hunk` for non-interactive hunk selection in jj. Essential for AI agents 
 ## Setup
 
 ```bash
-cargo install jj-hunk
+cargo install --git https://github.com/dashed/jj-hunk --locked
 ```
+
+**Not `cargo install jj-hunk`.** That name on crates.io is the upstream project
+(`laulauland/jj-hunk`, currently 0.3.0) — a different, older program with no hunkset
+query language. Installing it gives you a binary that cannot run most of what is
+documented here.
 
 **No jj config is required.** Every `jj-hunk` verb pins `merge-tools.jj-hunk.program` to the
 executable that is running and passes it to `jj` on the command line, so a `[merge-tools.jj-hunk]`
@@ -48,7 +53,8 @@ with an explicit error:
 Error: hunkset evaluation error: function() requires the 'semantic' feature (build with --features semantic)
 ```
 
-If you see that, rebuild with `cargo install jj-hunk --features semantic`. Every other predicate
+If you see that, you are on a `--no-default-features` build — `semantic` is on by default
+here, so reinstall without that flag. Every other predicate
 (`file`, `glob`, `extension`, `status`, `type`, `lines`, `content`, `added`, `removed`, `id`,
 `all`, `none`) works in any build.
 
@@ -282,12 +288,20 @@ See [Hunk IDs](#hunk-ids) for the two forms and their shelf life.
 Supported languages: Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, Ruby, C#, Scala,
 Swift, PHP, Bash, Elixir, Erlang, Haskell, OCaml, Zig, Lua.
 
-For a file in an unsupported language, semantic predicates contribute nothing and say so on stderr:
+For a file in an unsupported language, semantic predicates contribute nothing. When *nothing* in
+the diff could be parsed, that is said on stderr:
 
 ```
 warning: function() found no semantic metadata -- no parser is available for: notes.txt, only.kt.
 The empty result reflects missing language support, not an absence of matches.
 ```
+
+**The warning is not per-file, and this is the trap.** It fires only when no file in the diff was
+parsed at all. A diff holding one `.rs` and one `.txt` parses the `.rs`, so an empty
+`function("nope")` result comes back **silently** — indistinguishable from a genuine no-match, with
+the `.txt` unmentioned. Do not read "no warning" as "every file was understood". If it matters
+whether a file was analysed, check `semantic.is_analyzed` in `--format json` rather than inferring
+it from stderr.
 
 `toplevel()` and `depth()` also exclude unparsed files, so an unsupported file is never mistaken
 for genuinely top-level code.
@@ -629,8 +643,10 @@ mode flip, empty add and binary behind, at exit 0. See
 [Changes with no hunks](#changes-with-no-hunks-half-the-predicates-cannot-see-them).
 
 Paths — in output, in spec keys, and in `file()`/`glob()` — are **relative to the current
-directory**, not the repo root. Running from a subdirectory works, but the paths and therefore the
-hunk IDs differ from a run at the root.
+directory**, not the repo root. Running from a subdirectory works, and the paths differ from a run
+at the root (`src/svc.rs` there, `svc.rs` from inside `src/`). **Hunk IDs do not.** The path folded
+into the hash is workspace-root-relative, so an ID is the same string whichever directory you ask
+from, and a spec generated at the root resolves from a subdirectory.
 
 ### 2. Select and split
 
