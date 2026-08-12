@@ -344,6 +344,14 @@ where
         Some(content) => Some(Spec::from_str(content)?),
         None => None,
     };
+    // Before the revision is resolved, so a spec keyed on a path that could
+    // never have come from a diff is answered the same way here as it is by
+    // the verbs that would act on it. `list --spec` is how a spec gets checked
+    // before it is run, so the two have to agree on which keys are even
+    // sayable.
+    if let Some(spec) = spec.as_ref() {
+        validate_spec_paths(spec)?;
+    }
 
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
@@ -1887,6 +1895,11 @@ pub fn select(left: &str, right: &str) -> Result<()> {
         // No selection = keep everything
         return Ok(());
     };
+    // `select` is reached both through a driving verb, which has checked this
+    // already, and through a bare `jj --tool=jj-hunk`, which has not: on that
+    // path the spec is whatever the user put in `JJ_HUNK_SELECTION` and this
+    // is the only check it gets.
+    validate_spec_paths(&spec)?;
 
     let left_path = Path::new(left);
     let right_path = Path::new(right);
@@ -2113,6 +2126,59 @@ impl PathFrame {
             }
         }
         Some(parts.join("/"))
+    }
+
+    /// Why `display_path` cannot name a file in this workspace, if it cannot.
+    ///
+    /// Only the shape of the path is judged here. Whether a well-formed one is
+    /// really in the diff is a different question, asked later and against the
+    /// diff itself.
+    fn path_problem(&self, display_path: &str) -> Option<String> {
+        if display_path.is_empty() {
+            return Some("is empty".to_string());
+        }
+        // No path jj can print holds one, so a key that does was not read off
+        // any diff. Refused rather than passed along, because this string is
+        // echoed into error messages and listings and a terminal acts on some
+        // of them.
+        if let Some(c) = display_path.chars().find(|c| (*c as u32) < 0x20) {
+            return Some(format!("contains the control character U+{:04X}", c as u32));
+        }
+        // jj prints every path relative to the cwd, so no producer emits an
+        // absolute one and no diff holds one.
+        if Path::new(display_path).has_root() {
+            return Some("is an absolute path".to_string());
+        }
+
+        let mut climb = 0usize;
+        let mut seen_a_name = false;
+        for component in display_path.split(path_separators()) {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    // jj prints normalised paths, so an interior `..` spells a
+                    // path that already has a spelling. Two keys for one file
+                    // is how one entry starts shadowing another.
+                    if seen_a_name {
+                        return Some(
+                            "has a `..` after a named directory, which is not how \
+                             jj spells any path"
+                                .to_string(),
+                        );
+                    }
+                    // A leading `..` is ordinary -- from `sub/` jj really does
+                    // print `../top.txt` -- so what is refused is where the
+                    // climb lands, not that it happened at all.
+                    climb += 1;
+                    if climb > self.prefix.len() {
+                        return Some("climbs above the workspace root".to_string());
+                    }
+                }
+                _ => seen_a_name = true,
+            }
+        }
+
+        None
     }
 }
 
@@ -2475,6 +2541,73 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
     Ok(spec.to_string())
 }
 
+/// Refuse spec keys that cannot name a file in this workspace.
+///
+/// A spec key is a path an agent wrote, and every consumer of one looks it up
+/// in a set of paths that came off the diff -- `spec_decision`, `select` and
+/// `validate_spec_resolves` all reach for `spec.files.get(...)`. That is what
+/// makes a key like `/etc/passwd`, or one climbing out of the repo into a
+/// private key, harmless today: no such key is in the set, so nothing happens.
+///
+/// Harmless is not the same as refused, and the distance between them is one
+/// future lookup that joins a key onto a directory instead of comparing it
+/// against the set. `select` already refuses such a join from the other side,
+/// in `contained_join`; this refuses it before one is ever built, for every
+/// command that reads a spec rather than only for the one that writes files.
+///
+/// Refusing it here also makes the answer the same shape whatever the entry
+/// says. `validate_spec_resolves` reports an unknown path only when the entry
+/// means to keep something and nothing else in the spec keeps anything real --
+/// deliberately, because a stale allowlist entry is not an error. So a
+/// traversal key sitting under `{"action": "reset"}`, or beside one entry that
+/// does resolve, was accepted in silence at exit 0. That is the right answer
+/// for a path that is merely absent from this diff, and the wrong one for a
+/// path that could not have come from any diff.
+///
+/// Nothing here reads the diff: this judges the shape of the key, and can
+/// answer before a revision is even resolved.
+pub(crate) fn validate_spec_paths(spec: &Spec) -> Result<()> {
+    let frame = PathFrame::discover();
+    let mut problems: Vec<String> = Vec::new();
+
+    // Reported through `escape_debug`, which leaves an ordinary path exactly as
+    // written. A path only reaches this list by being malformed, and one of the
+    // ways it can be malformed is by carrying the control characters that would
+    // let it rewrite the very line reporting it.
+    let show = |path: &str| path.escape_debug().to_string();
+
+    for (key, file_spec) in &spec.files {
+        if let Some(reason) = frame.path_problem(key) {
+            problems.push(format!("{}: {reason}", show(key)));
+        }
+        // A rename's `from` is a spec key in all but position: written by the
+        // same hand, in the same frame, and resolved by `select` the same way.
+        // `validate_spec_resolves` never looks at it, so without this it is the
+        // one path in a spec that nothing checks at all.
+        if let Some(from) = file_spec.source_path() {
+            if let Some(reason) = frame.path_problem(from) {
+                problems.push(format!(
+                    "{}: its `from` {} {reason}",
+                    show(key),
+                    show(from)
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+
+    problems.sort();
+    anyhow::bail!(
+        "spec names paths that cannot be in this workspace:\n  {}\n\
+         A spec key is a path the way jj prints one: relative to the directory \
+         the command runs in, and inside the workspace.",
+        problems.join("\n  ")
+    );
+}
+
 /// Check that a spec actually refers to the diff it will be applied to.
 ///
 /// `Spec::selects_nothing` is structural: a non-empty id list satisfies it even
@@ -2803,6 +2936,9 @@ fn run_jj_with_selection_on(
     };
 
     if let Ok(mut parsed) = Spec::from_str(&spec_content) {
+        // First, and before `adopt_spec_frame` rewrites anything, so the
+        // refusal names the key as it was written.
+        validate_spec_paths(&parsed)?;
         // Refuse to mutate history with a selection that keeps nothing: jj
         // would carry it out and exit 0, which hides a typo'd selector from any
         // script driving this. What it would carry out differs per verb -- an
@@ -3517,6 +3653,126 @@ mod tests {
             assert_eq!(frame.to_root(path).as_deref(), Some(path));
             assert_eq!(frame.to_display(path), path);
         }
+    }
+
+    // --- spec key shape ---
+    //
+    // Two kinds of test, and they are not the same kind. The refusals below are
+    // ordinary regression tests: the shapes they name were accepted before
+    // `path_problem` existed. `every_path_jj_prints_is_an_acceptable_spec_key`
+    // is the preservation guard -- every path in it was accepted before this
+    // check and has to stay accepted after, so it is the one that cannot fail
+    // against the code it was written for, and the one that fails first if the
+    // refusal is ever widened into a ban on `..`.
+
+    /// Everything jj actually prints has to survive the shape check, or the
+    /// check is not a filter but a wall. The `..` spellings matter most: they
+    /// are indistinguishable in form from the traversal below and are told
+    /// apart only by where the climb lands.
+    #[test]
+    fn every_path_jj_prints_is_an_acceptable_spec_key() {
+        for (prefix, path) in [
+            (&[][..], "top.txt"),
+            (&[][..], "sub/deep/low.txt"),
+            (&["sub"][..], "mid.txt"),
+            (&["sub"][..], "../top.txt"),
+            (&["sub"][..], "deep/low.txt"),
+            (&["sub", "deep"][..], "low.txt"),
+            (&["sub", "deep"][..], "../mid.txt"),
+            (&["sub", "deep"][..], "../../top.txt"),
+            (&["sub", "deep"][..], "../../other/side.txt"),
+        ] {
+            assert_eq!(
+                frame_at(prefix).path_problem(path),
+                None,
+                "{path} was refused from {prefix:?}"
+            );
+        }
+    }
+
+    /// A key that climbs past the root names no file in the workspace, from any
+    /// directory. Refusing it is the whole point of measuring the climb against
+    /// the cwd depth rather than banning `..`, which the case above needs.
+    #[test]
+    fn a_spec_key_that_climbs_above_the_workspace_root_is_refused() {
+        for (prefix, path) in [
+            (&[][..], "../top.txt"),
+            (&[][..], "../../.ssh/id_rsa"),
+            (&["sub"][..], "../../top.txt"),
+            (&["sub"][..], "../../../../etc/passwd"),
+            (&["sub", "deep"][..], "../../../x.txt"),
+        ] {
+            assert_eq!(
+                frame_at(prefix).path_problem(path).as_deref(),
+                Some("climbs above the workspace root"),
+                "{path} was accepted from {prefix:?}"
+            );
+        }
+    }
+
+    /// jj prints relative paths only, so an absolute key came from somewhere
+    /// else. It is refused whatever the cwd is, because no depth makes one
+    /// legitimate.
+    #[test]
+    fn an_absolute_spec_key_is_refused_from_every_directory() {
+        for prefix in [&[][..], &["sub"][..], &["sub", "deep"][..]] {
+            assert_eq!(
+                frame_at(prefix).path_problem("/etc/passwd").as_deref(),
+                Some("is an absolute path"),
+                "accepted from {prefix:?}"
+            );
+        }
+    }
+
+    /// `sub/../top.txt` names a real file and still is not a path jj would
+    /// print. Two spellings of one file is how one spec entry starts shadowing
+    /// another, so the un-normalised one is refused rather than normalised.
+    #[test]
+    fn a_dotdot_after_a_named_directory_is_refused() {
+        let frame = frame_at(&["sub"]);
+        for path in ["sub/../top.txt", "a/b/../../c.txt", "deep/../../top.txt"] {
+            assert!(
+                frame
+                    .path_problem(path)
+                    .is_some_and(|reason| reason.starts_with("has a `..` after")),
+                "{path} was accepted"
+            );
+        }
+    }
+
+    /// No path jj can print holds a C0 control character, so a key that does was
+    /// not read off any diff. The refusal also keeps such a key from reaching a
+    /// terminal through the error message that reports it.
+    #[test]
+    fn a_control_character_in_a_spec_key_is_refused() {
+        let frame = frame_at(&[]);
+        for (path, code) in [
+            ("top\u{0}.txt", "U+0000"),
+            ("top\u{1b}[31m.txt", "U+001B"),
+            ("top\n.txt", "U+000A"),
+            ("top.txt\u{7}", "U+0007"),
+        ] {
+            assert_eq!(
+                frame.path_problem(path).as_deref(),
+                Some(format!("contains the control character {code}").as_str()),
+                "{path:?} was accepted"
+            );
+        }
+        // DEL and the C1 block are not covered, and that is a choice, not an
+        // oversight: they are ordinary bytes in a filename on every filesystem
+        // jj runs on, so refusing them would refuse a real path.
+        assert_eq!(frame.path_problem("top\u{7f}.txt"), None);
+    }
+
+    /// An empty key names no file, and is the one malformed key that would grow
+    /// teeth rather than fizzle if it ever reached a join: `dir.join("")` is
+    /// `dir` itself.
+    #[test]
+    fn an_empty_spec_key_is_refused() {
+        assert_eq!(
+            frame_at(&[]).path_problem("").as_deref(),
+            Some("is empty")
+        );
     }
 
     /// Off Windows a backslash is an ordinary character in a filename, and

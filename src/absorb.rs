@@ -612,13 +612,18 @@ fn load_spec(options: &AbsorbOptions, rev: Option<&str>) -> Result<Option<Spec>>
         return Ok(None);
     };
 
-    if hunkset::is_hunkset(&raw) {
+    let spec = if hunkset::is_hunkset(&raw) {
         // Evaluated against the same untruncated view absorb routes over, so
         // the ids it names are the ids the hunks actually have.
         let json = commands::evaluate_hunkset(&raw, &commands::DiffTarget::rev(rev), Truncation::NONE)?;
-        return Ok(Some(Spec::from_str(&json)?));
-    }
-    Ok(Some(Spec::from_str(&raw)?))
+        Spec::from_str(&json)?
+    } else {
+        Spec::from_str(&raw)?
+    };
+    // Both branches, so that the one check does not have to know which of them
+    // produced the keys it is looking at.
+    commands::validate_spec_paths(&spec)?;
+    Ok(Some(spec))
 }
 
 // ---------------------------------------------------------------------------

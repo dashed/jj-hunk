@@ -7116,3 +7116,281 @@ fn version_flag_reports_the_built_version() {
         );
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// The shape of a spec key.
+//
+// A spec key is a path an agent wrote, and an agent writes paths that were
+// never in any diff. Every consumer resolves one by looking it up in a set of
+// paths that came off the diff, so a key naming `/etc/passwd` has always been
+// inert -- but inert by good luck of the lookup, not by refusal, and the two
+// stop being the same thing the moment a lookup joins a key onto a directory
+// instead of comparing it against a set.
+//
+// Most of what follows is a regression test in the plain sense: before the
+// check these tests were written for, `split` took every one of these specs and
+// exited 0. Two of them are not, and are worth telling apart --
+// `a_pattern_reaching_outside_the_workspace_matches_nothing_rather_than_failing`
+// and the first half of `a_climb_to_the_workspace_root_is_kept_...` record
+// behaviour that was already right, so they cannot fail against the commit that
+// added them. Their job is to fail against a later one that widens the refusal
+// into a ban on `..`, or narrows it onto patterns, and so breaks a working
+// feature in the name of hardening.
+// ---------------------------------------------------------------------------
+
+/// The traversal in every spec shape that carries one.
+///
+/// The shapes matter because the older check that catches some of these --
+/// `validate_spec_resolves` -- deliberately holds its tongue for an entry that
+/// keeps nothing, and for an absent path in a spec that keeps something real
+/// elsewhere. Both silences are right for a path that is merely not in *this*
+/// diff and wrong for a path that could not be in any diff, so a key of this
+/// shape used to be accepted at exit 0 in four of the five spellings below.
+#[test]
+fn a_spec_key_that_climbs_out_of_the_workspace_is_refused_in_every_spec_shape() {
+    let repo = TestRepo::new("key-escape-shapes");
+    repo.write_file("top.txt", "t1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+
+    let escaping = "../../.ssh/id_rsa";
+    for entry in [
+        // Never reported before: the entry keeps nothing, so the reference
+        // check had nothing to say about where it pointed.
+        r#"{"action": "reset"}"#,
+        r#"{"ids": []}"#,
+        r#"{"hunks": []}"#,
+        // Reported before only because no other entry kept anything real.
+        r#"{"action": "keep"}"#,
+    ] {
+        let spec = format!(
+            r#"{{"files": {{"{escaping}": {entry}, "top.txt": {{"action": "keep"}}}}, "default": "keep"}}"#
+        );
+        let err = repo.hunk_fail(&["split", &spec, "escaped"]);
+        assert!(
+            err.contains("climbs above the workspace root"),
+            "{entry} was not refused for climbing out: {err}"
+        );
+    }
+
+    // And with nothing else in the spec at all.
+    let alone = format!(r#"{{"files": {{"{escaping}": {{"action": "keep"}}}}, "default": "reset"}}"#);
+    let err = repo.hunk_fail(&["split", &alone, "escaped"]);
+    assert!(err.contains("climbs above the workspace root"), "{err}");
+
+    assert!(
+        !repo.log_descriptions().iter().any(|d| d == "escaped"),
+        "a commit was made from a spec that named a path outside the workspace"
+    );
+}
+
+/// The discriminating pair, from one directory, in one repo: `..` is ordinary
+/// here and jj really does print it, so the test cannot be "does the key
+/// contain `..`". It is where the climb lands.
+///
+/// Banning `..` outright would pass the second half of this test and fail the
+/// first, which is the whole reason the check counts components against the
+/// depth of the cwd instead.
+#[test]
+fn a_climb_to_the_workspace_root_is_kept_and_a_climb_past_it_is_refused() {
+    let repo = TestRepo::new("key-escape-boundary");
+    repo.write_file("top.txt", "t1\n");
+    repo.write_file("sub/mid.txt", "m1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+    repo.write_file("sub/mid.txt", "m1\nm2\n");
+
+    // Exactly to the root: this is how jj spells `top.txt` from `sub/`, and it
+    // has to keep selecting that file.
+    let reaching = r#"{"files": {"../top.txt": {"action": "keep"}}, "default": "reset"}"#;
+    hunk_in_ok(&repo, "sub", &["split", reaching, "reached the root"]);
+    assert_eq!(
+        repo.changed_files("@-"),
+        vec!["M top.txt".to_string()],
+        "the legitimate climb stopped selecting the file above the cwd"
+    );
+
+    // One component further, from the same directory, is outside the workspace.
+    let escaping = r#"{"files": {"../../top.txt": {"action": "keep"}}, "default": "reset"}"#;
+    let err = hunk_in_fail(&repo, "sub", &["split", escaping, "climbed past"]);
+    assert!(
+        err.contains("climbs above the workspace root"),
+        "a climb past the root was accepted: {err}"
+    );
+}
+
+/// jj prints relative paths, so an absolute key came from somewhere that was
+/// not a diff. `/etc/passwd` is the one an agent writes.
+#[test]
+fn an_absolute_spec_key_is_refused() {
+    let repo = TestRepo::new("key-absolute");
+    repo.write_file("top.txt", "t1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+
+    let spec = r#"{"files": {"/etc/passwd": {"action": "reset"}, "top.txt": {"action": "keep"}}, "default": "keep"}"#;
+    let err = repo.hunk_fail(&["split", spec, "absolute"]);
+    assert!(err.contains("is an absolute path"), "{err}");
+}
+
+/// A key that names a real file by a path jj would never print for it. The
+/// file is right there, so nothing about this is *unresolvable* -- it is
+/// refused because one file answering to two keys is how one entry starts
+/// shadowing another.
+#[test]
+fn a_dotdot_after_a_named_directory_is_refused_even_though_it_names_a_real_file() {
+    let repo = TestRepo::new("key-interior-dotdot");
+    repo.write_file("top.txt", "t1\n");
+    repo.write_file("sub/mid.txt", "m1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+    repo.write_file("sub/mid.txt", "m1\nm2\n");
+
+    let spec = r#"{"files": {"sub/../top.txt": {"action": "keep"}}, "default": "reset"}"#;
+    let err = repo.hunk_fail(&["split", spec, "interior"]);
+    assert!(
+        err.contains("has a `..` after"),
+        "an un-normalised key naming a real file was accepted: {err}"
+    );
+}
+
+/// No path jj can print holds a C0 control character. Refusing the key also
+/// keeps it from reaching a terminal through the message that reports it,
+/// which is why the reported spelling is escaped rather than echoed.
+#[test]
+fn a_control_character_in_a_spec_key_is_refused_and_not_echoed_raw() {
+    let repo = TestRepo::new("key-control-chars");
+    repo.write_file("top.txt", "t1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+
+    for (escape, code) in [
+        (r"\u0000", "U+0000"),
+        (r"\u001b", "U+001B"),
+        (r"\n", "U+000A"),
+    ] {
+        let spec = format!(
+            r#"{{"files": {{"top{escape}.txt": {{"action": "keep"}}, "top.txt": {{"action": "keep"}}}}, "default": "keep"}}"#
+        );
+        let err = repo.hunk_fail(&["split", &spec, "control"]);
+        assert!(
+            err.contains(&format!("contains the control character {code}")),
+            "a {code} in a spec key was accepted: {err:?}"
+        );
+    }
+
+    let spec = r#"{"files": {"top\u001b[31m.txt": {"action": "keep"}}, "default": "reset"}"#;
+    let err = repo.hunk_fail(&["split", spec, "control"]);
+    assert!(
+        !err.contains('\u{1b}'),
+        "the refusal echoed the escape byte it was refusing: {err:?}"
+    );
+}
+
+/// A rename's `from` is a path written by the same hand as the key, and it is
+/// the one path in a spec that no other check looks at: `validate_spec_resolves`
+/// walks keys, ids and indices and never reads it.
+#[test]
+fn a_rename_source_that_climbs_out_of_the_workspace_is_refused() {
+    let repo = TestRepo::new("from-escape");
+    repo.write_file("top.txt", "t1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+
+    let spec = r#"{"files": {"top.txt": {"action": "keep", "from": "../../../../etc/passwd"}}, "default": "reset"}"#;
+    let err = repo.hunk_fail(&["split", spec, "from-escaped"]);
+    assert!(
+        err.contains("its `from`") && err.contains("climbs above the workspace root"),
+        "a rename source pointing outside the workspace was accepted: {err}"
+    );
+}
+
+/// `select` is normally handed a spec a verb has already checked. Reached
+/// directly -- `jj --tool=jj-hunk`, with `JJ_HUNK_SELECTION` pointing wherever
+/// the user put it -- there is no verb in front of it, so it has to refuse the
+/// same keys on its own.
+#[test]
+fn select_refuses_a_spec_key_that_names_a_path_outside_the_workspace() {
+    let repo = TestRepo::new("select-key-escape");
+    let root = repo.path().to_path_buf();
+    let left = root.join("L");
+    let right = root.join("R");
+    for dir in [&left, &right] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(left.join("a.txt"), "one\n").unwrap();
+    std::fs::write(right.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let spec_path = root.join("sel.json");
+    std::fs::write(
+        &spec_path,
+        r#"{"files": {"../../victim.txt": {"action": "reset"}}, "default": "keep"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(jj_hunk_bin())
+        .args(["select", left.to_str().unwrap(), right.to_str().unwrap()])
+        .current_dir(&root)
+        .env("JJ_HUNK_SELECTION", &spec_path)
+        .env("JJ_CONFIG", &repo.config_path)
+        .output()
+        .expect("failed to run jj-hunk select");
+
+    assert!(
+        !out.status.success(),
+        "select accepted a key naming a path outside the workspace"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("climbs above the workspace root"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Patterns are deliberately *not* held to the rule above, and this records the
+/// choice so that it is a choice and not an oversight.
+///
+/// A key names one file and is resolved to it. A pattern names a set and is
+/// only ever asked "does this path match?", against paths that came off the
+/// diff -- so a pattern reaching outside the workspace cannot resolve to
+/// anything even in principle, and matching nothing is the same answer it gives
+/// for any other path that is not in the diff. Refusing it would buy nothing
+/// and would cost the legitimate case in the second half of this test.
+#[test]
+fn a_pattern_reaching_outside_the_workspace_matches_nothing_rather_than_failing() {
+    let repo = TestRepo::new("pattern-outside");
+    repo.write_file("top.txt", "t1\n");
+    repo.write_file("sub/mid.txt", "m1\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("top.txt", "t1\nt2\n");
+    repo.write_file("sub/mid.txt", "m1\nm2\n");
+
+    for args in [
+        vec!["list", "--format", "json", "--files", "--include", "/etc/passwd"],
+        vec!["list", "--format", "json", "--files", "--include", "../../etc/passwd"],
+        vec!["list", "--format", "json", "--files", "--spec", r#"file("../../etc/passwd")"#],
+        vec!["list", "--format", "json", "--files", "--spec", r#"glob("/etc/*")"#],
+    ] {
+        let listing: serde_json::Value =
+            serde_json::from_str(&repo.hunk_ok(&args)).expect("listing should be json");
+        assert_eq!(
+            listing["files"].as_array().unwrap().len(),
+            0,
+            "{args:?} matched something"
+        );
+    }
+
+    // The same `..` spelling, landing inside the workspace, still matches --
+    // which is what a blanket refusal of `..` in a pattern would have cost.
+    for args in [
+        vec!["list", "--format", "json", "--files", "--include", "../top.txt"],
+        vec!["list", "--format", "json", "--files", "--spec", r#"file("../top.txt")"#],
+    ] {
+        let listing: serde_json::Value =
+            serde_json::from_str(&hunk_in_ok(&repo, "sub", &args)).expect("listing should be json");
+        let files = listing["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{args:?} stopped matching the file above sub/");
+        assert_eq!(files[0]["path"].as_str().unwrap(), "../top.txt");
+    }
+}
