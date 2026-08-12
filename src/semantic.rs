@@ -553,9 +553,11 @@ impl ParsedFile {
                     return SemanticContext::default();
                 }
                 let line_0 = line - 1;
-                let mut ctx = SemanticContext::default();
-                ctx.is_toplevel = true;
-                ctx.is_analyzed = true;
+                let mut ctx = SemanticContext {
+                    is_toplevel: true,
+                    is_analyzed: true,
+                    ..SemanticContext::default()
+                };
                 self.find_enclosing(root, line_0, &mut ctx, 0);
                 ctx
             })
@@ -621,26 +623,25 @@ impl ParsedFile {
         // Check function/scope containment
         let mut entered_scope = false;
 
-        if self.config.function_kinds.contains(&kind) && self.counts_as_function(&node) {
-            if node_contains_line(&node, line) {
-                if let Some(name) = self.extract_function_name(&node) {
-                    ctx.enclosing_function = Some(name);
-                }
-                ctx.is_toplevel = false;
-                entered_scope = true;
-                self.collect_sibling_annotations(&node, ctx);
+        if self.config.function_kinds.contains(&kind)
+            && self.counts_as_function(&node)
+            && node_contains_line(&node, line)
+        {
+            if let Some(name) = self.extract_function_name(&node) {
+                ctx.enclosing_function = Some(name);
             }
+            ctx.is_toplevel = false;
+            entered_scope = true;
+            self.collect_sibling_annotations(&node, ctx);
         }
 
-        if self.config.scope_kinds.contains(&kind) {
-            if node_contains_line(&node, line) {
-                if let Some(name) = self.extract_node_name(&node, self.config.scope_name_extractor) {
-                    ctx.enclosing_scope = Some(name);
-                }
-                ctx.is_toplevel = false;
-                entered_scope = true;
-                self.collect_sibling_annotations(&node, ctx);
+        if self.config.scope_kinds.contains(&kind) && node_contains_line(&node, line) {
+            if let Some(name) = self.extract_node_name(&node, self.config.scope_name_extractor) {
+                ctx.enclosing_scope = Some(name);
             }
+            ctx.is_toplevel = false;
+            entered_scope = true;
+            self.collect_sibling_annotations(&node, ctx);
         }
 
         // Call-based detection for languages where definitions and imports are
@@ -960,12 +961,11 @@ fn node_contains_line(node: &tree_sitter::Node, line: usize) -> bool {
 
 fn find_child_by_kind<'a>(node: &tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    // Bound to a local rather than returned directly: the iterator borrows
+    // `cursor`, and as a tail expression its temporary outlives `cursor`'s
+    // drop. The found `Node` itself borrows the tree, not the cursor.
+    let found = node.children(&mut cursor).find(|child| child.kind() == kind);
+    found
 }
 
 /// Get semantic contexts for multiple lines in a file, reusing a single parse.
