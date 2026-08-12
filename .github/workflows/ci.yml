@@ -82,10 +82,22 @@ jobs:
   clippy:
     name: clippy (advisory)
     runs-on: ubuntu-latest
-    # Advisory only. The crate is rustc-warning-free (enforced above), but
-    # clippy still reports lints inherited from upstream; gating on those
-    # would make someone else's debt the first red build. Turn this into a
-    # gate once the backlog is cleared.
+    # Advisory only, and it has to stay that way while the fork is split
+    # across feature branches.
+    #
+    # The fork's own code IS clean: zero clippy warnings on the integration
+    # merge in all three feature modes, as of the two `chore(clippy)` commits
+    # on alberto/hunkset-lang and alberto/tree-sitter-semantic.
+    #
+    # What is left belongs to upstream, and is only visible when a branch is
+    # built on its own. This branch carries main's `src/` unchanged, which
+    # still reports 9: five derivable `impl Default`s, two over-long argument
+    # lists, an elidable lifetime, and a manual loop counter. Gating here
+    # would fail this branch's own build over code it does not own -- exactly
+    # the outcome the earlier note promised to avoid.
+    #
+    # So the trigger is not "the fork's backlog is cleared" (it is); it is
+    # main itself being clean.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
