@@ -7,11 +7,103 @@ use super::error::HunksetError;
 use super::pattern::{compile_patterns, CompiledPattern};
 
 /// A hunk with its file-level context, used during evaluation.
+///
+/// Two kinds of entry reach the predicates. Most are hunks the differ really
+/// produced. The rest are *stand-ins*: one per change that produced no hunks at
+/// all -- a binary, a retargeted symlink, a mode-only flip, a pure rename, an
+/// empty add or remove -- minted by `whole_file_stand_in` so that a file-level
+/// predicate has something to name the file by. [`EnrichedHunk::content`] is
+/// what keeps the two apart.
 #[derive(Debug)]
 pub struct EnrichedHunk<'a> {
     pub file_path: &'a str,
     pub file_status: &'a str,
-    pub hunk: &'a Hunk,
+    /// Private, and reachable only through the accessors below.
+    ///
+    /// A public field is one new predicate away from the leak this type exists
+    /// to prevent: whoever writes the next content predicate would reach for
+    /// `h.hunk.added` because it is there, and a stand-in would answer.
+    hunk: &'a Hunk,
+    /// Whether `hunk` stands in for a whole-file change instead of being one.
+    is_stand_in: bool,
+}
+
+impl<'a> EnrichedHunk<'a> {
+    /// An entry for a hunk the differ really produced.
+    pub fn real(file_path: &'a str, file_status: &'a str, hunk: &'a Hunk) -> Self {
+        Self {
+            file_path,
+            file_status,
+            hunk,
+            is_stand_in: false,
+        }
+    }
+
+    /// An entry for a change with no hunks, standing in for the whole file.
+    pub fn stand_in(file_path: &'a str, file_status: &'a str, hunk: &'a Hunk) -> Self {
+        Self {
+            file_path,
+            file_status,
+            hunk,
+            is_stand_in: true,
+        }
+    }
+
+    /// The diffed text this entry may be matched *by* -- `None` for a stand-in.
+    ///
+    /// A stand-in exists so that a *file-level* predicate can name a change no
+    /// hunk expresses. Nothing was ever diffed behind it, so a *content-level*
+    /// predicate has no text it could have looked at and must never match it.
+    /// A binary or a rename riding along with `content("...")` is a change the
+    /// selector never asked for, and everything a hunkset does not pick up is
+    /// handed back by `default: reset` -- so the mistake is destructive in both
+    /// directions.
+    ///
+    /// That used to be enforced by the stand-in's *data*: empty `added` and
+    /// `removed`, and both line ranges parked at `(start 0, length 0)`. Both
+    /// halves of that argument are false. The empty substring is inside every
+    /// string, so `content("")` matched every stand-in there was; and line 0 is
+    /// inside `0..N`, so `lines(0..100000)` did too. `lines(1..100000)` did
+    /// not, which is exactly why the first round of guards read as clean.
+    /// Emptiness is not unmatchability -- a degenerate argument matches the
+    /// empty value -- and the degenerate arguments cannot be enumerated ahead
+    /// of the predicates nobody has written yet.
+    ///
+    /// So the answer is withheld rather than made empty. Rejecting `content("")`
+    /// and `lines(0..N)` at argument validation was the other option and is
+    /// worse: it fixes the two arguments that happen to have been found, and it
+    /// changes what those arguments mean for ordinary hunks, where `content("")`
+    /// selecting everything is a defensible reading of "content I did not
+    /// constrain".
+    pub fn content(&self) -> Option<&'a Hunk> {
+        (!self.is_stand_in).then_some(self.hunk)
+    }
+
+    /// What happened to the file as a whole, which `type()` reads.
+    ///
+    /// File-level, not content-level, and so answered for a stand-in too: it
+    /// carries the shape of its change (`insert`/`delete`/`replace`, derived
+    /// from the file status and from no text at all). Withholding it here
+    /// would stop `type(replace)` reaching a rename, which is the bug the
+    /// stand-ins were introduced to fix.
+    pub fn change_type(&self) -> &'a str {
+        &self.hunk.hunk_type
+    }
+
+    /// The id this entry contributes to a spec once it has been selected.
+    ///
+    /// Answered for a stand-in on purpose. A selected one puts
+    /// `whole-file:<path>` into the spec, which `evaluate_hunkset` then
+    /// rewrites into a whole-file action -- reading an id out is not matching
+    /// on one, and `id()` still cannot reach a stand-in.
+    pub fn id(&self) -> &'a str {
+        &self.hunk.id
+    }
+
+    /// The abbreviated id, for naming a hunk in an error message.
+    pub fn short_id(&self) -> &'a str {
+        &self.hunk.short_id
+    }
 }
 
 /// Evaluate a hunkset expression against a list of enriched hunks.
@@ -177,7 +269,10 @@ fn warn_if_nothing_analyzed(func: &str, result: &HashSet<usize>, hunks: &[Enrich
     if !result.is_empty() || hunks.is_empty() {
         return;
     }
-    if hunks.iter().any(|h| h.hunk.semantic.is_analyzed) {
+    if hunks
+        .iter()
+        .any(|h| h.content().is_some_and(|hunk| hunk.semantic.is_analyzed))
+    {
         return;
     }
     let mut files: Vec<&str> = hunks.iter().map(|h| h.file_path).collect();
@@ -428,7 +523,7 @@ fn eval_status(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<
 }
 
 fn eval_type(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    filter_by_field(patterns, hunks, |h| &h.hunk.hunk_type)
+    filter_by_field(patterns, hunks, |h| h.change_type())
 }
 
 // --- line ranges ---
@@ -445,9 +540,12 @@ fn eval_lines(args: &[Arg], hunks: &[EnrichedHunk], mode: LineRangeMode) -> Hash
         .iter()
         .enumerate()
         .filter(|(_, h)| {
+            // A stand-in occupies no line, and saying so as `(0, 0)` was not
+            // enough: line 0 is inside `lines(0..N)`.
+            let Some(hunk) = h.content() else { return false };
             ranges.iter().any(|&(start, end)| {
-                let before = hunk_touches_range(h.hunk.before_range.start, h.hunk.before_range.length, start, end);
-                let after = hunk_touches_range(h.hunk.after_range.start, h.hunk.after_range.length, start, end);
+                let before = hunk_touches_range(hunk.before_range.start, hunk.before_range.length, start, end);
+                let after = hunk_touches_range(hunk.after_range.start, hunk.after_range.length, start, end);
                 match mode {
                     LineRangeMode::Before => before,
                     LineRangeMode::After => after,
@@ -477,10 +575,13 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
         .iter()
         .enumerate()
         .filter(|(_, h)| {
+            // A stand-in has no added or removed text, and saying so as `""`
+            // was not enough: the empty substring is inside every string.
+            let Some(hunk) = h.content() else { return false };
             patterns.iter().any(|p| match mode {
-                ContentMode::Added => p.matches(&h.hunk.added),
-                ContentMode::Removed => p.matches(&h.hunk.removed),
-                ContentMode::Either => p.matches(&h.hunk.added) || p.matches(&h.hunk.removed),
+                ContentMode::Added => p.matches(&hunk.added),
+                ContentMode::Removed => p.matches(&hunk.removed),
+                ContentMode::Either => p.matches(&hunk.added) || p.matches(&hunk.removed),
             })
         })
         .map(|(i, _)| i)
@@ -543,15 +644,22 @@ fn eval_id(
             .iter()
             .enumerate()
             .filter(|(_, h)| {
+                // A hunk id is a digest of the text, so identity is
+                // content-level: a stand-in has no text and therefore no id to
+                // be named by. Its `whole-file:<path>` name is already refused
+                // above by `normalize_hunk_id`; this states the same rule where
+                // the matching happens, so that a stand-in renamed into some
+                // other shape later stays unnameable.
+                let Some(hunk) = h.content() else { return false };
                 if exact_only {
                     // `exact:` disables *prefix* matching -- it does not mean
                     // "the 64-hex form only". The short id is an equally
                     // canonical name for the same hunk, and the one `list`
                     // prints, so rejecting it made `id(exact:"hunk-3c6ce1bf")`
                     // silently select nothing at exit 0.
-                    h.hunk.id == *id || h.hunk.short_id == *id
+                    hunk.id == *id || hunk.short_id == *id
                 } else {
-                    crate::diff::id_matches(&id, &h.hunk.id)
+                    crate::diff::id_matches(&id, &hunk.id)
                 }
             })
             .map(|(i, _)| i)
@@ -562,7 +670,7 @@ fn eval_id(
             // unambiguous over this diff, so the list is directly usable.
             let mut which: Vec<String> = matched
                 .iter()
-                .map(|&i| format!("{} ({})", hunks[i].hunk.short_id, hunks[i].file_path))
+                .map(|&i| format!("{} ({})", hunks[i].short_id(), hunks[i].file_path))
                 .collect();
             which.sort();
             return Err(HunksetError::AmbiguousId {
@@ -591,9 +699,10 @@ fn eval_semantic(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], field: Se
         .iter()
         .enumerate()
         .filter(|(_, h)| {
+            let Some(hunk) = h.content() else { return false };
             let value = match field {
-                SemanticField::Function => h.hunk.semantic.enclosing_function.as_deref(),
-                SemanticField::Scope => h.hunk.semantic.enclosing_scope.as_deref(),
+                SemanticField::Function => hunk.semantic.enclosing_function.as_deref(),
+                SemanticField::Scope => hunk.semantic.enclosing_scope.as_deref(),
             };
             match value {
                 Some(v) => patterns.iter().any(|p| p.matches(v)),
@@ -609,10 +718,11 @@ fn eval_annotation(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> Hash
         .iter()
         .enumerate()
         .filter(|(_, h)| {
+            let Some(hunk) = h.content() else { return false };
             if patterns.is_empty() {
-                !h.hunk.semantic.annotations.is_empty()
+                !hunk.semantic.annotations.is_empty()
             } else {
-                h.hunk.semantic.annotations.iter().any(|ann| {
+                hunk.semantic.annotations.iter().any(|ann| {
                     patterns.iter().any(|p| p.matches(ann))
                 })
             }
@@ -632,16 +742,24 @@ where
 }
 
 fn eval_doc(hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    filter_by_bool(hunks, |h| h.hunk.semantic.is_doc_comment)
+    filter_by_bool(hunks, |h| {
+        h.content().is_some_and(|hunk| hunk.semantic.is_doc_comment)
+    })
 }
 
 fn eval_import(hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    filter_by_bool(hunks, |h| h.hunk.semantic.is_import)
+    filter_by_bool(hunks, |h| {
+        h.content().is_some_and(|hunk| hunk.semantic.is_import)
+    })
 }
 
 fn eval_toplevel(hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    // A hunk no parser looked at is not "top level" -- it is unknown.
-    filter_by_bool(hunks, |h| h.hunk.semantic.is_analyzed && h.hunk.semantic.is_toplevel)
+    // A hunk no parser looked at is not "top level" -- it is unknown, and a
+    // stand-in is the extreme of that: there was never any text to look at.
+    filter_by_bool(hunks, |h| {
+        h.content()
+            .is_some_and(|hunk| hunk.semantic.is_analyzed && hunk.semantic.is_toplevel)
+    })
 }
 
 fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
@@ -666,10 +784,11 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
             // Same reasoning as eval_toplevel: an unanalyzed hunk defaults to
             // depth 0, which would otherwise make depth(0) match every file
             // the parser could not read.
-            if !h.hunk.semantic.is_analyzed {
+            let Some(hunk) = h.content() else { return false };
+            if !hunk.semantic.is_analyzed {
                 return false;
             }
-            let d = h.hunk.semantic.nesting_depth;
+            let d = hunk.semantic.nesting_depth;
             exact.contains(&d) || ranges.iter().any(|&(lo, hi)| d >= lo && d <= hi)
         })
         .map(|(i, _)| i)
@@ -699,7 +818,7 @@ pub fn to_spec(
         files
             .entry(h.file_path.to_string())
             .or_default()
-            .push(h.hunk.id.clone());
+            .push(h.id().to_string());
     }
 
     let spec_files: BTreeMap<String, FileSpec> = files
@@ -760,7 +879,7 @@ mod tests {
         ];
         let enriched: Vec<EnrichedHunk> = hunks_data
             .iter()
-            .map(|h| EnrichedHunk { file_path: "src/lib.rs", file_status: "modified", hunk: h })
+            .map(|h| EnrichedHunk::real("src/lib.rs", "modified", h))
             .collect();
 
         assert_eq!(evaluate(&parse("type(insert)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
@@ -772,8 +891,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/lib.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "tests/test.rs", file_status: "added", hunk: &h2 },
+            EnrichedHunk::real("src/lib.rs", "modified", &h1),
+            EnrichedHunk::real("tests/test.rs", "added", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"file("src/lib.rs")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -783,8 +902,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/lib.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "tests/test.rs", file_status: "added", hunk: &h2 },
+            EnrichedHunk::real("src/lib.rs", "modified", &h1),
+            EnrichedHunk::real("tests/test.rs", "added", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"glob("src/**/*.rs")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -794,8 +913,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "TODO: fix this\n");
         let h2 = make_hunk(1, "replace", "old code\n", "new code\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"added("TODO")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse(r#"removed("old")"#).unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -807,9 +926,9 @@ mod tests {
         let h2 = make_hunk(1, "insert", "", "also new\n");
         let h3 = make_hunk(2, "delete", "gone\n", "");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "src/b.rs", file_status: "modified", hunk: &h2 },
-            EnrichedHunk { file_path: "tests/c.rs", file_status: "modified", hunk: &h3 },
+            EnrichedHunk::real("src/a.rs", "modified", &h1),
+            EnrichedHunk::real("src/b.rs", "modified", &h2),
+            EnrichedHunk::real("tests/c.rs", "modified", &h3),
         ];
         assert_eq!(evaluate(&parse(r#"type(insert) & glob("src/**")"#).unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
         assert_eq!(evaluate(&parse("all() ~ type(delete)").unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
@@ -824,8 +943,8 @@ mod tests {
         h2.before_range.start = 25;
         h2.before_range.length = 0;
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("a.rs", "modified", &h2),
         ];
         assert_eq!(evaluate(&parse("lines(1..10)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("lines(20..30)").unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -836,8 +955,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "delete", "y\n", "");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "src/b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("src/a.rs", "modified", &h1),
+            EnrichedHunk::real("src/b.rs", "modified", &h2),
         ];
         let selected = HashSet::from([0]);
         let spec = to_spec(&selected, &enriched, &HashMap::new());
@@ -850,11 +969,7 @@ mod tests {
     #[test]
     fn to_spec_carries_the_rename_source() {
         let h = make_hunk(0, "replace", "old\n", "new\n");
-        let enriched = vec![EnrichedHunk {
-            file_path: "dst.rs",
-            file_status: "renamed",
-            hunk: &h,
-        }];
+        let enriched = vec![EnrichedHunk::real("dst.rs", "renamed", &h)];
         let renames = HashMap::from([("dst.rs", "src.rs")]);
         let spec = to_spec(&HashSet::from([0]), &enriched, &renames);
         assert_eq!(spec.files["dst.rs"].source_path(), Some("src.rs"));
@@ -863,7 +978,7 @@ mod tests {
     #[test]
     fn unknown_function_is_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         let expr = parse("functon(\"foo\")").unwrap();
         assert!(matches!(evaluate(&expr, &enriched).unwrap_err(), HunksetError::UnknownFunction { .. }));
     }
@@ -871,7 +986,7 @@ mod tests {
     #[test]
     fn invalid_regex_is_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         let expr = parse(r#"added(regex:"(unclosed")"#).unwrap();
         assert!(matches!(evaluate(&expr, &enriched).unwrap_err(), HunksetError::InvalidRegex { .. }));
     }
@@ -880,7 +995,7 @@ mod tests {
     #[cfg(not(feature = "semantic"))]
     fn semantic_functions_require_feature() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         for func in &["scope(\"Foo\")", "function(\"bar\")", "doc()", "import()", "toplevel()", "depth(0)", "annotation(\"test\")"] {
             let expr = parse(func).unwrap();
             let err = evaluate(&expr, &enriched).unwrap_err();
@@ -901,8 +1016,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/lib.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "src/lib.py", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("src/lib.rs", "modified", &h1),
+            EnrichedHunk::real("src/lib.py", "modified", &h2),
         ];
         assert_eq!(evaluate(&parse("extension(rs)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -912,8 +1027,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "added", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "added", &h2),
         ];
         assert_eq!(evaluate(&parse("status(added)").unwrap(), &enriched).unwrap(), HashSet::from([1]));
     }
@@ -928,9 +1043,9 @@ mod tests {
         let mut h3 = make_hunk(2, "insert", "", "const X: i32 = 1;\n");
         h3.semantic.is_toplevel = true;
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h3 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("a.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", "modified", &h3),
         ];
         assert_eq!(evaluate(&parse("doc()").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("import()").unwrap(), &enriched).unwrap(), HashSet::from([1]));
@@ -945,7 +1060,7 @@ mod tests {
         // while toplevel() does not.
         let mut h = make_hunk(0, "insert", "", "hello\n");
         h.semantic.is_analyzed = false;
-        let enriched = vec![EnrichedHunk { file_path: "notes.txt", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("notes.txt", "modified", &h)];
 
         assert!(
             evaluate(&parse("toplevel()").unwrap(), &enriched).unwrap().is_empty(),
@@ -967,9 +1082,9 @@ mod tests {
         let mut h3 = make_hunk(2, "insert", "", "z\n");
         h3.semantic.nesting_depth = 2;
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h3 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("a.rs", "modified", &h2),
+            EnrichedHunk::real("a.rs", "modified", &h3),
         ];
         assert_eq!(evaluate(&parse("depth(0)").unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("depth(0..1)").unwrap(), &enriched).unwrap(), HashSet::from([0, 1]));
@@ -982,8 +1097,8 @@ mod tests {
         h1.semantic.annotations = vec!["#[test]".to_string()];
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("a.rs", "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"annotation("test")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
         assert_eq!(evaluate(&parse("annotation()").unwrap(), &enriched).unwrap(), HashSet::from([0]));
@@ -995,8 +1110,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "fn hello_world() {\n");
         let h2 = make_hunk(1, "insert", "", "let x = 1;\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("a.rs", "modified", &h2),
         ];
         assert_eq!(evaluate(&parse(r#"added(regex:"fn\s+\w+")"#).unwrap(), &enriched).unwrap(), HashSet::from([0]));
     }
@@ -1014,8 +1129,8 @@ mod tests {
 
     fn enrich<'a>(src: &'a Hunk, vendor: &'a Hunk) -> Vec<EnrichedHunk<'a>> {
         vec![
-            EnrichedHunk { file_path: "src.txt", file_status: "modified", hunk: src },
-            EnrichedHunk { file_path: "vendor/lib.txt", file_status: "modified", hunk: vendor },
+            EnrichedHunk::real("src.txt", "modified", src),
+            EnrichedHunk::real("vendor/lib.txt", "modified", vendor),
         ]
     }
 
@@ -1107,7 +1222,7 @@ mod tests {
     #[test]
     fn an_abbreviated_id_resolves_whether_or_not_it_is_quoted() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         // `hunk-00000000...`: any prefix of it names this hunk.
         let prefix = &h.id[..12];
         let quoted = format!(r#"id("{prefix}")"#);
@@ -1141,6 +1256,167 @@ mod tests {
         hunk
     }
 
+    /// A stand-in exactly as `whole_file_stand_in` mints one: no text, both
+    /// ranges on line 0, and a name that is not in hunk-id form.
+    fn make_stand_in(path: &str) -> Hunk {
+        // No text, so `make_hunk` already gives both ranges length 0; only the
+        // start moves to the line no file has.
+        let mut hunk = make_hunk(0, "replace", "", "");
+        hunk.id = format!("whole-file:{path}");
+        hunk.short_id = hunk.id.clone();
+        hunk.before_range.start = 0;
+        hunk.after_range.start = 0;
+        // Nothing was ever parsed, unlike the .rs fixtures `make_hunk` models.
+        hunk.semantic = crate::diff::SemanticInfo::default();
+        hunk
+    }
+
+    /// Every content-level predicate, asked with the argument that makes it
+    /// degenerate. `EnrichedHunk::stand_in` withholds the text, so each one
+    /// selects the real hunk and nothing else.
+    ///
+    /// Data alone did not do this. `content("")` finds the empty substring
+    /// inside the stand-in's empty `added`, and `lines(0..9)` finds line 0
+    /// inside the range that `(start 0, length 0)` reports -- both matched
+    /// before the withholding, while `lines(1..9)` did not, which is how the
+    /// leak stayed hidden.
+    #[test]
+    fn no_content_predicate_reaches_a_stand_in_however_degenerate_its_argument() {
+        let real = make_hunk(0, "replace", "old\n", "new\n");
+        let stand_in = make_stand_in("blob.bin");
+        let enriched = vec![
+            EnrichedHunk::real("a.rs", "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+        ];
+
+        for spec in [
+            r#"content("")"#,
+            r#"added("")"#,
+            r#"removed("")"#,
+            "lines(0..100000)",
+            "before_line(0..100000)",
+            "after_line(0..100000)",
+        ] {
+            assert_eq!(
+                evaluate(&parse(spec).unwrap(), &enriched).unwrap(),
+                HashSet::from([0]),
+                "{spec} reached the stand-in"
+            );
+        }
+
+        // `lines(0)` names the one line no real hunk can occupy, so it is the
+        // sharpest form of the question: the answer is nothing at all, where
+        // before the change it was the stand-in alone.
+        assert!(
+            evaluate(&parse("lines(0)").unwrap(), &enriched)
+                .unwrap()
+                .is_empty(),
+            "line 0 belongs to no hunk, and a stand-in is not an exception"
+        );
+    }
+
+    /// And the same predicates still answer for the real hunk they were asked
+    /// about, so the rule above is "a stand-in has no content", not "content
+    /// predicates match nothing".
+    ///
+    /// Preservation guard: with no stand-in in the list this passed before the
+    /// change too, and cannot have failed beforehand.
+    #[test]
+    fn a_degenerate_content_argument_still_selects_an_ordinary_hunk() {
+        let insert = make_hunk(0, "insert", "", "added only\n");
+        let delete = make_hunk(1, "delete", "removed only\n", "");
+        let enriched = vec![
+            EnrichedHunk::real("a.rs", "modified", &insert),
+            EnrichedHunk::real("b.rs", "modified", &delete),
+        ];
+
+        for spec in [
+            r#"content("")"#,
+            r#"added("")"#,
+            r#"removed("")"#,
+            "lines(0..100000)",
+        ] {
+            assert_eq!(
+                evaluate(&parse(spec).unwrap(), &enriched).unwrap(),
+                HashSet::from([0, 1]),
+                "{spec} stopped selecting ordinary hunks"
+            );
+        }
+    }
+
+    /// File-level predicates must go on reaching the stand-in, which is the
+    /// entire reason it is in the list. A fix that made `content()` miss it by
+    /// dropping it from evaluation would pass the test above and reintroduce
+    /// the bug the stand-ins were added for.
+    #[test]
+    fn file_level_predicates_still_reach_a_stand_in() {
+        let real = make_hunk(0, "replace", "old\n", "new\n");
+        let stand_in = make_stand_in("blob.bin");
+        let enriched = vec![
+            EnrichedHunk::real("a.rs", "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+        ];
+
+        for spec in [
+            "all()",
+            r#"file("blob.bin")"#,
+            "type(replace)",
+            "status(modified)",
+        ] {
+            assert!(
+                evaluate(&parse(spec).unwrap(), &enriched)
+                    .unwrap()
+                    .contains(&1),
+                "{spec} lost the stand-in"
+            );
+        }
+        assert_eq!(
+            evaluate(&parse(r#"~file("a.rs")"#).unwrap(), &enriched).unwrap(),
+            HashSet::from([1]),
+            "negation lost the stand-in"
+        );
+    }
+
+    /// `id()` declines a stand-in on its own, not merely because
+    /// `whole-file:<path>` is refused as an argument.
+    ///
+    /// This is the one case no end-to-end test can reach: from the CLI there is
+    /// no way to hand `id()` a stand-in's name that survives
+    /// `normalize_hunk_id`, so the argument check answers first and the match
+    /// is never attempted. Handing the stand-in a well-formed `hunk-<hex>` id
+    /// here gets past that check and asks the question directly. Before the
+    /// change this selected it; now it is an unknown id, which is the same
+    /// answer `id()` gives for any name that fits no hunk.
+    #[test]
+    fn id_cannot_match_a_stand_in_wearing_a_hunk_id() {
+        let real = make_hunk_with_distinct_id(0, 'a');
+        let mut stand_in = make_stand_in("blob.bin");
+        stand_in.id = format!("hunk-{}", "b".repeat(64));
+        stand_in.short_id = format!("hunk-{}", "b".repeat(8));
+        let enriched = vec![
+            EnrichedHunk::real("a.rs", "modified", &real),
+            EnrichedHunk::stand_in("blob.bin", "modified", &stand_in),
+        ];
+
+        for spec in [
+            "id(hunk-bbbb)".to_string(),
+            format!(r#"id(exact:"{}")"#, stand_in.id),
+            format!(r#"id(exact:"{}")"#, stand_in.short_id),
+        ] {
+            assert!(
+                matches!(eval_err(&spec, &enriched), HunksetError::UnknownId { .. }),
+                "{spec} named a stand-in"
+            );
+        }
+
+        // The real hunk is still nameable, so this is not "id() matches
+        // nothing".
+        assert_eq!(
+            evaluate(&parse("id(hunk-aaaa)").unwrap(), &enriched).unwrap(),
+            HashSet::from([0])
+        );
+    }
+
     /// The negated form is where dropping the flag did damage: an id that
     /// resolved to nothing left `~` selecting the entire diff.
     #[test]
@@ -1148,8 +1424,8 @@ mod tests {
         let h1 = make_hunk_with_distinct_id(0, 'a');
         let h2 = make_hunk_with_distinct_id(1, 'b');
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "modified", &h2),
         ];
         assert_eq!(
             evaluate(&parse("~id(hunk-aaaa)").unwrap(), &enriched).unwrap(),
@@ -1169,8 +1445,8 @@ mod tests {
         let mut h2 = make_hunk_with_distinct_id(1, 'a');
         h2.id.replace_range(60.., "bbbb");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "modified", &h2),
         ];
         assert!(matches!(
             eval_err("id(hunk-aaaa)", &enriched),
@@ -1183,7 +1459,7 @@ mod tests {
     #[test]
     fn explicit_exact_still_rules_out_abbreviation() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
 
         for spec in [
             format!(r#"id(exact:"{}")"#, h.id),
@@ -1210,7 +1486,7 @@ mod tests {
     #[test]
     fn an_id_that_names_no_hunk_is_an_error() {
         let h = make_hunk(0, "insert", "", "x\n");
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         for spec in [
             r#"id("hunk-ffffffff")"#,
             r#"~id("hunk-ffffffff")"#,
@@ -1232,7 +1508,7 @@ mod tests {
     fn id_rejects_a_pattern_kind_it_cannot_honour() {
         let mut h = make_hunk(0, "insert", "", "x\n");
         h.id = format!("hunk-{}", "abcdef01".repeat(8));
-        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        let enriched = vec![EnrichedHunk::real("a.rs", "modified", &h)];
         // A real substring of the id, but not a prefix: substring matching
         // would have found it and prefix matching cannot, so honouring the
         // prefix the user wrote is the difference between a hit and a miss.
@@ -1257,8 +1533,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "// TODO: fix this\n");
         let h2 = make_hunk(1, "replace", "old code\n", "new code\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "modified", &h2),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(selects("added(TODO)"), HashSet::from([0]));
@@ -1277,8 +1553,8 @@ mod tests {
         let h1 = make_hunk(0, "insert", "", "x\n");
         let h2 = make_hunk(1, "insert", "", "y\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rss", file_status: "modified", hunk: &h2 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rss", "modified", &h2),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(selects("extension(rs)"), HashSet::from([0]));
@@ -1305,7 +1581,7 @@ mod tests {
             .spawn(move || {
                 let h = make_hunk(0, "insert", "", "x\n");
                 let enriched =
-                    vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+                    vec![EnrichedHunk::real("a.rs", "modified", &h)];
                 let expr = parse(&spec).expect("chain should parse");
                 let selected = evaluate(&expr, &enriched).expect("chain should evaluate");
                 drop(expr);
@@ -1375,9 +1651,9 @@ mod tests {
         let h2 = make_hunk(1, "delete", "y\n", "");
         let h3 = make_hunk(2, "replace", "a\n", "b\n");
         let enriched = vec![
-            EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "b.rs", file_status: "modified", hunk: &h2 },
-            EnrichedHunk { file_path: "c.rs", file_status: "modified", hunk: &h3 },
+            EnrichedHunk::real("a.rs", "modified", &h1),
+            EnrichedHunk::real("b.rs", "modified", &h2),
+            EnrichedHunk::real("c.rs", "modified", &h3),
         ];
         let selects = |spec: &str| evaluate(&parse(spec).unwrap(), &enriched).unwrap();
         assert_eq!(
@@ -1400,9 +1676,9 @@ mod tests {
         let h2 = make_hunk(1, "insert", "", "y\n");
         let h3 = make_hunk(2, "delete", "z\n", "");
         let enriched = vec![
-            EnrichedHunk { file_path: "src/a.rs", file_status: "modified", hunk: &h1 },
-            EnrichedHunk { file_path: "src/a.rs", file_status: "modified", hunk: &h2 },
-            EnrichedHunk { file_path: "src/b.rs", file_status: "modified", hunk: &h3 },
+            EnrichedHunk::real("src/a.rs", "modified", &h1),
+            EnrichedHunk::real("src/a.rs", "modified", &h2),
+            EnrichedHunk::real("src/b.rs", "modified", &h3),
         ];
         let selected = HashSet::from([0, 2]);
         let spec = to_spec(&selected, &enriched, &HashMap::new());

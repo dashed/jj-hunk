@@ -6130,6 +6130,91 @@ fn no_content_predicate_matches_the_text_surrounding_a_hunkless_change() {
     );
 }
 
+/// The same question asked with the arguments that make a content predicate
+/// degenerate. The guard above is real but was answered by the stand-in's
+/// *data* -- empty `added`/`removed`, both line ranges at `(0, 0)` -- and
+/// emptiness is not unmatchability:
+///
+///   * the empty substring is inside every string, so `content("")` matched
+///     every stand-in there was, making it a synonym for `all()`;
+///   * line 0 is inside `0..100000`, so `lines(0..100000)` did too. The guard
+///     above uses `lines(1..100000)`, which is clean for exactly the reason the
+///     old comment gave -- and that is why it read as passing.
+///
+/// This is not a new leak. It pre-existed for binaries, the one shape that
+/// already had a stand-in, and `blob.bin` in this fixture is that case;
+/// generalising the stand-in multiplied it across the other four. Without the
+/// fix each of these four expressions commits all six shapes, at exit 0, so the
+/// assertion is on what landed.
+#[cfg(unix)]
+#[test]
+fn a_degenerate_content_argument_cannot_reach_a_hunkless_change_either() {
+    for expr in [
+        r#"content("")"#,
+        r#"added("")"#,
+        r#"removed("")"#,
+        "lines(0..100000)",
+    ] {
+        let repo = hunkless_shapes_repo("hunkless-degenerate");
+        repo.hunk_ok(&["split", expr, "just the text"]);
+        assert_eq!(
+            repo.changed_files("@-"),
+            vec!["M text.txt"],
+            "{expr} reached a change whose bytes it never saw"
+        );
+        assert_eq!(
+            sorted_changes(&repo, "@"),
+            every_shape_but(&["text.txt"]),
+            "{expr} moved more than the text"
+        );
+    }
+}
+
+/// The half that stops the fix from being "a content predicate matches
+/// nothing". Each expression above is degenerate, not meaningless: over
+/// ordinary hunks `content("")` really does select every one of them, because
+/// the empty substring really is inside their text. Only the stand-ins, which
+/// have no text for the question to have been asked about, drop out.
+///
+/// Withholding a stand-in's content is what makes that distinction expressible
+/// at all. Rejecting `content("")` and `lines(0..N)` as arguments -- the other
+/// way to make the test above pass -- would take these four cases with it, and
+/// would still leave whatever degenerate argument turns up next.
+///
+/// Preservation guard: this passed before the change as well, since nothing
+/// here involves a hunkless shape, so it cannot have failed beforehand. Its
+/// value is entirely in what it forbids a later fix from doing.
+#[test]
+fn a_degenerate_content_argument_still_matches_every_ordinary_hunk() {
+    for expr in [
+        r#"content("")"#,
+        r#"added("")"#,
+        r#"removed("")"#,
+        "lines(0..100000)",
+    ] {
+        let repo = TestRepo::new("degenerate-ordinary");
+        repo.write_file("a.txt", "one\ntwo\n");
+        repo.write_file("b.txt", "three\nfour\n");
+        repo.jj_ok(&["commit", "-m", "base"]);
+        // A replacement and a pure insertion, so that `removed("")` is asked
+        // about a hunk with removed text and about one without.
+        repo.write_file("a.txt", "one\nEDITED\n");
+        repo.write_file("b.txt", "three\nfour\nfive\n");
+
+        repo.hunk_ok(&["split", expr, "every ordinary hunk"]);
+        assert_eq!(
+            sorted_changes(&repo, "@-"),
+            vec!["M a.txt", "M b.txt"],
+            "{expr} stopped reaching ordinary hunks"
+        );
+        assert!(
+            repo.changed_files("@").is_empty(),
+            "{expr} left an ordinary hunk behind: {:?}",
+            repo.changed_files("@")
+        );
+    }
+}
+
 /// Nor can `id()`. The stand-in's id is deliberately not in `hunk-<hex>` form,
 /// so it is rejected as an argument rather than merely failing to match -- a
 /// hunkless change cannot be selected by an identity it does not have. And

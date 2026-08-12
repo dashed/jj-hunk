@@ -651,17 +651,17 @@ pub(crate) fn evaluate_hunkset(
     let mut enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
         .flat_map(|fh| {
-            fh.hunks.iter().map(move |hunk| EnrichedHunk {
-                file_path: &fh.path,
-                file_status: &fh.status,
-                hunk,
-            })
+            fh.hunks
+                .iter()
+                .map(move |hunk| EnrichedHunk::real(&fh.path, &fh.status, hunk))
         })
         .collect();
-    enriched.extend(stand_ins.iter().map(|(index, hunk)| EnrichedHunk {
-        file_path: &file_hunks[*index].path,
-        file_status: &file_hunks[*index].status,
-        hunk,
+    // `stand_in`, not `real`, and that is the whole of the content-level
+    // guarantee: the evaluator declines to show a stand-in's text to
+    // `content()`, `added()`, `removed()`, `lines()` and `id()` because it is
+    // told which entries are stand-ins, not because their text is empty.
+    enriched.extend(stand_ins.iter().map(|(index, hunk)| {
+        EnrichedHunk::stand_in(&file_hunks[*index].path, &file_hunks[*index].status, hunk)
     }));
 
     let selected = hunkset::evaluate(&ast, &enriched)
@@ -708,15 +708,23 @@ pub(crate) fn evaluate_hunkset(
 /// path have no halves either -- so the stand-in carries exactly what a
 /// *file-level* predicate reads: the path and status come from the enclosing
 /// [`EnrichedHunk`], and `type()` reports what happened to the file as a whole.
-/// Everything a *content-level* predicate reads is deliberately empty, so
-/// `content()`, `added()`, `removed()` and `lines()` cannot match a file whose
-/// bytes they were never able to look at. That emptiness is the point: a
-/// stand-in made any more real would start answering questions about text it
-/// never saw.
 ///
-/// The id is not in hunk-id form on purpose. `normalize_hunk_id` only ever
-/// yields `hunk-<hex>`, so no `id()` argument can prefix-match this one, and
-/// the stand-in cannot be selected by an identity it does not really have.
+/// What a *content-level* predicate reads is left empty here, but nothing rests
+/// on that any more. It is the enclosing [`EnrichedHunk::stand_in`] that makes
+/// this unmatchable by `content()`, `added()`, `removed()`, `lines()` and
+/// `id()`, because emptiness turned out not to mean unmatchable: `content("")`
+/// found the empty string inside the empty string, and `lines(0..N)` found line
+/// 0 inside the range. The fields stay empty because there is honestly nothing
+/// to put in them -- a stand-in made any more real would start answering
+/// questions about text that was never diffed -- not because emptiness is a
+/// defence.
+///
+/// The id is not in hunk-id form on purpose, and that property is still worth
+/// keeping even now that `id()` declines a stand-in outright.
+/// `normalize_hunk_id` only ever yields `hunk-<hex>`, so `id("whole-file:link")`
+/// is refused as a malformed argument rather than accepted and silently matching
+/// nothing -- which is the difference between a typo being reported and `~id(..)`
+/// quietly meaning "everything".
 fn whole_file_stand_in(file: &FileHunks) -> Hunk {
     let hunk_type = match file.status.as_str() {
         "added" | "copied" => "insert",
@@ -732,8 +740,10 @@ fn whole_file_stand_in(file: &FileHunks) -> Hunk {
         hunk_type: hunk_type.to_string(),
         removed: String::new(),
         added: String::new(),
-        // Line 0 exists in no file, so `lines(..)` and its variants never
-        // report this as touching a line they were asked about.
+        // Line 0 exists in no file. That is a true statement about a real
+        // file and a false one about `lines()`: `hunk_touches_range` reads a
+        // zero-length range as the single point `start`, and 0 is inside
+        // `0..100000`. `EnrichedHunk::stand_in` is what keeps `lines()` away.
         before_range: crate::diff::LineRange { start: 0, length: 0 },
         after_range: crate::diff::LineRange { start: 0, length: 0 },
         context: None,

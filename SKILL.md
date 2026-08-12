@@ -323,9 +323,11 @@ selected **whole** or not at all. Which predicates can reach one is a hard split
 | `all()`, `file()`, `glob()`, `extension()`, `status()`, and any negation `~x` | `content()`, `added()`, `removed()`, `lines()`, `id()` |
 
 The right column is not an oversight. These changes are given a stand-in hunk that carries a path
-and a status and no text at all, precisely so that a question about content cannot be answered
-about bytes that were never diffed — a link's target and a renamed file's body are not in any
-hunk, so nothing matches them.
+and a status and no text at all, and the stand-in is *marked* as one so that a content-level
+predicate declines it outright. The marking is what does the work: empty text is not unmatchable
+text, and both `content("")` and `lines(0..N)` are true of it. A question about content is refused
+rather than answered about bytes that were never diffed — a link's target and a renamed file's body
+are not in any hunk, so there was nothing there to match on.
 
 **This is the trap: a `content()`-only selector silently leaves every one of them behind.** It is
 not an error and nothing warns you — they just stay in the revision you were emptying:

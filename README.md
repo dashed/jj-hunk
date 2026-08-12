@@ -425,10 +425,11 @@ Four details worth knowing:
   status and nothing else, so `all()`, `file()`, `glob()`, `extension()`, `status()` and
   any negation `~x` can name it — and a selected one is turned into `{"action": "keep"}`,
   because there is no half of it to take. `content()`, `added()`, `removed()`, `lines()`
-  and `id()` still cannot reach one: the stand-in holds no text and occupies no line, so
-  a content question about a file whose bytes were never diffed goes on being answered
-  "no". A `content()`-only selector therefore still leaves every one of these behind, at
-  exit 0.
+  and `id()` cannot reach one: the stand-in is *marked* as a stand-in, and each of those
+  declines a marked one outright rather than comparing against the empty text it holds.
+  The marking is what does the work — empty text is not unmatchable text, and both
+  `content("")` and `lines(0..N)` are true of it. A `content()`-only selector therefore
+  still leaves every one of these behind, at exit 0.
 
 ### Renamed files: the `from` field
 
@@ -717,9 +718,11 @@ reach one:
 | `all()`, `file()`, `glob()`, `extension()`, `status()`, and any negation | `content()`, `added()`, `removed()`, `lines()`, `id()` |
 
 The right column is deliberate. Each of these changes gets a stand-in hunk that carries
-only a path and a status, so a file-level question has something to match — and a
-content-level question, asked about bytes that were never diffed, goes on being answered
-"no" rather than guessed at. A link's target and a renamed file's body are in no hunk.
+only a path and a status, so a file-level question has something to match; the stand-in is
+also marked as one, and a content-level predicate declines a marked stand-in rather than
+matching against the empty text it holds. A content-level question about bytes that were
+never diffed is refused rather than guessed at. A link's target and a renamed file's body
+are in no hunk, so there was never anything there to ask about.
 
 The consequence is worth stating plainly: **a selector built only from `content()` and
 friends leaves every one of these changes behind.** If a selection is meant to cover the
